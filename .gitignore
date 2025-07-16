@@ -1,0 +1,124 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+build/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# Temporary directories
+tmp/
+temp/
+
+# Cache directories
+/tmp/fuse-client*
+/tmp/nvme-cache*
+
+# Development environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Editor directories and files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Go sum backup
+go.sum.backup
+
+# Air live reload tool
+.air.toml
+
+# Profiling files
+*.prof
+
+# Delve debugger
+debug
+
+# GoLand
+.idea/
+
+# Generated files
+*.pb.go
+*.pb.gw.go
+
+# Local configuration files
+config.local.yaml
+config.local.json
+
+# Docker
+.dockerignore
+Dockerfile.local
+
+# Kubernetes
+k8s/local/
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Performance and debug files
+*.pprof
+*.trace
+
+# Mock files (if using gomock)
+mocks/ 

@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package coordinator;
+
+option go_package = "./proto";
+
+// Coordinator service for peer registration and metadata management
+service Coordinator {
+    rpc RegisterPeer(RegisterPeerRequest) returns (RegisterPeerResponse);
+    rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
+    rpc UpdatePeerStatus(UpdatePeerStatusRequest) returns (UpdatePeerStatusResponse);
+    rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationResponse);
+    rpc UpdateFileLocation(UpdateFileLocationRequest) returns (UpdateFileLocationResponse);
+}
+
+message PeerInfo {
+    string id = 1;
+    string address = 2;
+    string nvme_path = 3;
+    int64 available_space = 4;
+    int64 used_space = 5;
+    string status = 6;
+    int64 last_heartbeat = 7;
+}
+
+message RegisterPeerRequest {
+    PeerInfo peer = 1;
+}
+
+message RegisterPeerResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetPeersRequest {
+    string requester_id = 1;
+}
+
+message GetPeersResponse {
+    repeated PeerInfo peers = 1;
+}
+
+message UpdatePeerStatusRequest {
+    string peer_id = 1;
+    string status = 2;
+    int64 available_space = 3;
+    int64 used_space = 4;
+}
+
+message UpdatePeerStatusResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message FileLocation {
+    string file_path = 1;
+    string peer_id = 2;
+    string storage_tier = 3; // "nvme", "peer", "cloud"
+    string storage_path = 4;
+    int64 file_size = 5;
+    int64 last_accessed = 6;
+}
+
+message GetFileLocationRequest {
+    string file_path = 1;
+}
+
+message GetFileLocationResponse {
+    repeated FileLocation locations = 1;
+}
+
+message UpdateFileLocationRequest {
+    FileLocation location = 1;
+}
+
+message UpdateFileLocationResponse {
+    bool success = 1;
+    string message = 2;
+} 

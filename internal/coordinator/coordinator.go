@@ -1,0 +1,201 @@
+package coordinator
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+)
+
+// PeerInfo represents a peer in the system
+type PeerInfo struct {
+	ID             string
+	Address        string
+	NVMePath       string
+	AvailableSpace int64
+	UsedSpace      int64
+	Status         string
+	LastHeartbeat  time.Time
+}
+
+// FileLocation represents the location of a file
+type FileLocation struct {
+	FilePath     string
+	PeerID       string
+	StorageTier  string
+	StoragePath  string
+	FileSize     int64
+	LastAccessed time.Time
+}
+
+// CoordinatorService manages peer registration and file metadata
+type CoordinatorService struct {
+	peers         map[string]*PeerInfo
+	fileLocations map[string][]*FileLocation
+	mu            sync.RWMutex
+	logger        *log.Logger
+}
+
+// NewCoordinatorService creates a new coordinator service
+func NewCoordinatorService() *CoordinatorService {
+	return &CoordinatorService{
+		peers:         make(map[string]*PeerInfo),
+		fileLocations: make(map[string][]*FileLocation),
+		logger:        log.New(log.Writer(), "[COORDINATOR] ", log.LstdFlags),
+	}
+}
+
+// RegisterPeer registers a new peer in the system
+func (cs *CoordinatorService) RegisterPeer(ctx context.Context, peer *PeerInfo) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	peer.LastHeartbeat = time.Now()
+	peer.Status = "active"
+
+	cs.peers[peer.ID] = peer
+	cs.logger.Printf("Registered peer: %s at %s", peer.ID, peer.Address)
+
+	return nil
+}
+
+// GetPeers returns all active peers
+func (cs *CoordinatorService) GetPeers(ctx context.Context, requesterID string) ([]*PeerInfo, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	peers := make([]*PeerInfo, 0, len(cs.peers))
+	for _, peer := range cs.peers {
+		// Don't include the requester in the list
+		if peer.ID != requesterID && peer.Status == "active" {
+			peers = append(peers, peer)
+		}
+	}
+
+	return peers, nil
+}
+
+// UpdatePeerStatus updates the status of a peer
+func (cs *CoordinatorService) UpdatePeerStatus(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	peer, exists := cs.peers[peerID]
+	if !exists {
+		cs.logger.Printf("Peer not found: %s", peerID)
+		return nil
+	}
+
+	peer.Status = status
+	peer.AvailableSpace = availableSpace
+	peer.UsedSpace = usedSpace
+	peer.LastHeartbeat = time.Now()
+
+	cs.logger.Printf("Updated peer status: %s -> %s", peerID, status)
+	return nil
+}
+
+// GetFileLocation returns the locations of a file
+func (cs *CoordinatorService) GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	locations := cs.fileLocations[filePath]
+	if locations == nil {
+		return []*FileLocation{}, nil
+	}
+
+	// Return a copy to avoid race conditions
+	result := make([]*FileLocation, len(locations))
+	copy(result, locations)
+	return result, nil
+}
+
+// UpdateFileLocation updates the location of a file
+func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *FileLocation) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	locations := cs.fileLocations[location.FilePath]
+	if locations == nil {
+		locations = make([]*FileLocation, 0)
+	}
+
+	// Check if this location already exists
+	for i, loc := range locations {
+		if loc.PeerID == location.PeerID && loc.StorageTier == location.StorageTier {
+			// Update existing location
+			locations[i] = location
+			cs.fileLocations[location.FilePath] = locations
+			return nil
+		}
+	}
+
+	// Add new location
+	locations = append(locations, location)
+	cs.fileLocations[location.FilePath] = locations
+
+	cs.logger.Printf("Updated file location: %s on peer %s", location.FilePath, location.PeerID)
+	return nil
+}
+
+// CleanupInactivePeers removes peers that haven't sent heartbeats
+func (cs *CoordinatorService) CleanupInactivePeers(timeout time.Duration) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	now := time.Now()
+	for peerID, peer := range cs.peers {
+		if now.Sub(peer.LastHeartbeat) > timeout {
+			peer.Status = "inactive"
+			cs.logger.Printf("Peer %s marked as inactive", peerID)
+		}
+	}
+}
+
+// GetPeerStats returns statistics about registered peers
+func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	activePeers := 0
+	totalSpace := int64(0)
+	usedSpace := int64(0)
+
+	for _, peer := range cs.peers {
+		if peer.Status == "active" {
+			activePeers++
+			totalSpace += peer.AvailableSpace
+			usedSpace += peer.UsedSpace
+		}
+	}
+
+	return map[string]interface{}{
+		"active_peers":    activePeers,
+		"total_peers":     len(cs.peers),
+		"total_space":     totalSpace,
+		"used_space":      usedSpace,
+		"available_space": totalSpace - usedSpace,
+		"file_count":      len(cs.fileLocations),
+	}
+}
+
+// Start starts the coordinator service with periodic cleanup
+func (cs *CoordinatorService) Start(ctx context.Context) {
+	// Start cleanup goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cs.CleanupInactivePeers(60 * time.Second)
+			}
+		}
+	}()
+
+	cs.logger.Printf("Coordinator service started")
+}
