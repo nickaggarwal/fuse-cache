@@ -51,13 +51,13 @@ func (fs *FileSystem) Mount(ctx context.Context, mountPoint string) (*fuse.Conn,
 }
 
 // Serve serves the FUSE filesystem
-func (fs *FileSystem) Serve(ctx context.Context, conn *fuse.Conn) error {
+func (filesystem *FileSystem) Serve(ctx context.Context, conn *fuse.Conn) error {
 	defer conn.Close()
 
-	fs.logger.Printf("FUSE filesystem is ready")
+	filesystem.logger.Printf("FUSE filesystem is ready")
 
 	// Use the fs.Serve function from bazil.org/fuse/fs
-	return fs.Serve(ctx, conn)
+	return fs.Serve(conn, filesystem)
 }
 
 // Root returns the root directory of the filesystem
