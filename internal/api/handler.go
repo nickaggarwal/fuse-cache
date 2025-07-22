@@ -49,7 +49,9 @@ func (h *Handler) SetupRoutes() *mux.Router {
 
 	// Cache operations
 	router.HandleFunc("/api/cache", h.handleCache).Methods("GET")
+	router.HandleFunc("/api/cache/local", h.handleCacheLocal).Methods("GET")
 	router.HandleFunc("/api/cache/stats", h.handleCacheStats).Methods("GET")
+	router.HandleFunc("/api/cache/snapshot-status", h.handleSnapshotStatus).Methods("GET")
 
 	// Health check
 	router.HandleFunc("/api/health", h.handleHealth).Methods("GET")
@@ -109,8 +111,22 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx cont
 		Data:         data,
 	}
 
-	if err := h.cacheManager.Put(ctx, entry); err != nil {
-		h.logger.Printf("Failed to store file: %s", err)
+	// Check if this is a peer replication write (to prevent infinite loops)
+	isReplication := r.Header.Get("X-Replication") == "true"
+	
+	var putErr error
+	if isReplication {
+		// This is a replication from another peer - don't replicate further
+		h.logger.Printf("Received replicated file: %s (%d bytes) - skipping peer replication", filePath, len(data))
+		putErr = h.cacheManager.PutWithoutReplication(ctx, entry)
+	} else {
+		// This is an original write - allow normal replication
+		h.logger.Printf("Received original file: %s (%d bytes) - will replicate to peers", filePath, len(data))
+		putErr = h.cacheManager.Put(ctx, entry)
+	}
+
+	if putErr != nil {
+		h.logger.Printf("Failed to store file: %s", putErr)
 		http.Error(w, "Failed to store file", http.StatusInternalServerError)
 		return
 	}
@@ -263,6 +279,21 @@ func (h *Handler) handleCache(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(entries)
 }
 
+// handleCacheLocal handles local-only cache listing requests (prevents infinite loops)
+func (h *Handler) handleCacheLocal(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	entries, err := h.cacheManager.List(ctx) // This now returns local entries only
+	if err != nil {
+		http.Error(w, "Failed to list local cache", http.StatusInternalServerError)
+		return
+	}
+
+	h.logger.Printf("Returning %d local cache entries", len(entries))
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entries)
+}
+
 // handleCacheStats handles cache statistics requests
 func (h *Handler) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	if h.coordinator == nil {
@@ -273,6 +304,18 @@ func (h *Handler) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	stats := h.coordinator.GetPeerStats()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// handleSnapshotStatus handles snapshot status requests
+func (h *Handler) handleSnapshotStatus(w http.ResponseWriter, r *http.Request) {
+	// Try to get snapshot status if the cache manager supports it
+	if statusProvider, ok := h.cacheManager.(interface{ GetSnapshotStatus() map[string]interface{} }); ok {
+		status := statusProvider.GetSnapshotStatus()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	} else {
+		http.Error(w, "Snapshot status not available", http.StatusServiceUnavailable)
+	}
 }
 
 // handleHealth handles health check requests

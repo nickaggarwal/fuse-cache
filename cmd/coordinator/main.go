@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -97,6 +98,31 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		w.Write([]byte(`{"success": true}`))
 	})
 
+	// Unregister peer endpoint
+	mux.HandleFunc("/api/peers/unregister", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var request struct {
+			PeerID string `json:"peer_id"`
+		}
+
+		if err := parseJSONRequest(r, &request); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if err := coordinatorService.UnregisterPeer(r.Context(), request.PeerID); err != nil {
+			http.Error(w, "Failed to unregister peer", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success": true}`))
+	})
+
 	// Get peers endpoint
 	mux.HandleFunc("/api/peers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -143,48 +169,40 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		w.Write([]byte(`{"success": true}`))
 	})
 
-	// Get file location endpoint
+	// File location endpoint (both GET and PUT)
 	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+		switch r.Method {
+		case http.MethodGet:
+			filePath := r.URL.Query().Get("path")
+			if filePath == "" {
+				http.Error(w, "File path is required", http.StatusBadRequest)
+				return
+			}
 
-		filePath := r.URL.Query().Get("path")
-		if filePath == "" {
-			http.Error(w, "File path is required", http.StatusBadRequest)
-			return
-		}
+			locations, err := coordinatorService.GetFileLocation(r.Context(), filePath)
+			if err != nil {
+				http.Error(w, "Failed to get file location", http.StatusInternalServerError)
+				return
+			}
 
-		locations, err := coordinatorService.GetFileLocation(r.Context(), filePath)
-		if err != nil {
-			http.Error(w, "Failed to get file location", http.StatusInternalServerError)
-			return
-		}
-
-		writeJSONResponse(w, locations)
-	})
-
-	// Update file location endpoint
-	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var location coordinator.FileLocation
+			writeJSONResponse(w, locations)
+		case http.MethodPut:
+			var location coordinator.FileLocation
 		if err := parseJSONRequest(r, &location); err != nil {
 			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
 
-		if err := coordinatorService.UpdateFileLocation(r.Context(), &location); err != nil {
-			http.Error(w, "Failed to update file location", http.StatusInternalServerError)
-			return
-		}
+			if err := coordinatorService.UpdateFileLocation(r.Context(), &location); err != nil {
+				http.Error(w, "Failed to update file location", http.StatusInternalServerError)
+				return
+			}
 
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"success": true}`))
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"success": true}`))
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	// Get statistics endpoint
@@ -210,13 +228,16 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 }
 
 func parseJSONRequest(r *http.Request, v interface{}) error {
-	// Simple JSON parsing - in a real implementation, you'd use encoding/json
-	// For now, just return nil as we can't import encoding/json due to missing dependencies
-	return nil
+	defer r.Body.Close()
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
 func writeJSONResponse(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	// Simple JSON response - in a real implementation, you'd use encoding/json
-	w.Write([]byte("{}"))
+	
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("Failed to encode JSON response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }

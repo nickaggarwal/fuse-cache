@@ -59,6 +59,21 @@ func (cs *CoordinatorService) RegisterPeer(ctx context.Context, peer *PeerInfo) 
 	return nil
 }
 
+// UnregisterPeer removes a peer from the coordinator
+func (cs *CoordinatorService) UnregisterPeer(ctx context.Context, peerID string) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if _, exists := cs.peers[peerID]; exists {
+		delete(cs.peers, peerID)
+		cs.logger.Printf("Unregistered peer: %s", peerID)
+	} else {
+		cs.logger.Printf("Attempted to unregister non-existent peer: %s", peerID)
+	}
+
+	return nil
+}
+
 // GetPeers returns all active peers
 func (cs *CoordinatorService) GetPeers(ctx context.Context, requesterID string) ([]*PeerInfo, error) {
 	cs.mu.RLock()

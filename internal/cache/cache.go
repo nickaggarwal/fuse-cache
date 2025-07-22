@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -29,9 +30,11 @@ type CacheEntry struct {
 type CacheManager interface {
 	Get(ctx context.Context, filePath string) (*CacheEntry, error)
 	Put(ctx context.Context, entry *CacheEntry) error
+	PutWithoutReplication(ctx context.Context, entry *CacheEntry) error
 	Delete(ctx context.Context, filePath string) error
 	List(ctx context.Context) ([]*CacheEntry, error)
 	Evict(ctx context.Context, tier CacheTier) error
+	Shutdown()
 }
 
 // TierStorage represents storage interface for each tier
@@ -51,15 +54,17 @@ type CacheConfig struct {
 	PeerTimeout     time.Duration
 	CloudTimeout    time.Duration
 	CoordinatorAddr string
+	PeerID          string // Current peer ID to exclude from replication
 }
 
 // DefaultCacheManager implements CacheManager
 type DefaultCacheManager struct {
-	config       *CacheConfig
-	nvmeStorage  TierStorage
-	peerStorage  TierStorage
-	cloudStorage TierStorage
-	entries      map[string]*CacheEntry
+	config          *CacheConfig
+	nvmeStorage     TierStorage
+	peerStorage     TierStorage
+	cloudStorage    TierStorage
+	entries         map[string]*CacheEntry
+	snapshotManager *SnapshotManager
 }
 
 // NewCacheManager creates a new cache manager
@@ -80,7 +85,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		return nil, err
 	}
 
-	cm.peerStorage, err = NewPeerStorage(config.CoordinatorAddr, config.PeerTimeout)
+	cm.peerStorage, err = NewPeerStorage(config.CoordinatorAddr, config.PeerID, config.PeerTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +94,10 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Initialize snapshot manager with 30-second sync interval
+	syncInterval := 30 * time.Second
+	cm.snapshotManager = NewSnapshotManager(config.CoordinatorAddr, config.PeerID, syncInterval)
 
 	return cm, nil
 }
@@ -119,23 +128,58 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 
 // Put stores a file in the cache
 func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error {
+	return cm.putWithReplication(ctx, entry, true)
+}
+
+// PutWithoutReplication stores a file in the cache without replicating to peers (used for peer writes)
+func (cm *DefaultCacheManager) PutWithoutReplication(ctx context.Context, entry *CacheEntry) error {
+	return cm.putWithReplication(ctx, entry, false)
+}
+
+// putWithReplication is the internal implementation that controls peer replication
+func (cm *DefaultCacheManager) putWithReplication(ctx context.Context, entry *CacheEntry, shouldReplicate bool) error {
 	// Try to store in NVME first
 	if err := cm.putToTier(ctx, entry, TierNVMe); err == nil {
 		cm.entries[entry.FilePath] = entry
+		
+		// Update snapshot with local entry
+		cm.snapshotManager.AddLocalEntry(entry)
+		
+		// Only replicate to peers if this is an original user write (not a peer replication)
+		if shouldReplicate {
+			// Also replicate to peers for synchronization (async)
+			go func() {
+				// Use background context for async operation to avoid cancellation
+				bgCtx := context.Background()
+				fmt.Printf("[CACHE] Replicating file %s to peers...\n", entry.FilePath)
+				if err := cm.putToTier(bgCtx, entry, TierPeer); err != nil {
+					fmt.Printf("[CACHE] Failed to replicate %s to peers: %v\n", entry.FilePath, err)
+				} else {
+					fmt.Printf("[CACHE] Successfully replicated %s to peers\n", entry.FilePath)
+				}
+			}()
+		} else {
+			fmt.Printf("[CACHE] Skipping peer replication for %s (received from peer)\n", entry.FilePath)
+		}
+		
 		return nil
 	}
 
-	// Fall back to peer storage
-	entry.Tier = TierPeer
-	if err := cm.putToTier(ctx, entry, TierPeer); err == nil {
-		cm.entries[entry.FilePath] = entry
-		return nil
+	// Fall back to peer storage (only if we should replicate)
+	if shouldReplicate {
+		entry.Tier = TierPeer
+		if err := cm.putToTier(ctx, entry, TierPeer); err == nil {
+			cm.entries[entry.FilePath] = entry
+			cm.snapshotManager.AddLocalEntry(entry)
+			return nil
+		}
 	}
 
 	// Fall back to cloud storage
 	entry.Tier = TierCloud
 	if err := cm.putToTier(ctx, entry, TierCloud); err == nil {
 		cm.entries[entry.FilePath] = entry
+		cm.snapshotManager.AddLocalEntry(entry)
 		return nil
 	}
 
@@ -155,17 +199,50 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	}
 
 	delete(cm.entries, filePath)
+	
+	// Remove from snapshot
+	cm.snapshotManager.RemoveLocalEntry(filePath)
+	
 	return nil
 }
 
-// List returns all cached entries
+// List returns all cached entries using snapshot (prevents infinite loops)
 func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) {
-	entries := make([]*CacheEntry, 0, len(cm.entries))
-	for _, entry := range cm.entries {
-		entries = append(entries, entry)
-	}
+	fmt.Printf("[CACHE] Listing cached entries from snapshot...\n")
+	
+	// Use local snapshot only to avoid infinite loop when called from FUSE operations
+	entries := cm.snapshotManager.GetLocalSnapshot()
+	
+	fmt.Printf("[CACHE] Found %d entries from local snapshot\n", len(entries))
 	return entries, nil
 }
+
+// ListAll returns all cached entries including peer entries (use with caution, not for FUSE operations)
+func (cm *DefaultCacheManager) ListAll(ctx context.Context) ([]*CacheEntry, error) {
+	fmt.Printf("[CACHE] Listing all cached entries (local + peer) from snapshot...\n")
+	
+	// Get full snapshot including peer entries
+	entries := cm.snapshotManager.GetSnapshot()
+	
+	fmt.Printf("[CACHE] Found %d entries from full snapshot\n", len(entries))
+	return entries, nil
+}
+
+// GetSnapshotStatus returns status information about the snapshot manager
+func (cm *DefaultCacheManager) GetSnapshotStatus() map[string]interface{} {
+	return cm.snapshotManager.GetSyncStatus()
+}
+
+// Shutdown gracefully shuts down the cache manager
+func (cm *DefaultCacheManager) Shutdown() {
+	if cm.snapshotManager != nil {
+		cm.snapshotManager.Stop()
+	}
+}
+
+// NOTE: The old listFromPeers, getPeersFromCoordinator, and listFromPeer methods
+// have been removed as they caused infinite loops. The new snapshot-based approach
+// handles peer synchronization in the background without blocking directory operations.
 
 // Evict removes entries from a specific tier
 func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error {
@@ -178,6 +255,38 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 func (cm *DefaultCacheManager) getFromTier(ctx context.Context, filePath string, tier CacheTier) (*CacheEntry, error) {
 	storage := cm.getStorageForTier(tier)
 
+	// For peer storage, avoid calling Exists() to prevent infinite loops
+	// Instead, rely on the snapshot manager for peer data discovery
+	if tier == TierPeer {
+		// Check if we have this file in our peer snapshot
+		snapshot := cm.snapshotManager.GetSnapshot()
+		for _, entry := range snapshot {
+			if entry.FilePath == filePath && entry.Tier == TierPeer {
+				// Found in snapshot, try to read from peers
+				data, err := storage.Read(ctx, filePath)
+				if err != nil {
+					return nil, err
+				}
+				
+				size, err := storage.Size(ctx, filePath)
+				if err != nil {
+					return nil, err
+				}
+				
+				return &CacheEntry{
+					FilePath:     filePath,
+					StoragePath:  filePath,
+					Size:         size,
+					LastAccessed: time.Now(),
+					Tier:         tier,
+					Data:         data,
+				}, nil
+			}
+		}
+		return nil, errors.New("file not found in peer snapshot")
+	}
+
+	// For other tiers (NVMe, Cloud), use the normal exists check
 	if !storage.Exists(ctx, filePath) {
 		return nil, errors.New("file not found in tier")
 	}

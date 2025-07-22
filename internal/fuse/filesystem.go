@@ -90,8 +90,12 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	fullPath := filepath.Join(d.path, name)
 
-	// Check if it's a file in the cache
-	if entry, err := d.fs.cacheManager.Get(ctx, fullPath); err == nil {
+	// Check if it's a file in the cache (with timeout to avoid blocking)
+	// Use a short timeout context to prevent hanging on peer storage
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	
+	if entry, err := d.fs.cacheManager.Get(lookupCtx, fullPath); err == nil {
 		return &File{
 			fs:    d.fs,
 			path:  fullPath,
@@ -236,8 +240,11 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// Get fresh data from cache
-	entry, err := f.fs.cacheManager.Get(ctx, f.path)
+	// Get fresh data from cache (with timeout to avoid blocking)
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	
+	entry, err := f.fs.cacheManager.Get(readCtx, f.path)
 	if err != nil {
 		return fuse.EIO
 	}
@@ -275,13 +282,22 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.entry.Size = int64(len(f.entry.Data))
 	f.entry.LastAccessed = time.Now()
 
-	// Store in cache
-	if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-		return fuse.EIO
-	}
+	// Store in cache asynchronously.
+	// We make a deep copy of the entry to ensure the background write uses the correct data.
+	entryCopy := *f.entry
+	entryCopy.Data = make([]byte, len(f.entry.Data))
+	copy(entryCopy.Data, f.entry.Data)
+
+	go func() {
+		// Use background context for async operation to avoid cancellation from original request
+		bgCtx := context.Background()
+		if err := f.fs.cacheManager.Put(bgCtx, &entryCopy); err != nil {
+			f.fs.logger.Printf("[ERROR] Async write for %s failed: %v", f.path, err)
+		}
+	}()
 
 	resp.Size = len(req.Data)
-	f.fs.logger.Printf("Wrote %d bytes to %s at offset %d", len(req.Data), f.path, req.Offset)
+	f.fs.logger.Printf("Wrote %d bytes to %s at offset %d (async)", len(req.Data), f.path, req.Offset)
 	return nil
 }
 
@@ -290,10 +306,21 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Ensure data is stored in cache
-	if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-		return fuse.EIO
-	}
+	// Make a copy of the entry for async operation
+	entryCopy := *f.entry
+	entryCopy.Data = make([]byte, len(f.entry.Data))
+	copy(entryCopy.Data, f.entry.Data)
+
+	// Store in cache asynchronously to avoid blocking the flush operation
+	go func() {
+		// Use background context for async operation to avoid cancellation from original request
+		bgCtx := context.Background()
+		if err := f.fs.cacheManager.Put(bgCtx, &entryCopy); err != nil {
+			f.fs.logger.Printf("[ERROR] Async flush for %s failed: %v", f.path, err)
+		} else {
+			f.fs.logger.Printf("Async flush completed for: %s", f.path)
+		}
+	}()
 
 	f.fs.logger.Printf("Flushed file: %s", f.path)
 	return nil
@@ -321,10 +348,21 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		f.entry.Size = int64(req.Size)
 		f.entry.LastAccessed = time.Now()
 
-		// Store in cache
-		if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-			return fuse.EIO
-		}
+		// Make a copy of the entry for async operation
+		entryCopy := *f.entry
+		entryCopy.Data = make([]byte, len(f.entry.Data))
+		copy(entryCopy.Data, f.entry.Data)
+
+		// Store in cache asynchronously to avoid blocking
+		go func() {
+			// Use background context for async operation to avoid cancellation from original request
+			bgCtx := context.Background()
+			if err := f.fs.cacheManager.Put(bgCtx, &entryCopy); err != nil {
+				f.fs.logger.Printf("[ERROR] Async setattr for %s failed: %v", f.path, err)
+			} else {
+				f.fs.logger.Printf("Async setattr completed for: %s", f.path)
+			}
+		}()
 	}
 
 	return f.Attr(ctx, &resp.Attr)
@@ -332,8 +370,11 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 // Open opens the file
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
-	// Check if file exists in cache
-	entry, err := f.fs.cacheManager.Get(ctx, f.path)
+	// Check if file exists in cache (with timeout to avoid blocking)
+	openCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	
+	entry, err := f.fs.cacheManager.Get(openCtx, f.path)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
