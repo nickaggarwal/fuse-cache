@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: client
+  namespace: fuse-system
+  labels:
+    app: client
+spec:
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      nodeSelector:
+        agentpool: userpool
+      containers:
+        - name: client
+          image: stargzrepo.azurecr.io/fuse-client:latest
+          command: ["client"]
+          args:
+            - "-mount"
+            - "$(FUSE_MOUNT_PATH)"
+            - "-nvme"
+            - "$(NVME_CACHE_PATH)"
+            - "-coordinator"
+            - "$(COORDINATOR_ADDR)"
+            - "-port"
+            - "8081"
+            - "-chunk-size"
+            - "$(CHUNK_SIZE_MB)"
+          envFrom:
+            - configMapRef:
+                name: fuse-config
+            - secretRef:
+                name: aws-credentials
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 8081
+              name: http
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fuse-device
+              mountPath: /dev/fuse
+            - name: nvme-storage
+              mountPath: /mnt/nvme
+            - name: fuse-mount
+              mountPath: /mnt/fuse
+              mountPropagation: Bidirectional
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: fuse-device
+          hostPath:
+            path: /dev/fuse
+        - name: nvme-storage
+          hostPath:
+            path: /mnt
+            type: Directory
+        - name: fuse-mount
+          hostPath:
+            path: /mnt/fuse
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: client-headless
+  namespace: fuse-system
+  labels:
+    app: client
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: client
+  ports:
+    - port: 8081
+      targetPort: 8081
+      protocol: TCP
+      name: http

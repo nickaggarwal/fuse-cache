@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -69,6 +70,11 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("Server shutdown error: %v", err)
+	}
+
+	// Save state before exiting
+	if err := coordinatorService.SaveState(); err != nil {
+		logger.Printf("Failed to save state: %v", err)
 	}
 
 	logger.Println("Coordinator stopped")
@@ -143,48 +149,42 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		w.Write([]byte(`{"success": true}`))
 	})
 
-	// Get file location endpoint
+	// File location endpoint (GET and PUT)
 	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
+			filePath := r.URL.Query().Get("path")
+			if filePath == "" {
+				http.Error(w, "File path is required", http.StatusBadRequest)
+				return
+			}
+
+			locations, err := coordinatorService.GetFileLocation(r.Context(), filePath)
+			if err != nil {
+				http.Error(w, "Failed to get file location", http.StatusInternalServerError)
+				return
+			}
+
+			writeJSONResponse(w, locations)
+
+		case http.MethodPut:
+			var location coordinator.FileLocation
+			if err := parseJSONRequest(r, &location); err != nil {
+				http.Error(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
+
+			if err := coordinatorService.UpdateFileLocation(r.Context(), &location); err != nil {
+				http.Error(w, "Failed to update file location", http.StatusInternalServerError)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"success": true}`))
+
+		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
 		}
-
-		filePath := r.URL.Query().Get("path")
-		if filePath == "" {
-			http.Error(w, "File path is required", http.StatusBadRequest)
-			return
-		}
-
-		locations, err := coordinatorService.GetFileLocation(r.Context(), filePath)
-		if err != nil {
-			http.Error(w, "Failed to get file location", http.StatusInternalServerError)
-			return
-		}
-
-		writeJSONResponse(w, locations)
-	})
-
-	// Update file location endpoint
-	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var location coordinator.FileLocation
-		if err := parseJSONRequest(r, &location); err != nil {
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
-
-		if err := coordinatorService.UpdateFileLocation(r.Context(), &location); err != nil {
-			http.Error(w, "Failed to update file location", http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"success": true}`))
 	})
 
 	// Get statistics endpoint
@@ -210,13 +210,12 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 }
 
 func parseJSONRequest(r *http.Request, v interface{}) error {
-	// Simple JSON parsing - in a real implementation, you'd use encoding/json
-	// For now, just return nil as we can't import encoding/json due to missing dependencies
-	return nil
+	return json.NewDecoder(r.Body).Decode(v)
 }
 
 func writeJSONResponse(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	// Simple JSON response - in a real implementation, you'd use encoding/json
-	w.Write([]byte("{}"))
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("Failed to write response: %v", err)
+	}
 }

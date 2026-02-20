@@ -3,6 +3,10 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"sort"
+	"sync"
 	"time"
 )
 
@@ -51,6 +55,19 @@ type CacheConfig struct {
 	PeerTimeout     time.Duration
 	CloudTimeout    time.Duration
 	CoordinatorAddr string
+	ChunkSize       int64
+
+	// Cloud provider: "s3" or "azure"
+	CloudProvider string
+
+	// S3 config
+	S3Bucket string
+	S3Region string
+
+	// Azure config
+	AzureStorageAccount   string
+	AzureStorageKey       string
+	AzureContainerName    string
 }
 
 // DefaultCacheManager implements CacheManager
@@ -60,6 +77,9 @@ type DefaultCacheManager struct {
 	peerStorage  TierStorage
 	cloudStorage TierStorage
 	entries      map[string]*CacheEntry
+	nvmeUsed     int64
+	mu           sync.RWMutex
+	logger       *log.Logger
 }
 
 // NewCacheManager creates a new cache manager
@@ -68,9 +88,15 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		return nil, errors.New("NVME path is required")
 	}
 
+	// Set default chunk size if not provided
+	if config.ChunkSize <= 0 {
+		config.ChunkSize = 4 * 1024 * 1024 // 4MB default
+	}
+
 	cm := &DefaultCacheManager{
 		config:  config,
 		entries: make(map[string]*CacheEntry),
+		logger:  log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
 	}
 
 	// Initialize storage tiers
@@ -85,7 +111,18 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		return nil, err
 	}
 
-	cm.cloudStorage, err = NewCloudStorage(config.CloudTimeout)
+	// Initialize cloud storage based on provider
+	switch config.CloudProvider {
+	case "azure":
+		cm.cloudStorage, err = NewAzureStorage(
+			config.AzureStorageAccount,
+			config.AzureStorageKey,
+			config.AzureContainerName,
+			config.CloudTimeout,
+		)
+	default: // "s3" or empty
+		cm.cloudStorage, err = NewCloudStorage(config.S3Bucket, config.S3Region, config.CloudTimeout)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -102,15 +139,13 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 
 	// Check Tier 2: Peers
 	if entry, err := cm.getFromTier(ctx, filePath, TierPeer); err == nil {
-		// Promote to NVME if there's space
-		go cm.promoteToNVMe(ctx, entry)
+		go cm.promoteToNVMe(context.Background(), entry)
 		return entry, nil
 	}
 
 	// Check Tier 3: Cloud
 	if entry, err := cm.getFromTier(ctx, filePath, TierCloud); err == nil {
-		// Promote to NVME if there's space
-		go cm.promoteToNVMe(ctx, entry)
+		go cm.promoteToNVMe(context.Background(), entry)
 		return entry, nil
 	}
 
@@ -119,32 +154,63 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 
 // Put stores a file in the cache
 func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error {
-	// Try to store in NVME first
-	if err := cm.putToTier(ctx, entry, TierNVMe); err == nil {
+	// Try to store in NVME first (with eviction if needed)
+	if err := cm.putToNVMeWithEviction(ctx, entry); err == nil {
+		cm.mu.Lock()
 		cm.entries[entry.FilePath] = entry
+		cm.mu.Unlock()
 		return nil
 	}
 
-	// Fall back to peer storage
-	entry.Tier = TierPeer
-	if err := cm.putToTier(ctx, entry, TierPeer); err == nil {
-		cm.entries[entry.FilePath] = entry
-		return nil
+	// Check if file needs chunking
+	if int64(len(entry.Data)) > cm.config.ChunkSize {
+		return cm.putChunked(ctx, entry)
 	}
 
-	// Fall back to cloud storage
-	entry.Tier = TierCloud
-	if err := cm.putToTier(ctx, entry, TierCloud); err == nil {
-		cm.entries[entry.FilePath] = entry
-		return nil
+	// Parallel Write Strategy: Race Peer and Cloud
+	type writeResult struct {
+		tier CacheTier
+		err  error
 	}
 
-	return errors.New("failed to store file in any tier")
+	resultChan := make(chan writeResult, 2)
+	writeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		entryCopy := *entry
+		entryCopy.Tier = TierPeer
+		err := cm.putToTier(writeCtx, &entryCopy, TierPeer)
+		resultChan <- writeResult{TierPeer, err}
+	}()
+
+	go func() {
+		entryCopy := *entry
+		entryCopy.Tier = TierCloud
+		err := cm.putToTier(writeCtx, &entryCopy, TierCloud)
+		resultChan <- writeResult{TierCloud, err}
+	}()
+
+	// Wait for first success or all failures
+	for i := 0; i < 2; i++ {
+		res := <-resultChan
+		if res.err == nil {
+			cm.mu.Lock()
+			entry.Tier = res.tier
+			cm.entries[entry.FilePath] = entry
+			cm.mu.Unlock()
+			return nil
+		}
+	}
+
+	return errors.New("failed to store file in Peer or Cloud tier")
 }
 
 // Delete removes a file from cache
 func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) error {
+	cm.mu.RLock()
 	entry, exists := cm.entries[filePath]
+	cm.mu.RUnlock()
 	if !exists {
 		return errors.New("file not found in cache")
 	}
@@ -154,12 +220,19 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 		return err
 	}
 
+	cm.mu.Lock()
+	if entry.Tier == TierNVMe {
+		cm.nvmeUsed -= entry.Size
+	}
 	delete(cm.entries, filePath)
+	cm.mu.Unlock()
 	return nil
 }
 
 // List returns all cached entries
 func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	entries := make([]*CacheEntry, 0, len(cm.entries))
 	for _, entry := range cm.entries {
 		entries = append(entries, entry)
@@ -167,10 +240,77 @@ func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) 
 	return entries, nil
 }
 
-// Evict removes entries from a specific tier
+// Evict removes the least recently accessed entries from a tier to free the given number of bytes.
+// If bytesNeeded is 0, it evicts entries until usage is below 90% of MaxNVMeSize.
 func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error {
-	// Implementation for LRU eviction
-	// This would be more complex in a real implementation
+	if tier != TierNVMe {
+		return nil
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	target := cm.config.MaxNVMeSize * 9 / 10 // evict down to 90%
+	if cm.nvmeUsed <= target {
+		return nil
+	}
+
+	// Collect NVMe entries and sort by LastAccessed (oldest first)
+	type entryRef struct {
+		key   string
+		entry *CacheEntry
+	}
+	var nvmeEntries []entryRef
+	for k, e := range cm.entries {
+		if e.Tier == TierNVMe {
+			nvmeEntries = append(nvmeEntries, entryRef{k, e})
+		}
+	}
+	sort.Slice(nvmeEntries, func(i, j int) bool {
+		return nvmeEntries[i].entry.LastAccessed.Before(nvmeEntries[j].entry.LastAccessed)
+	})
+
+	for _, ref := range nvmeEntries {
+		if cm.nvmeUsed <= target {
+			break
+		}
+		storage := cm.getStorageForTier(TierNVMe)
+		if err := storage.Delete(ctx, ref.entry.FilePath); err != nil {
+			cm.logger.Printf("Eviction delete failed for %s: %v", ref.key, err)
+			continue
+		}
+		cm.nvmeUsed -= ref.entry.Size
+		delete(cm.entries, ref.key)
+		cm.logger.Printf("Evicted %s (%d bytes)", ref.key, ref.entry.Size)
+	}
+
+	return nil
+}
+
+// putToNVMeWithEviction tries NVMe write, evicting if necessary
+func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry *CacheEntry) error {
+	cm.mu.RLock()
+	wouldExceed := cm.nvmeUsed+entry.Size > cm.config.MaxNVMeSize
+	cm.mu.RUnlock()
+
+	if wouldExceed {
+		cm.Evict(ctx, TierNVMe)
+		// Re-check after eviction
+		cm.mu.RLock()
+		stillExceed := cm.nvmeUsed+entry.Size > cm.config.MaxNVMeSize
+		cm.mu.RUnlock()
+		if stillExceed {
+			return errors.New("NVMe storage full after eviction")
+		}
+	}
+
+	if err := cm.putToTier(ctx, entry, TierNVMe); err != nil {
+		return err
+	}
+
+	cm.mu.Lock()
+	cm.nvmeUsed += entry.Size
+	cm.mu.Unlock()
 	return nil
 }
 
@@ -221,7 +361,6 @@ func (cm *DefaultCacheManager) getStorageForTier(tier CacheTier) TierStorage {
 }
 
 func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEntry) {
-	// Promote file to NVME storage
 	newEntry := &CacheEntry{
 		FilePath:     entry.FilePath,
 		StoragePath:  entry.StoragePath,
@@ -231,7 +370,63 @@ func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEn
 		Data:         entry.Data,
 	}
 
-	if err := cm.putToTier(ctx, newEntry, TierNVMe); err == nil {
-		cm.entries[entry.FilePath] = newEntry
+	if err := cm.putToNVMeWithEviction(ctx, newEntry); err != nil {
+		cm.logger.Printf("Promotion to NVMe failed for %s: %v", entry.FilePath, err)
+		return
 	}
+
+	cm.mu.Lock()
+	cm.entries[entry.FilePath] = newEntry
+	cm.mu.Unlock()
+}
+
+func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry) error {
+	dataLen := int64(len(entry.Data))
+	numChunks := (dataLen + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, numChunks)
+
+	for i := int64(0); i < numChunks; i++ {
+		start := i * cm.config.ChunkSize
+		end := start + cm.config.ChunkSize
+		if end > dataLen {
+			end = dataLen
+		}
+
+		chunkData := entry.Data[start:end]
+		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
+
+		wg.Add(1)
+		go func(path string, data []byte) {
+			defer wg.Done()
+
+			chunkEntry := &CacheEntry{
+				FilePath:     path,
+				StoragePath:  path,
+				Size:         int64(len(data)),
+				LastAccessed: time.Now(),
+				Data:         data,
+			}
+
+			if err := cm.Put(ctx, chunkEntry); err != nil {
+				errChan <- err
+			}
+		}(chunkPath, chunkData)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return fmt.Errorf("failed to upload chunk: %v", err)
+		}
+	}
+
+	cm.mu.Lock()
+	cm.entries[entry.FilePath] = entry
+	cm.mu.Unlock()
+
+	return nil
 }

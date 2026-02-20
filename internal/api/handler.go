@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"fuse-client/internal/cache"
@@ -16,27 +18,53 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const maxUploadSize = 100 * 1024 * 1024 // 100MB
+
 // Handler handles HTTP requests for the peer API
 type Handler struct {
 	cacheManager cache.CacheManager
-	coordinator  *coordinator.CoordinatorService
+	coordinator  coordinator.Coordinator
 	peerID       string
+	apiKey       string
 	logger       *log.Logger
 }
 
 // NewHandler creates a new API handler
-func NewHandler(cacheManager cache.CacheManager, coordinator *coordinator.CoordinatorService, peerID string) *Handler {
+func NewHandler(cacheManager cache.CacheManager, coord coordinator.Coordinator, peerID string, apiKey string) *Handler {
 	return &Handler{
 		cacheManager: cacheManager,
-		coordinator:  coordinator,
+		coordinator:  coord,
 		peerID:       peerID,
+		apiKey:       apiKey,
 		logger:       log.New(log.Writer(), "[API] ", log.LstdFlags),
 	}
+}
+
+// authMiddleware checks API key if configured
+func (h *Handler) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Health endpoint is always public
+		if r.URL.Path == "/api/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if h.apiKey != "" {
+			key := r.Header.Get("X-API-Key")
+			if key != h.apiKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // SetupRoutes sets up the HTTP routes
 func (h *Handler) SetupRoutes() *mux.Router {
 	router := mux.NewRouter()
+
+	// Apply auth middleware
+	router.Use(h.authMiddleware)
 
 	// File operations
 	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
@@ -57,29 +85,42 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	return router
 }
 
+// sanitizePath validates and cleans a file path to prevent path traversal
+func sanitizePath(raw string) (string, error) {
+	cleaned := filepath.Clean("/" + raw)
+	if strings.Contains(cleaned, "..") {
+		return "", fmt.Errorf("invalid path: contains traversal")
+	}
+	return cleaned, nil
+}
+
 // handleFile handles file operations
 func (h *Handler) handleFile(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	filePath := "/" + vars["path"]
+	filePath, err := sanitizePath(vars["path"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 
 	switch r.Method {
 	case "GET":
-		h.handleFileGet(w, r, ctx, filePath)
+		h.handleFileGet(w, ctx, filePath)
 	case "PUT":
 		h.handleFilePut(w, r, ctx, filePath)
 	case "DELETE":
-		h.handleFileDelete(w, r, ctx, filePath)
+		h.handleFileDelete(w, ctx, filePath)
 	case "HEAD":
-		h.handleFileHead(w, r, ctx, filePath)
+		h.handleFileHead(w, ctx, filePath)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
 // handleFileGet handles GET requests for files
-func (h *Handler) handleFileGet(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
+func (h *Handler) handleFileGet(w http.ResponseWriter, ctx context.Context, filePath string) {
 	entry, err := h.cacheManager.Get(ctx, filePath)
 	if err != nil {
 		h.logger.Printf("File not found: %s", filePath)
@@ -96,8 +137,15 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, r *http.Request, ctx cont
 
 // handleFilePut handles PUT requests for files
 func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
-	data, err := ioutil.ReadAll(r.Body)
+	// Limit upload size
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
+		if err.Error() == "http: request body too large" {
+			http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -133,7 +181,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx cont
 }
 
 // handleFileDelete handles DELETE requests for files
-func (h *Handler) handleFileDelete(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
+func (h *Handler) handleFileDelete(w http.ResponseWriter, ctx context.Context, filePath string) {
 	if err := h.cacheManager.Delete(ctx, filePath); err != nil {
 		h.logger.Printf("Failed to delete file: %s", err)
 		http.Error(w, "Failed to delete file", http.StatusInternalServerError)
@@ -145,7 +193,7 @@ func (h *Handler) handleFileDelete(w http.ResponseWriter, r *http.Request, ctx c
 }
 
 // handleFileHead handles HEAD requests for files
-func (h *Handler) handleFileHead(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
+func (h *Handler) handleFileHead(w http.ResponseWriter, ctx context.Context, filePath string) {
 	entry, err := h.cacheManager.Get(ctx, filePath)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -159,7 +207,11 @@ func (h *Handler) handleFileHead(w http.ResponseWriter, r *http.Request, ctx con
 // handleFileSize handles requests for file size
 func (h *Handler) handleFileSize(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	filePath := "/" + vars["path"]
+	filePath, err := sanitizePath(vars["path"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 

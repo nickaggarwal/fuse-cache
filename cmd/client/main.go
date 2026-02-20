@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,7 +24,22 @@ func main() {
 		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator address")
 		peerPort        = flag.Int("port", 8081, "Port for peer API server")
 		peerID          = flag.String("peer-id", "", "Peer ID (auto-generated if not provided)")
-		help            = flag.Bool("help", false, "Show help")
+		chunkSizeMB     = flag.Int("chunk-size", 4, "Chunk size in MB")
+		apiKey          = flag.String("api-key", "", "API key for authentication (optional)")
+
+		// Cloud provider selection
+		cloudProvider = flag.String("cloud-provider", "s3", "Cloud storage provider: s3 or azure")
+
+		// S3 config
+		s3Bucket = flag.String("s3-bucket", "fuse-client-cache", "S3 bucket name")
+		s3Region = flag.String("s3-region", "us-east-1", "S3 region")
+
+		// Azure config
+		azureAccount   = flag.String("azure-account", "", "Azure storage account name")
+		azureKey       = flag.String("azure-key", "", "Azure storage account key")
+		azureContainer = flag.String("azure-container", "fuse-cache", "Azure blob container name")
+
+		help = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
 
@@ -37,6 +53,17 @@ func main() {
 		*peerID = fmt.Sprintf("peer-%d", time.Now().Unix())
 	}
 
+	// Override from env vars if set
+	if v := os.Getenv("AZURE_STORAGE_ACCOUNT"); v != "" && *azureAccount == "" {
+		*azureAccount = v
+	}
+	if v := os.Getenv("AZURE_STORAGE_KEY"); v != "" && *azureKey == "" {
+		*azureKey = v
+	}
+	if v := os.Getenv("AZURE_CONTAINER_NAME"); v != "" && *azureContainer == "" {
+		*azureContainer = v
+	}
+
 	logger := log.New(os.Stdout, "[CLIENT] ", log.LstdFlags)
 	logger.Printf("Starting FUSE client with ID: %s", *peerID)
 
@@ -48,10 +75,18 @@ func main() {
 	cacheConfig := &cache.CacheConfig{
 		NVMePath:        *nvmePath,
 		MaxNVMeSize:     10 * 1024 * 1024 * 1024, // 10GB
-		MaxPeerSize:     5 * 1024 * 1024 * 1024,  // 5GB
+		MaxPeerSize:     5 * 1024 * 1024 * 1024,   // 5GB
 		PeerTimeout:     30 * time.Second,
 		CloudTimeout:    60 * time.Second,
 		CoordinatorAddr: *coordinatorAddr,
+		ChunkSize:       int64(*chunkSizeMB) * 1024 * 1024,
+
+		CloudProvider:       *cloudProvider,
+		S3Bucket:            *s3Bucket,
+		S3Region:            *s3Region,
+		AzureStorageAccount: *azureAccount,
+		AzureStorageKey:     *azureKey,
+		AzureContainerName:  *azureContainer,
 	}
 
 	// Initialize cache manager
@@ -60,18 +95,17 @@ func main() {
 		logger.Fatalf("Failed to create cache manager: %v", err)
 	}
 
-	// Create coordinator service (optional for clients)
-	var coordinatorService *coordinator.CoordinatorService
+	// Create coordinator client (HTTP-based, talks to remote coordinator)
+	var coordClient coordinator.Coordinator
 	if *coordinatorAddr != "" {
-		coordinatorService = coordinator.NewCoordinatorService()
-		coordinatorService.Start(ctx)
+		coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
 
-		// Register this peer with the coordinator
-		go registerPeer(ctx, coordinatorService, *peerID, *peerPort, *nvmePath, logger)
+		// Register this peer with the remote coordinator
+		go registerPeer(ctx, coordClient, *peerID, *peerPort, *nvmePath, logger)
 	}
 
 	// Create API handler
-	apiHandler := api.NewHandler(cacheManager, coordinatorService, *peerID)
+	apiHandler := api.NewHandler(cacheManager, coordClient, *peerID, *apiKey)
 
 	// Start API server
 	go func() {
@@ -97,35 +131,13 @@ func main() {
 		}
 	}()
 
-	// Add a test file to the cache
-	go func() {
-		// Wait a bit for the filesystem to be ready
-		time.Sleep(2 * time.Second)
-
-		// Add a test file
-		testFilePath := "/test-file.txt"
-		testData := []byte("Hello, FUSE!")
-
-		entry := &cache.CacheEntry{
-			FilePath:     testFilePath,
-			Size:         int64(len(testData)),
-			LastAccessed: time.Now(),
-			Data:         testData,
-		}
-
-		if err := cacheManager.Put(ctx, entry); err != nil {
-			logger.Printf("Failed to put test file: %v", err)
-		} else {
-			logger.Printf("Test file stored in cache: %s", testFilePath)
-		}
-	}()
-
 	logger.Printf("Client started successfully")
 	logger.Printf("- Peer ID: %s", *peerID)
 	logger.Printf("- Mount point: %s", *mountPoint)
 	logger.Printf("- NVME cache: %s", *nvmePath)
 	logger.Printf("- API port: %d", *peerPort)
 	logger.Printf("- Coordinator: %s", *coordinatorAddr)
+	logger.Printf("- Cloud provider: %s", *cloudProvider)
 
 	// Wait for interrupt signal to gracefully shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -147,27 +159,39 @@ func main() {
 	logger.Println("Client stopped")
 }
 
-func registerPeer(ctx context.Context, coordinatorService *coordinator.CoordinatorService, peerID string, port int, nvmePath string, logger *log.Logger) {
-	// Calculate available space (simplified)
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port int, nvmePath string, logger *log.Logger) {
 	availableSpace := int64(10 * 1024 * 1024 * 1024) // 10GB
 	usedSpace := int64(0)
 
+	// Use POD_IP env var if available (Kubernetes), otherwise detect local IP
+	host := os.Getenv("POD_IP")
+	if host == "" {
+		host = getLocalIP()
+	}
+
 	peerInfo := &coordinator.PeerInfo{
 		ID:             peerID,
-		Address:        fmt.Sprintf("localhost:%d", port),
+		Address:        fmt.Sprintf("%s:%d", host, port),
 		NVMePath:       nvmePath,
 		AvailableSpace: availableSpace,
 		UsedSpace:      usedSpace,
 		Status:         "active",
 	}
 
-	// Register peer
-	if err := coordinatorService.RegisterPeer(ctx, peerInfo); err != nil {
-		logger.Printf("Failed to register peer: %v", err)
-		return
+	// Retry registration with backoff
+	for attempt := 0; attempt < 5; attempt++ {
+		if err := coordClient.RegisterPeer(ctx, peerInfo); err != nil {
+			logger.Printf("Failed to register peer (attempt %d): %v", attempt+1, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
+				continue
+			}
+		}
+		logger.Printf("Peer registered successfully at %s", peerInfo.Address)
+		break
 	}
-
-	logger.Printf("Peer registered successfully")
 
 	// Send periodic heartbeats
 	ticker := time.NewTicker(30 * time.Second)
@@ -178,16 +202,22 @@ func registerPeer(ctx context.Context, coordinatorService *coordinator.Coordinat
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Update peer status
-			if err := coordinatorService.UpdatePeerStatus(ctx, peerID, "active", availableSpace, usedSpace); err != nil {
+			if err := coordClient.UpdatePeerStatus(ctx, peerID, "active", availableSpace, usedSpace); err != nil {
 				logger.Printf("Failed to update peer status: %v", err)
 			}
 		}
 	}
 }
 
-func calculateDiskUsage(path string) (int64, int64) {
-	// Simplified disk usage calculation
-	// In a real implementation, you would use syscall.Statfs or similar
-	return 10 * 1024 * 1024 * 1024, 0 // 10GB available, 0 used
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "localhost"
+	}
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+			return ipNet.IP.String()
+		}
+	}
+	return "localhost"
 }

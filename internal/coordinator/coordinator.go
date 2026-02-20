@@ -2,31 +2,45 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"os"
 	"sync"
 	"time"
 )
 
 // PeerInfo represents a peer in the system
 type PeerInfo struct {
-	ID             string
-	Address        string
-	NVMePath       string
-	AvailableSpace int64
-	UsedSpace      int64
-	Status         string
-	LastHeartbeat  time.Time
+	ID             string    `json:"id"`
+	Address        string    `json:"address"`
+	NVMePath       string    `json:"nvme_path"`
+	AvailableSpace int64     `json:"available_space"`
+	UsedSpace      int64     `json:"used_space"`
+	Status         string    `json:"status"`
+	LastHeartbeat  time.Time `json:"last_heartbeat"`
+}
+
+// ChunkInfo represents a file chunk
+type ChunkInfo struct {
+	Index   int    `json:"index"`
+	PeerID  string `json:"peer_id"`
+	ChunkID string `json:"chunk_id"`
 }
 
 // FileLocation represents the location of a file
 type FileLocation struct {
-	FilePath     string
-	PeerID       string
-	StorageTier  string
-	StoragePath  string
-	FileSize     int64
-	LastAccessed time.Time
+	FilePath     string      `json:"file_path"`
+	PeerID       string      `json:"peer_id"`
+	StorageTier  string      `json:"storage_tier"`
+	StoragePath  string      `json:"storage_path"`
+	FileSize     int64       `json:"file_size"`
+	LastAccessed time.Time   `json:"last_accessed"`
+	IsChunked    bool        `json:"is_chunked"`
+	Chunks       []ChunkInfo `json:"chunks,omitempty"`
 }
+
+// Ensure CoordinatorService implements the Coordinator interface
+var _ Coordinator = (*CoordinatorService)(nil)
 
 // CoordinatorService manages peer registration and file metadata
 type CoordinatorService struct {
@@ -66,7 +80,6 @@ func (cs *CoordinatorService) GetPeers(ctx context.Context, requesterID string) 
 
 	peers := make([]*PeerInfo, 0, len(cs.peers))
 	for _, peer := range cs.peers {
-		// Don't include the requester in the list
 		if peer.ID != requesterID && peer.Status == "active" {
 			peers = append(peers, peer)
 		}
@@ -105,7 +118,6 @@ func (cs *CoordinatorService) GetFileLocation(ctx context.Context, filePath stri
 		return []*FileLocation{}, nil
 	}
 
-	// Return a copy to avoid race conditions
 	result := make([]*FileLocation, len(locations))
 	copy(result, locations)
 	return result, nil
@@ -121,17 +133,14 @@ func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *
 		locations = make([]*FileLocation, 0)
 	}
 
-	// Check if this location already exists
 	for i, loc := range locations {
 		if loc.PeerID == location.PeerID && loc.StorageTier == location.StorageTier {
-			// Update existing location
 			locations[i] = location
 			cs.fileLocations[location.FilePath] = locations
 			return nil
 		}
 	}
 
-	// Add new location
 	locations = append(locations, location)
 	cs.fileLocations[location.FilePath] = locations
 
@@ -180,22 +189,81 @@ func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
 	}
 }
 
-// Start starts the coordinator service with periodic cleanup
+// Start starts the coordinator service with periodic cleanup and persistence
 func (cs *CoordinatorService) Start(ctx context.Context) {
-	// Start cleanup goroutine
+	if err := cs.LoadState(); err != nil {
+		cs.logger.Printf("Failed to load state: %v", err)
+	} else {
+		cs.logger.Printf("Loaded state from disk")
+	}
+
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+		cleanupTicker := time.NewTicker(30 * time.Second)
+		saveTicker := time.NewTicker(1 * time.Minute)
+		defer cleanupTicker.Stop()
+		defer saveTicker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
+				cs.SaveState()
 				return
-			case <-ticker.C:
+			case <-cleanupTicker.C:
 				cs.CleanupInactivePeers(60 * time.Second)
+			case <-saveTicker.C:
+				if err := cs.SaveState(); err != nil {
+					cs.logger.Printf("Failed to save state: %v", err)
+				}
 			}
 		}
 	}()
 
 	cs.logger.Printf("Coordinator service started")
+}
+
+// State represents the persistent state of the coordinator
+type State struct {
+	Peers         map[string]*PeerInfo       `json:"peers"`
+	FileLocations map[string][]*FileLocation `json:"file_locations"`
+}
+
+// SaveState saves the coordinator state to disk
+func (cs *CoordinatorService) SaveState() error {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	state := State{
+		Peers:         cs.peers,
+		FileLocations: cs.fileLocations,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile("coordinator_state.json", data, 0644)
+}
+
+// LoadState loads the coordinator state from disk
+func (cs *CoordinatorService) LoadState() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	data, err := os.ReadFile("coordinator_state.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	cs.peers = state.Peers
+	cs.fileLocations = state.FileLocations
+	return nil
 }

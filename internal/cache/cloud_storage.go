@@ -21,10 +21,16 @@ type CloudStorage struct {
 }
 
 // NewCloudStorage creates a new cloud storage instance
-func NewCloudStorage(timeout time.Duration) (*CloudStorage, error) {
-	// Create AWS session
+func NewCloudStorage(bucket, region string, timeout time.Duration) (*CloudStorage, error) {
+	if bucket == "" {
+		bucket = "fuse-client-cache"
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+
 	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String("us-east-1"), // Default region
+		Region: aws.String(region),
 	})
 	if err != nil {
 		return nil, err
@@ -33,7 +39,7 @@ func NewCloudStorage(timeout time.Duration) (*CloudStorage, error) {
 	s3Client := s3.New(sess)
 
 	return &CloudStorage{
-		bucket:     "fuse-client-cache", // Default bucket name
+		bucket:     bucket,
 		s3Client:   s3Client,
 		uploader:   s3manager.NewUploader(sess),
 		downloader: s3manager.NewDownloader(sess),
@@ -41,13 +47,10 @@ func NewCloudStorage(timeout time.Duration) (*CloudStorage, error) {
 	}, nil
 }
 
-// Read reads a file from cloud storage
 func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
-	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
-	// Download the file
 	buf := aws.NewWriteAtBuffer([]byte{})
 	_, err := cs.downloader.DownloadWithContext(timeoutCtx, buf, &s3.GetObjectInput{
 		Bucket: aws.String(cs.bucket),
@@ -60,13 +63,10 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Write writes a file to cloud storage
 func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) error {
-	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
-	// Upload the file
 	_, err := cs.uploader.UploadWithContext(timeoutCtx, &s3manager.UploadInput{
 		Bucket: aws.String(cs.bucket),
 		Key:    aws.String(path),
@@ -75,9 +75,7 @@ func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) err
 	return err
 }
 
-// Delete removes a file from cloud storage
 func (cs *CloudStorage) Delete(ctx context.Context, path string) error {
-	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
@@ -88,9 +86,7 @@ func (cs *CloudStorage) Delete(ctx context.Context, path string) error {
 	return err
 }
 
-// Exists checks if a file exists in cloud storage
 func (cs *CloudStorage) Exists(ctx context.Context, path string) bool {
-	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
@@ -101,9 +97,7 @@ func (cs *CloudStorage) Exists(ctx context.Context, path string) bool {
 	return err == nil
 }
 
-// Size returns the size of a file in cloud storage
 func (cs *CloudStorage) Size(ctx context.Context, path string) (int64, error) {
-	// Create a timeout context
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 

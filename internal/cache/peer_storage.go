@@ -1,12 +1,14 @@
 package cache
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math/big"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -46,7 +48,6 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 
-	// Try to read from each peer
 	for _, peer := range peers {
 		if peer.Status != "active" {
 			continue
@@ -61,25 +62,44 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	return nil, fmt.Errorf("file not found on any peer")
 }
 
-// Write writes a file to peer storage
+// Write writes a file to peer storage with replication
 func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) error {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Try to write to the first available peer
+	// Cryptographically secure shuffle
+	cryptoShuffle(peers)
+
+	successCount := 0
+	replicationFactor := 3
+	var lastErr error
+
 	for _, peer := range peers {
+		if successCount >= replicationFactor {
+			break
+		}
+
 		if peer.Status != "active" {
 			continue
 		}
 
 		if err := ps.writeToPeer(ctx, peer.Address, path, data); err == nil {
-			return nil
+			successCount++
+		} else {
+			lastErr = err
 		}
 	}
 
-	return fmt.Errorf("failed to write to any peer")
+	if successCount > 0 {
+		return nil
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to write to any peer: %v", lastErr)
+	}
+	return fmt.Errorf("no active peers available")
 }
 
 // Delete removes a file from peer storage
@@ -89,16 +109,18 @@ func (ps *PeerStorage) Delete(ctx context.Context, path string) error {
 		return err
 	}
 
-	// Try to delete from all peers
+	var lastErr error
 	for _, peer := range peers {
 		if peer.Status != "active" {
 			continue
 		}
 
-		ps.deleteFromPeer(ctx, peer.Address, path)
+		if err := ps.deleteFromPeer(ctx, peer.Address, path); err != nil {
+			lastErr = err
+		}
 	}
 
-	return nil
+	return lastErr
 }
 
 // Exists checks if a file exists in peer storage
@@ -141,10 +163,19 @@ func (ps *PeerStorage) Size(ctx context.Context, path string) (int64, error) {
 	return 0, fmt.Errorf("file not found on any peer")
 }
 
-// Helper methods
+// cryptoShuffle performs a Fisher-Yates shuffle using crypto/rand
+func cryptoShuffle(peers []PeerInfo) {
+	for i := len(peers) - 1; i > 0; i-- {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			continue
+		}
+		j := int(n.Int64())
+		peers[i], peers[j] = peers[j], peers[i]
+	}
+}
+
 func (ps *PeerStorage) getPeers(ctx context.Context) ([]PeerInfo, error) {
-	// This would normally make a gRPC call to the coordinator
-	// For now, we'll use a REST API call
 	url := fmt.Sprintf("http://%s/api/peers", ps.coordinatorAddr)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -184,13 +215,13 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, peerAddr, path string) 
 		return nil, fmt.Errorf("peer returned status: %d", resp.StatusCode)
 	}
 
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 func (ps *PeerStorage) writeToPeer(ctx context.Context, peerAddr, path string, data []byte) error {
 	url := fmt.Sprintf("http://%s/api/files/%s", peerAddr, path)
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, strings.NewReader(string(data)))
+	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}

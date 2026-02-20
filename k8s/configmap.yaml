@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuse-config
+  namespace: fuse-system
+data:
+  COORDINATOR_ADDR: "coordinator.fuse-system.svc.cluster.local:8080"
+  NVME_CACHE_PATH: "/mnt/nvme/cache"
+  FUSE_MOUNT_PATH: "/mnt/fuse"
+  CHUNK_SIZE_MB: "4"
