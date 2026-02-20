@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,6 +120,12 @@ type DefaultCacheManager struct {
 	metrics      *CacheMetrics
 	metadataAt   time.Time
 	metadataView []*CacheEntry
+	rangeChunks  map[string]*chunkCacheEntry
+}
+
+type chunkCacheEntry struct {
+	chunkIndex int64
+	data       []byte
 }
 
 // NewCacheManager creates a new cache manager
@@ -144,10 +152,11 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 
 	cm := &DefaultCacheManager{
-		config:  config,
-		entries: make(map[string]*CacheEntry),
-		logger:  log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
-		metrics: NewCacheMetrics(),
+		config:      config,
+		entries:     make(map[string]*CacheEntry),
+		logger:      log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
+		metrics:     NewCacheMetrics(),
+		rangeChunks: make(map[string]*chunkCacheEntry),
 	}
 
 	// Initialize storage tiers
@@ -299,6 +308,8 @@ func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w i
 
 // Put stores a file in the cache
 func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error {
+	cm.invalidateRangeCache(entry.FilePath)
+
 	// Compute checksum
 	if len(entry.Data) > 0 && entry.Checksum == "" {
 		h := sha256.Sum256(entry.Data)
@@ -388,6 +399,8 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 
 // Delete removes a file from cache
 func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) error {
+	cm.invalidateRangeCache(filePath)
+
 	cm.mu.RLock()
 	entry, exists := cm.entries[filePath]
 	cm.mu.RUnlock()
@@ -720,9 +733,8 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	dataLen := int64(len(entry.Data))
 	numChunks := (dataLen + cm.config.ChunkSize - 1) / cm.config.ChunkSize
 
-	var wg sync.WaitGroup
-	errChan := make(chan error, numChunks)
-
+	// Write chunks sequentially to avoid unbounded goroutine/data fan-out
+	// that can spike memory on large files (e.g., 1GiB+ writes).
 	for i := int64(0); i < numChunks; i++ {
 		start := i * cm.config.ChunkSize
 		end := start + cm.config.ChunkSize
@@ -732,36 +744,24 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 
 		chunkData := entry.Data[start:end]
 		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
-
-		wg.Add(1)
-		go func(path string, data []byte) {
-			defer wg.Done()
-
-			chunkEntry := &CacheEntry{
-				FilePath:     path,
-				StoragePath:  path,
-				Size:         int64(len(data)),
-				LastAccessed: time.Now(),
-				Data:         data,
-			}
-
-			if err := cm.Put(ctx, chunkEntry); err != nil {
-				errChan <- err
-			}
-		}(chunkPath, chunkData)
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	for err := range errChan {
-		if err != nil {
+		chunkEntry := &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(chunkData)),
+			LastAccessed: time.Now(),
+			Data:         chunkData,
+		}
+		if err := cm.Put(ctx, chunkEntry); err != nil {
 			return fmt.Errorf("failed to upload chunk: %v", err)
 		}
 	}
 
 	entry.IsChunked = true
 	entry.NumChunks = numChunks
+	entry.Size = dataLen
+	// Drop full payload after chunking to avoid retaining large buffers in memory.
+	entry.Data = nil
+	entry.Checksum = ""
 
 	cm.mu.Lock()
 	cm.entries[entry.FilePath] = entry
@@ -769,6 +769,135 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
 
 	return nil
+}
+
+// ReadRange reads a byte range from a file without loading an entire chunked file
+// into memory.
+func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error) {
+	if size <= 0 {
+		return []byte{}, nil
+	}
+
+	cm.mu.RLock()
+	entry, hasMeta := cm.entries[filePath]
+	isChunked := hasMeta && entry.IsChunked
+	chunkSize := cm.config.ChunkSize
+	cm.mu.RUnlock()
+
+	if !isChunked {
+		got, err := cm.Get(ctx, filePath)
+		if err != nil {
+			return nil, err
+		}
+		if offset >= int64(len(got.Data)) {
+			return []byte{}, nil
+		}
+		end := offset + int64(size)
+		if end > int64(len(got.Data)) {
+			end = int64(len(got.Data))
+		}
+		out := make([]byte, end-offset)
+		copy(out, got.Data[offset:end])
+		return out, nil
+	}
+
+	totalSize := entry.Size
+	if totalSize < 0 {
+		totalSize = 0
+	}
+	if offset >= totalSize {
+		return []byte{}, nil
+	}
+	end := offset + int64(size)
+	if end > totalSize {
+		end = totalSize
+	}
+
+	startChunk := offset / chunkSize
+	endChunk := (end - 1) / chunkSize
+	out := make([]byte, 0, end-offset)
+
+	for i := startChunk; i <= endChunk; i++ {
+		chunkData, ok := cm.getChunkFromRangeCache(filePath, i)
+		if !ok {
+			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
+			chunkEntry, err := cm.Get(ctx, chunkPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read chunk %d for %s: %v", i, filePath, err)
+			}
+			chunkData = chunkEntry.Data
+			cm.setChunkInRangeCache(filePath, i, chunkData)
+		}
+
+		chunkOffset := i * chunkSize
+		from := int64(0)
+		if offset > chunkOffset {
+			from = offset - chunkOffset
+		}
+
+		to := int64(len(chunkData))
+		chunkEnd := chunkOffset + int64(len(chunkData))
+		if end < chunkEnd {
+			to = end - chunkOffset
+		}
+
+		if from < 0 {
+			from = 0
+		}
+		if to < from {
+			to = from
+		}
+		if to > int64(len(chunkData)) {
+			to = int64(len(chunkData))
+		}
+		out = append(out, chunkData[from:to]...)
+	}
+
+	return out, nil
+}
+
+func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	cached, ok := cm.rangeChunks[filePath]
+	if !ok || cached == nil || cached.chunkIndex != chunkIndex {
+		return nil, false
+	}
+	return cached.data, true
+}
+
+func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	cm.mu.Lock()
+	cm.rangeChunks[filePath] = &chunkCacheEntry{
+		chunkIndex: chunkIndex,
+		data:       data,
+	}
+	cm.mu.Unlock()
+}
+
+func (cm *DefaultCacheManager) invalidateRangeCache(filePath string) {
+	cm.mu.Lock()
+	delete(cm.rangeChunks, filePath)
+	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
+		delete(cm.rangeChunks, parent)
+	}
+	cm.mu.Unlock()
+}
+
+func parentFilePathFromChunkPath(path string) (string, bool) {
+	idx := strings.LastIndex(path, "_chunk_")
+	if idx <= 0 {
+		return "", false
+	}
+	if _, err := strconv.ParseInt(path[idx+len("_chunk_"):], 10, 64); err != nil {
+		return "", false
+	}
+	return path[:idx], true
 }
 
 // Stats returns current NVMe usage and capacity

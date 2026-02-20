@@ -22,6 +22,7 @@ const (
 	maxReadaheadBytes = 4 * 1024 * 1024 // 4 MiB
 	maxBackgroundReqs = 128
 	defaultBlockSize  = 4 * 1024
+	writeProgressStep = 32 * 1024 * 1024 // 32 MiB
 )
 
 // pathToInode generates a deterministic inode number from a path using FNV-64a
@@ -39,6 +40,10 @@ func pathToInode(path string) uint64 {
 type FileSystem struct {
 	cacheManager cache.CacheManager
 	logger       *log.Logger
+}
+
+type rangeReader interface {
+	ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error)
 }
 
 // NewFileSystem creates a new FUSE filesystem
@@ -283,6 +288,31 @@ type File struct {
 	dirty bool
 }
 
+func growBuffer(data []byte, needed int) []byte {
+	if needed <= len(data) {
+		return data
+	}
+	if needed <= cap(data) {
+		return data[:needed]
+	}
+
+	newCap := cap(data)
+	if newCap == 0 {
+		newCap = 128 * 1024
+	}
+	for newCap < needed {
+		if newCap < 64*1024*1024 {
+			newCap *= 2
+		} else {
+			newCap += 64 * 1024 * 1024
+		}
+	}
+
+	grown := make([]byte, needed, newCap)
+	copy(grown, data)
+	return grown
+}
+
 // Attr returns the attributes of the file
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.mu.RLock()
@@ -318,28 +348,35 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 // Read reads data from the file
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	// Data is fetched lazily on read, not on lookup/open.
+	// Prefer range reads to avoid full-file materialization for chunked objects.
+	if rr, ok := f.fs.cacheManager.(rangeReader); ok {
+		data, err := rr.ReadRange(ctx, f.path, req.Offset, req.Size)
+		if err != nil {
+			return fuse.EIO
+		}
+		resp.Data = data
+		if len(data) > 0 && req.Offset%writeProgressStep == 0 {
+			f.fs.logger.Printf("Read %d bytes from %s at offset %d", len(data), f.path, req.Offset)
+		}
+		return nil
+	}
+
+	// Fallback path.
 	entry, err := f.fs.cacheManager.Get(ctx, f.path)
 	if err != nil {
 		return fuse.EIO
 	}
-
-	f.mu.Lock()
-	f.entry = entry
-	f.mu.Unlock()
-
-	// Handle offset and size
 	if req.Offset >= int64(len(entry.Data)) {
 		return nil
 	}
-
 	end := req.Offset + int64(req.Size)
 	if end > int64(len(entry.Data)) {
 		end = int64(len(entry.Data))
 	}
-
 	resp.Data = entry.Data[req.Offset:end]
-	f.fs.logger.Printf("Read %d bytes from %s at offset %d", len(resp.Data), f.path, req.Offset)
+	if len(resp.Data) > 0 && req.Offset%writeProgressStep == 0 {
+		f.fs.logger.Printf("Read %d bytes from %s at offset %d", len(resp.Data), f.path, req.Offset)
+	}
 	return nil
 }
 
@@ -348,13 +385,11 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Resize data if necessary
+	prevLen := len(f.entry.Data)
+
+	// Grow with headroom to avoid O(n^2) realloc/copy churn on sequential writes.
 	needed := int(req.Offset) + len(req.Data)
-	if needed > len(f.entry.Data) {
-		newData := make([]byte, needed)
-		copy(newData, f.entry.Data)
-		f.entry.Data = newData
-	}
+	f.entry.Data = growBuffer(f.entry.Data, needed)
 
 	// Write the data
 	copy(f.entry.Data[req.Offset:], req.Data)
@@ -363,7 +398,9 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.dirty = true
 
 	resp.Size = len(req.Data)
-	f.fs.logger.Printf("Wrote %d bytes to %s at offset %d", len(req.Data), f.path, req.Offset)
+	if (prevLen / writeProgressStep) != (needed / writeProgressStep) {
+		f.fs.logger.Printf("Write progress %s: %d bytes", f.path, needed)
+	}
 	return nil
 }
 
@@ -399,9 +436,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if req.Size < uint64(len(f.entry.Data)) {
 			f.entry.Data = f.entry.Data[:req.Size]
 		} else if req.Size > uint64(len(f.entry.Data)) {
-			newData := make([]byte, req.Size)
-			copy(newData, f.entry.Data)
-			f.entry.Data = newData
+			f.entry.Data = growBuffer(f.entry.Data, int(req.Size))
 		}
 		f.entry.Size = int64(req.Size)
 		f.entry.LastAccessed = time.Now()
