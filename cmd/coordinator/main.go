@@ -209,6 +209,23 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		}
 	})
 
+	// File metadata listing endpoint (GET)
+	mux.HandleFunc("/api/files/locations", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		prefix := r.URL.Query().Get("prefix")
+		locations, err := coordinatorService.ListFileLocations(r.Context(), prefix)
+		if err != nil {
+			http.Error(w, "Failed to list file locations", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSONResponse(w, locations)
+	})
+
 	// Get statistics endpoint
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

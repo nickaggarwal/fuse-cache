@@ -17,6 +17,7 @@ type Coordinator interface {
 	GetPeers(ctx context.Context, requesterID string) ([]*PeerInfo, error)
 	UpdatePeerStatus(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64) error
 	GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error)
+	ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error)
 	UpdateFileLocation(ctx context.Context, location *FileLocation) error
 	GetPeerStats() map[string]interface{}
 }
@@ -119,6 +120,29 @@ func (cc *CoordinatorClient) UpdatePeerStatus(ctx context.Context, peerID string
 
 func (cc *CoordinatorClient) GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/api/files/location?path=%s", cc.addr, filePath), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := cc.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var locations []*FileLocation
+	if err := json.NewDecoder(resp.Body).Decode(&locations); err != nil {
+		return nil, err
+	}
+	return locations, nil
+}
+
+func (cc *CoordinatorClient) ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error) {
+	url := fmt.Sprintf("http://%s/api/files/locations", cc.addr)
+	if prefix != "" {
+		url += "?prefix=" + prefix
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}

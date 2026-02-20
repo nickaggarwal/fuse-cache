@@ -123,6 +123,7 @@ func main() {
 		AzureStorageKey:     *azureKey,
 		AzureContainerName:  *azureContainer,
 		GCPBucket:           *gcpBucket,
+		LocalPeerID:         *peerID,
 	}
 
 	// Initialize cache manager

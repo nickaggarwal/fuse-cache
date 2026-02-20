@@ -22,6 +22,8 @@ metadata:
     app: coordinator
 spec:
   replicas: {{ .Values.coordinator.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: coordinator
@@ -35,7 +37,7 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["coordinator"]
-          args: ["-port", "{{ .Values.coordinator.httpPort }}", "-grpc-port", "{{ .Values.coordinator.grpcPort }}"]
+          args: ["-port", "{{ .Values.coordinator.httpPort }}"]
           ports:
             - containerPort: {{ .Values.coordinator.httpPort }}
               name: http

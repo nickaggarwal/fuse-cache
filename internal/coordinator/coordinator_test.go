@@ -123,6 +123,29 @@ func TestFileLocationUpdate(t *testing.T) {
 	}
 }
 
+func TestListFileLocations(t *testing.T) {
+	cs := NewCoordinatorService()
+	ctx := context.Background()
+
+	cs.UpdateFileLocation(ctx, &FileLocation{
+		FilePath: "/dir/a.txt", PeerID: "peer-1", StorageTier: "cloud", FileSize: 10,
+	})
+	cs.UpdateFileLocation(ctx, &FileLocation{
+		FilePath: "/dir/b.txt", PeerID: "peer-2", StorageTier: "peer", FileSize: 20,
+	})
+	cs.UpdateFileLocation(ctx, &FileLocation{
+		FilePath: "/other/c.txt", PeerID: "peer-3", StorageTier: "nvme", FileSize: 30,
+	})
+
+	locs, err := cs.ListFileLocations(ctx, "/dir/")
+	if err != nil {
+		t.Fatalf("ListFileLocations: %v", err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("ListFileLocations returned %d, want 2", len(locs))
+	}
+}
+
 func TestCleanupInactivePeers(t *testing.T) {
 	cs := NewCoordinatorService()
 	ctx := context.Background()

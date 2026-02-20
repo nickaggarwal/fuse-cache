@@ -96,6 +96,13 @@ type CacheConfig struct {
 
 	// Peer replication config
 	MinPeerReplicas int
+
+	// MetadataRefreshTTL controls how frequently remote metadata is refreshed.
+	// This mirrors metadata-cache TTL behavior in systems like Mountpoint.
+	MetadataRefreshTTL time.Duration
+
+	// LocalPeerID identifies this client when publishing metadata updates.
+	LocalPeerID string
 }
 
 // DefaultCacheManager implements CacheManager
@@ -109,6 +116,8 @@ type DefaultCacheManager struct {
 	mu           sync.RWMutex
 	logger       *log.Logger
 	metrics      *CacheMetrics
+	metadataAt   time.Time
+	metadataView []*CacheEntry
 }
 
 // NewCacheManager creates a new cache manager
@@ -129,6 +138,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 	if config.MinPeerReplicas <= 0 {
 		config.MinPeerReplicas = 3
+	}
+	if config.MetadataRefreshTTL <= 0 {
+		config.MetadataRefreshTTL = 5 * time.Second
 	}
 
 	cm := &DefaultCacheManager{
@@ -310,6 +322,7 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		dataCopy := make([]byte, len(entry.Data))
 		copy(dataCopy, entry.Data)
 		go cm.persistToCloud(entry.FilePath, dataCopy)
+		go cm.publishFileLocation(context.Background(), entry, TierNVMe)
 
 		return nil
 	}
@@ -365,6 +378,7 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 			cm.entries[entry.FilePath] = entry
 			cm.mu.Unlock()
 			cm.metrics.RecordWrite(int64(len(entry.Data)))
+			go cm.publishFileLocation(context.Background(), entry, res.tier)
 			return nil
 		}
 	}
@@ -398,12 +412,51 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 // List returns all cached entries
 func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) {
 	cm.mu.RLock()
-	defer cm.mu.RUnlock()
 	entries := make([]*CacheEntry, 0, len(cm.entries))
 	for _, entry := range cm.entries {
-		entries = append(entries, entry)
+		entryCopy := *entry
+		entries = append(entries, &entryCopy)
 	}
-	return entries, nil
+	coord := cm.config.Coordinator
+	metadataFresh := time.Since(cm.metadataAt) < cm.config.MetadataRefreshTTL
+	metadataView := cm.metadataView
+	cm.mu.RUnlock()
+
+	if coord == nil {
+		return entries, nil
+	}
+
+	// Reuse a fresh metadata snapshot to avoid coordinator round-trips on every stat/ls.
+	if metadataFresh {
+		return mergeEntries(entries, metadataView), nil
+	}
+
+	locations, err := coord.ListFileLocations(ctx, "")
+	if err != nil {
+		cm.logger.Printf("Metadata list fallback to local cache only: %v", err)
+		return entries, nil
+	}
+
+	remote := make([]*CacheEntry, 0, len(locations))
+	for _, loc := range locations {
+		if loc == nil || loc.FilePath == "" {
+			continue
+		}
+		remote = append(remote, &CacheEntry{
+			FilePath:     loc.FilePath,
+			StoragePath:  loc.StoragePath,
+			Size:         loc.FileSize,
+			LastAccessed: loc.LastAccessed,
+			Tier:         tierFromStorageTier(loc.StorageTier),
+		})
+	}
+
+	cm.mu.Lock()
+	cm.metadataView = remote
+	cm.metadataAt = time.Now()
+	cm.mu.Unlock()
+
+	return mergeEntries(entries, remote), nil
 }
 
 // Evict removes the least recently accessed entries from a tier to free the given number of bytes.
@@ -506,6 +559,35 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 	return nil
 }
 
+func (cm *DefaultCacheManager) publishFileLocation(ctx context.Context, entry *CacheEntry, tier CacheTier) {
+	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" || entry == nil {
+		return
+	}
+	location := &coordinator.FileLocation{
+		FilePath:     entry.FilePath,
+		PeerID:       cm.config.LocalPeerID,
+		StorageTier:  cacheTierToStorageTier(tier),
+		StoragePath:  entry.FilePath,
+		FileSize:     entry.Size,
+		LastAccessed: time.Now(),
+		IsChunked:    entry.IsChunked,
+	}
+	if err := cm.config.Coordinator.UpdateFileLocation(ctx, location); err != nil {
+		cm.logger.Printf("Failed to publish metadata for %s: %v", entry.FilePath, err)
+	}
+}
+
+func cacheTierToStorageTier(tier CacheTier) string {
+	switch tier {
+	case TierNVMe:
+		return "nvme"
+	case TierPeer:
+		return "peer"
+	default:
+		return "cloud"
+	}
+}
+
 // Helper methods
 func (cm *DefaultCacheManager) getFromTier(ctx context.Context, filePath string, tier CacheTier) (*CacheEntry, error) {
 	storage := cm.getStorageForTier(tier)
@@ -579,6 +661,41 @@ func (cm *DefaultCacheManager) getStorageForTier(tier CacheTier) TierStorage {
 	}
 }
 
+func tierFromStorageTier(storageTier string) CacheTier {
+	switch storageTier {
+	case "nvme":
+		return TierNVMe
+	case "peer":
+		return TierPeer
+	default:
+		return TierCloud
+	}
+}
+
+// mergeEntries merges local and remote metadata views by FilePath.
+// Local entries take precedence because they include freshest in-memory state.
+func mergeEntries(local []*CacheEntry, remote []*CacheEntry) []*CacheEntry {
+	byPath := make(map[string]*CacheEntry, len(local)+len(remote))
+	for _, entry := range remote {
+		if entry == nil || entry.FilePath == "" {
+			continue
+		}
+		byPath[entry.FilePath] = entry
+	}
+	for _, entry := range local {
+		if entry == nil || entry.FilePath == "" {
+			continue
+		}
+		byPath[entry.FilePath] = entry
+	}
+
+	merged := make([]*CacheEntry, 0, len(byPath))
+	for _, entry := range byPath {
+		merged = append(merged, entry)
+	}
+	return merged
+}
+
 func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEntry) {
 	newEntry := &CacheEntry{
 		FilePath:     entry.FilePath,
@@ -649,6 +766,7 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	cm.mu.Lock()
 	cm.entries[entry.FilePath] = entry
 	cm.mu.Unlock()
+	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
 
 	return nil
 }

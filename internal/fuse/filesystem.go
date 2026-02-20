@@ -102,21 +102,25 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	fullPath := filepath.Join(d.path, name)
 
-	// Check if it's a file in the cache
-	if entry, err := d.fs.cacheManager.Get(ctx, fullPath); err == nil {
-		return &File{
-			fs:    d.fs,
-			path:  fullPath,
-			entry: entry,
-		}, nil
-	}
-
-	// Check if it's a directory by looking for files with this prefix
 	entries, err := d.fs.cacheManager.List(ctx)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
 
+	// Metadata-first lookup: find file entry without triggering data fetch.
+	for _, entry := range entries {
+		if entry.FilePath != fullPath {
+			continue
+		}
+		entryCopy := *entry
+		return &File{
+			fs:    d.fs,
+			path:  fullPath,
+			entry: &entryCopy,
+		}, nil
+	}
+
+	// Check if it's a directory by looking for files with this prefix.
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.FilePath, fullPath+"/") {
 			return &Dir{
@@ -267,28 +271,45 @@ type File struct {
 // Attr returns the attributes of the file
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
+	entry := f.entry
+	f.mu.RUnlock()
+
+	if entry == nil {
+		entries, err := f.fs.cacheManager.List(ctx)
+		if err == nil {
+			for _, listed := range entries {
+				if listed.FilePath == f.path {
+					entry = listed
+					break
+				}
+			}
+		}
+	}
+	if entry == nil {
+		return fuse.ENOENT
+	}
 
 	a.Inode = pathToInode(f.path)
 	a.Mode = 0644
 	a.Nlink = 1
-	a.Size = uint64(f.entry.Size)
-	a.Mtime = f.entry.LastAccessed
-	a.Atime = f.entry.LastAccessed
-	a.Ctime = f.entry.LastAccessed
+	a.Size = uint64(entry.Size)
+	a.Mtime = entry.LastAccessed
+	a.Atime = entry.LastAccessed
+	a.Ctime = entry.LastAccessed
 	return nil
 }
 
 // Read reads data from the file
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	// Get fresh data from cache
+	// Data is fetched lazily on read, not on lookup/open.
 	entry, err := f.fs.cacheManager.Get(ctx, f.path)
 	if err != nil {
 		return fuse.EIO
 	}
+
+	f.mu.Lock()
+	f.entry = entry
+	f.mu.Unlock()
 
 	// Handle offset and size
 	if req.Offset >= int64(len(entry.Data)) {
@@ -380,15 +401,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 // Open opens the file
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
-	// Check if file exists in cache
-	entry, err := f.fs.cacheManager.Get(ctx, f.path)
-	if err != nil {
-		return nil, fuse.ENOENT
-	}
-
-	f.mu.Lock()
-	f.entry = entry
-	f.mu.Unlock()
+	// Keep open metadata-only. Actual download happens in Read on first access.
 	return f, nil
 }
 

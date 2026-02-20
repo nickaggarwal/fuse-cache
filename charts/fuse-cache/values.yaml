@@ -41,8 +41,8 @@ client:
   fuseMountHostPath: /mnt/fuse
 
 config:
-  coordinatorAddr: coordinator.fuse-system.svc.cluster.local:8080
-  coordinatorGrpcAddr: coordinator.fuse-system.svc.cluster.local:9080
+  coordinatorAddr: ""
+  coordinatorGrpcAddr: ""
   nvmeCachePath: /mnt/nvme/cache
   fuseMountPath: /mnt/fuse
   chunkSizeMB: "4"

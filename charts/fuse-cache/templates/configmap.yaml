@@ -4,8 +4,8 @@ metadata:
   name: fuse-config
   namespace: {{ include "fuse-cache.namespace" . }}
 data:
-  COORDINATOR_ADDR: {{ .Values.config.coordinatorAddr | quote }}
-  COORDINATOR_GRPC_ADDR: {{ .Values.config.coordinatorGrpcAddr | quote }}
+  COORDINATOR_ADDR: {{ (.Values.config.coordinatorAddr | default (printf "coordinator.%s.svc.cluster.local:%v" (include "fuse-cache.namespace" .) .Values.coordinator.httpPort)) | quote }}
+  COORDINATOR_GRPC_ADDR: {{ (.Values.config.coordinatorGrpcAddr | default (printf "coordinator.%s.svc.cluster.local:%v" (include "fuse-cache.namespace" .) .Values.coordinator.grpcPort)) | quote }}
   NVME_CACHE_PATH: {{ .Values.config.nvmeCachePath | quote }}
   FUSE_MOUNT_PATH: {{ .Values.config.fuseMountPath | quote }}
   CHUNK_SIZE_MB: {{ .Values.config.chunkSizeMB | quote }}

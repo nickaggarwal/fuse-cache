@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -122,6 +123,25 @@ func (cs *CoordinatorService) GetFileLocation(ctx context.Context, filePath stri
 
 	result := make([]*FileLocation, len(locations))
 	copy(result, locations)
+	return result, nil
+}
+
+// ListFileLocations returns one metadata location per file path, filtered by prefix.
+func (cs *CoordinatorService) ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	result := make([]*FileLocation, 0, len(cs.fileLocations))
+	for path, locations := range cs.fileLocations {
+		if prefix != "" && !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		if len(locations) == 0 {
+			continue
+		}
+		locCopy := *locations[0]
+		result = append(result, &locCopy)
+	}
 	return result, nil
 }
 

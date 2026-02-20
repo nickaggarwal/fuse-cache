@@ -2,6 +2,11 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
 
 	pb "fuse-client/internal/pb"
 
@@ -13,6 +18,9 @@ import (
 type GRPCCoordinatorClient struct {
 	conn   *grpc.ClientConn
 	client pb.CoordinatorServiceClient
+
+	httpAddr   string
+	httpClient *http.Client
 }
 
 // NewGRPCCoordinatorClient creates a new gRPC-based coordinator client.
@@ -24,8 +32,12 @@ func NewGRPCCoordinatorClient(addr string) (*GRPCCoordinatorClient, error) {
 		return nil, err
 	}
 	return &GRPCCoordinatorClient{
-		conn:   conn,
-		client: pb.NewCoordinatorServiceClient(conn),
+		conn:     conn,
+		client:   pb.NewCoordinatorServiceClient(conn),
+		httpAddr: deriveCoordinatorHTTPAddr(addr),
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}, nil
 }
 
@@ -70,6 +82,29 @@ func (c *GRPCCoordinatorClient) GetFileLocation(ctx context.Context, filePath st
 	return locations, nil
 }
 
+func (c *GRPCCoordinatorClient) ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error) {
+	url := fmt.Sprintf("http://%s/api/files/locations", c.httpAddr)
+	if prefix != "" {
+		url += "?prefix=" + prefix
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var locations []*FileLocation
+	if err := json.NewDecoder(resp.Body).Decode(&locations); err != nil {
+		return nil, err
+	}
+	return locations, nil
+}
+
 func (c *GRPCCoordinatorClient) UpdateFileLocation(ctx context.Context, location *FileLocation) error {
 	_, err := c.client.UpdateFileLocation(ctx, &pb.UpdateFileLocationRequest{
 		Location: fileLocationToProto(location),
@@ -95,4 +130,12 @@ func (c *GRPCCoordinatorClient) GetPeerStats() map[string]interface{} {
 // Close closes the underlying gRPC connection.
 func (c *GRPCCoordinatorClient) Close() error {
 	return c.conn.Close()
+}
+
+func deriveCoordinatorHTTPAddr(grpcAddr string) string {
+	host, _, err := net.SplitHostPort(grpcAddr)
+	if err != nil {
+		return grpcAddr
+	}
+	return net.JoinHostPort(host, "8080")
 }
