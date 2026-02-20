@@ -1,15 +1,23 @@
 package cache
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // mockStorage is a simple in-memory TierStorage for testing
 type mockStorage struct {
+	mu   sync.RWMutex
 	data map[string][]byte
 }
 
@@ -18,6 +26,8 @@ func newMockStorage() *mockStorage {
 }
 
 func (m *mockStorage) Read(ctx context.Context, path string) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if d, ok := m.data[path]; ok {
 		out := make([]byte, len(d))
 		copy(out, d)
@@ -27,21 +37,29 @@ func (m *mockStorage) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (m *mockStorage) Write(ctx context.Context, path string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.data[path] = append([]byte(nil), data...)
 	return nil
 }
 
 func (m *mockStorage) Delete(ctx context.Context, path string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.data, path)
 	return nil
 }
 
 func (m *mockStorage) Exists(ctx context.Context, path string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	_, ok := m.data[path]
 	return ok
 }
 
 func (m *mockStorage) Size(ctx context.Context, path string) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if d, ok := m.data[path]; ok {
 		return int64(len(d)), nil
 	}
@@ -54,15 +72,20 @@ func newTestCacheManager() *DefaultCacheManager {
 	cloud := newMockStorage()
 	return &DefaultCacheManager{
 		config: &CacheConfig{
-			NVMePath:    "/tmp/test",
-			MaxNVMeSize: 1024 * 1024, // 1MB
-			ChunkSize:   4 * 1024 * 1024,
+			NVMePath:           "/tmp/test",
+			MaxNVMeSize:        1024 * 1024, // 1MB
+			ChunkSize:          4 * 1024 * 1024,
+			CloudRetryCount:    1,
+			CloudRetryBaseWait: time.Millisecond,
+			MinPeerReplicas:    3,
+			CloudTimeout:       5 * time.Second,
 		},
 		nvmeStorage:  nvme,
 		peerStorage:  peer,
 		cloudStorage: cloud,
 		entries:      make(map[string]*CacheEntry),
 		logger:       log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
+		metrics:      NewCacheMetrics(),
 	}
 }
 
@@ -196,4 +219,553 @@ func TestCacheManager_GetFallsToLowerTiers(t *testing.T) {
 	if got.Tier != TierCloud {
 		t.Errorf("Tier = %d, want TierCloud (%d)", got.Tier, TierCloud)
 	}
+}
+
+func TestCacheManager_CloudRetry(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.CloudRetryCount = 3
+	cm.config.CloudRetryBaseWait = time.Millisecond
+
+	failingCloud := &failNTimesStorage{
+		inner:     cm.cloudStorage.(*mockStorage),
+		failCount: 2,
+	}
+	cm.cloudStorage = failingCloud
+
+	ctx := context.Background()
+	entry := &CacheEntry{
+		FilePath:     "/retry-test.txt",
+		Size:         5,
+		LastAccessed: time.Now(),
+		Data:         []byte("retry"),
+	}
+
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Wait for background persist to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have been called 3 times (2 failures + 1 success)
+	if calls := failingCloud.calls.Load(); calls != 3 {
+		t.Errorf("Cloud write called %d times, want 3", calls)
+	}
+
+	// Verify data was persisted to cloud
+	data, err := failingCloud.inner.Read(ctx, "/retry-test.txt")
+	if err != nil {
+		t.Fatalf("Cloud read: %v", err)
+	}
+	if string(data) != "retry" {
+		t.Errorf("Cloud data = %q, want %q", data, "retry")
+	}
+}
+
+// failNTimesStorage wraps a storage and fails the first N Write calls
+type failNTimesStorage struct {
+	inner     *mockStorage
+	failCount int32
+	calls     atomic.Int32
+}
+
+func (f *failNTimesStorage) Read(ctx context.Context, path string) ([]byte, error) {
+	return f.inner.Read(ctx, path)
+}
+
+func (f *failNTimesStorage) Write(ctx context.Context, path string, data []byte) error {
+	n := f.calls.Add(1)
+	if n <= f.failCount {
+		return fmt.Errorf("simulated failure %d", n)
+	}
+	return f.inner.Write(ctx, path, data)
+}
+
+func (f *failNTimesStorage) Delete(ctx context.Context, path string) error {
+	return f.inner.Delete(ctx, path)
+}
+
+func (f *failNTimesStorage) Exists(ctx context.Context, path string) bool {
+	return f.inner.Exists(ctx, path)
+}
+
+func (f *failNTimesStorage) Size(ctx context.Context, path string) (int64, error) {
+	return f.inner.Size(ctx, path)
+}
+
+func TestCacheManager_ChunkedReassembly(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 10 // 10 bytes per chunk
+	ctx := context.Background()
+
+	// Create data larger than chunk size
+	data := []byte("abcdefghijklmnopqrstuvwxyz") // 26 bytes = 3 chunks
+
+	entry := &CacheEntry{
+		FilePath:     "/chunked.txt",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put chunked: %v", err)
+	}
+
+	// Verify the entry is marked as chunked
+	cm.mu.RLock()
+	e := cm.entries["/chunked.txt"]
+	cm.mu.RUnlock()
+
+	if !e.IsChunked {
+		t.Error("Entry not marked as chunked")
+	}
+	if e.NumChunks != 3 {
+		t.Errorf("NumChunks = %d, want 3", e.NumChunks)
+	}
+
+	// Read it back
+	got, err := cm.Get(ctx, "/chunked.txt")
+	if err != nil {
+		t.Fatalf("Get chunked: %v", err)
+	}
+
+	if !bytes.Equal(got.Data, data) {
+		t.Errorf("Get data = %q, want %q", got.Data, data)
+	}
+}
+
+func TestCacheManager_Checksum(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	data := []byte("checksum test data")
+	entry := &CacheEntry{
+		FilePath:     "/checksum.txt",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Verify checksum was computed
+	if entry.Checksum == "" {
+		t.Error("Checksum was not computed")
+	}
+
+	h := sha256.Sum256(data)
+	expected := hex.EncodeToString(h[:])
+	if entry.Checksum != expected {
+		t.Errorf("Checksum = %s, want %s", entry.Checksum, expected)
+	}
+
+	// Verify sidecar was written
+	sidecarData, err := cm.nvmeStorage.Read(ctx, "/checksum.txt.sha256")
+	if err != nil {
+		t.Fatalf("Read sidecar: %v", err)
+	}
+	if string(sidecarData) != expected {
+		t.Errorf("Sidecar checksum = %s, want %s", string(sidecarData), expected)
+	}
+
+	// Read back and verify checksum validation passes
+	got, err := cm.Get(ctx, "/checksum.txt")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.Data) != string(data) {
+		t.Errorf("Get data = %q, want %q", got.Data, data)
+	}
+}
+
+func TestCacheManager_ChecksumMismatch(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	data := []byte("original data")
+	entry := &CacheEntry{
+		FilePath:     "/corrupt.txt",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Wait for background cloud persist
+	time.Sleep(50 * time.Millisecond)
+
+	// Remove from cloud and peer so only NVMe is available
+	cm.cloudStorage.Delete(ctx, "/corrupt.txt")
+	cm.peerStorage.Delete(ctx, "/corrupt.txt")
+
+	// Corrupt the data on NVMe
+	cm.nvmeStorage.Write(ctx, "/corrupt.txt", []byte("corrupted data"))
+
+	// Get should fail due to checksum mismatch on NVMe and miss on other tiers
+	_, err := cm.Get(ctx, "/corrupt.txt")
+	if err == nil {
+		t.Error("Expected error for corrupted data, got nil")
+	}
+}
+
+func TestCacheMetrics(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	// Put a file
+	cm.Put(ctx, &CacheEntry{
+		FilePath:     "/metric.txt",
+		Size:         5,
+		LastAccessed: time.Now(),
+		Data:         []byte("hello"),
+	})
+
+	// Wait for background persist
+	time.Sleep(50 * time.Millisecond)
+
+	// Get it (NVMe hit)
+	cm.Get(ctx, "/metric.txt")
+
+	// Miss (not found)
+	cm.Get(ctx, "/nonexistent.txt")
+
+	snapshot := cm.GetMetrics()
+
+	if snapshot["write_count"].(int64) != 1 {
+		t.Errorf("write_count = %v, want 1", snapshot["write_count"])
+	}
+	if snapshot["write_bytes"].(int64) != 5 {
+		t.Errorf("write_bytes = %v, want 5", snapshot["write_bytes"])
+	}
+	if snapshot["nvme_hits"].(int64) != 1 {
+		t.Errorf("nvme_hits = %v, want 1", snapshot["nvme_hits"])
+	}
+	// nonexistent file should miss all 3 tiers
+	if snapshot["nvme_misses"].(int64) < 1 {
+		t.Errorf("nvme_misses = %v, want >= 1", snapshot["nvme_misses"])
+	}
+}
+
+func TestCacheManager_Stats(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	used, capacity := cm.Stats()
+	if used != 0 {
+		t.Errorf("Initial used = %d, want 0", used)
+	}
+	if capacity != 1024*1024 {
+		t.Errorf("Capacity = %d, want %d", capacity, 1024*1024)
+	}
+
+	cm.Put(ctx, &CacheEntry{
+		FilePath:     "/stats.txt",
+		Size:         100,
+		LastAccessed: time.Now(),
+		Data:         make([]byte, 100),
+	})
+
+	used, _ = cm.Stats()
+	if used != 100 {
+		t.Errorf("After put used = %d, want 100", used)
+	}
+}
+
+// newLargeFileCacheManager creates a cache manager sized for large file tests.
+// NVMe capacity is set to max+1GB so writes land on NVMe without fallback.
+func newLargeFileCacheManager(maxNVMe int64) *DefaultCacheManager {
+	nvme := newMockStorage()
+	peer := newMockStorage()
+	cloud := newMockStorage()
+	return &DefaultCacheManager{
+		config: &CacheConfig{
+			NVMePath:           "/tmp/test-large",
+			MaxNVMeSize:        maxNVMe,
+			ChunkSize:          4 * 1024 * 1024, // 4MB chunks
+			CloudRetryCount:    1,
+			CloudRetryBaseWait: time.Millisecond,
+			MinPeerReplicas:    3,
+			CloudTimeout:       60 * time.Second,
+		},
+		nvmeStorage:  nvme,
+		peerStorage:  peer,
+		cloudStorage: cloud,
+		entries:      make(map[string]*CacheEntry),
+		logger:       log.New(log.Writer(), "[CACHE-LARGE] ", log.LstdFlags),
+		metrics:      NewCacheMetrics(),
+	}
+}
+
+// randomData generates n bytes of random data
+func randomData(t *testing.T, n int) []byte {
+	t.Helper()
+	data := make([]byte, n)
+	if _, err := io.ReadFull(rand.Reader, data); err != nil {
+		t.Fatalf("Failed to generate random data: %v", err)
+	}
+	return data
+}
+
+func TestLargeFile_10MB(t *testing.T) {
+	const size = 10 * 1024 * 1024 // 10MB
+	cm := newLargeFileCacheManager(size + 1024*1024*1024)
+	ctx := context.Background()
+
+	data := randomData(t, size)
+	checksum := sha256.Sum256(data)
+
+	entry := &CacheEntry{
+		FilePath:     "/large-10mb.bin",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	// Put should chunk the file (10MB > 4MB chunk size)
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put 10MB: %v", err)
+	}
+
+	// Wait for background cloud persist
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify entry is chunked
+	cm.mu.RLock()
+	e := cm.entries["/large-10mb.bin"]
+	cm.mu.RUnlock()
+
+	if !e.IsChunked {
+		t.Error("10MB file should be chunked")
+	}
+
+	expectedChunks := int64(3) // ceil(10MB / 4MB) = 3
+	if e.NumChunks != expectedChunks {
+		t.Errorf("NumChunks = %d, want %d", e.NumChunks, expectedChunks)
+	}
+
+	// Read it back
+	got, err := cm.Get(ctx, "/large-10mb.bin")
+	if err != nil {
+		t.Fatalf("Get 10MB: %v", err)
+	}
+
+	if int64(len(got.Data)) != size {
+		t.Errorf("Got %d bytes, want %d", len(got.Data), size)
+	}
+
+	// Verify data integrity via checksum
+	gotChecksum := sha256.Sum256(got.Data)
+	if checksum != gotChecksum {
+		t.Error("10MB file data corrupted: checksum mismatch")
+	}
+
+	// Verify each chunk was persisted to cloud
+	for i := int64(0); i < expectedChunks; i++ {
+		chunkPath := fmt.Sprintf("/large-10mb.bin_chunk_%d", i)
+		if !cm.cloudStorage.Exists(ctx, chunkPath) {
+			t.Errorf("Chunk %d not persisted to cloud", i)
+		}
+	}
+
+	// Verify stats
+	used, _ := cm.Stats()
+	if used <= 0 {
+		t.Error("Stats should report non-zero usage after 10MB write")
+	}
+
+	// Verify metrics
+	snapshot := cm.GetMetrics()
+	if snapshot["write_count"].(int64) < 3 {
+		t.Errorf("write_count = %v, want >= 3 (one per chunk)", snapshot["write_count"])
+	}
+
+	t.Logf("10MB test passed: %d chunks, checksum OK", expectedChunks)
+}
+
+func TestLargeFile_100MB(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping 100MB test in short mode")
+	}
+
+	const size = 100 * 1024 * 1024 // 100MB
+	cm := newLargeFileCacheManager(size + 1024*1024*1024)
+	ctx := context.Background()
+
+	data := randomData(t, size)
+	checksum := sha256.Sum256(data)
+
+	entry := &CacheEntry{
+		FilePath:     "/large-100mb.bin",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put 100MB: %v", err)
+	}
+
+	// Wait for background cloud persist (longer for 100MB)
+	time.Sleep(2 * time.Second)
+
+	// Verify chunking
+	cm.mu.RLock()
+	e := cm.entries["/large-100mb.bin"]
+	cm.mu.RUnlock()
+
+	if !e.IsChunked {
+		t.Error("100MB file should be chunked")
+	}
+
+	expectedChunks := int64(25) // ceil(100MB / 4MB) = 25
+	if e.NumChunks != expectedChunks {
+		t.Errorf("NumChunks = %d, want %d", e.NumChunks, expectedChunks)
+	}
+
+	// Read it back and verify integrity
+	got, err := cm.Get(ctx, "/large-100mb.bin")
+	if err != nil {
+		t.Fatalf("Get 100MB: %v", err)
+	}
+
+	if int64(len(got.Data)) != size {
+		t.Errorf("Got %d bytes, want %d", len(got.Data), size)
+	}
+
+	gotChecksum := sha256.Sum256(got.Data)
+	if checksum != gotChecksum {
+		t.Error("100MB file data corrupted: checksum mismatch")
+	}
+
+	// Verify all chunks persisted to cloud
+	for i := int64(0); i < expectedChunks; i++ {
+		chunkPath := fmt.Sprintf("/large-100mb.bin_chunk_%d", i)
+		if !cm.cloudStorage.Exists(ctx, chunkPath) {
+			t.Errorf("Chunk %d not persisted to cloud", i)
+		}
+	}
+
+	// Verify we can delete the chunked file and its individual chunks
+	for i := int64(0); i < expectedChunks; i++ {
+		chunkPath := fmt.Sprintf("/large-100mb.bin_chunk_%d", i)
+		if err := cm.Delete(ctx, chunkPath); err != nil {
+			t.Errorf("Delete chunk %d: %v", i, err)
+		}
+	}
+	if err := cm.Delete(ctx, "/large-100mb.bin"); err != nil {
+		t.Errorf("Delete parent entry: %v", err)
+	}
+
+	// Verify everything is cleaned up
+	cm.mu.RLock()
+	remaining := len(cm.entries)
+	cm.mu.RUnlock()
+	if remaining != 0 {
+		t.Errorf("After delete, %d entries remain, want 0", remaining)
+	}
+
+	t.Logf("100MB test passed: %d chunks, checksum OK", expectedChunks)
+}
+
+func TestLargeFile_1GB(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping 1GB test in short mode")
+	}
+
+	const size = 1024 * 1024 * 1024 // 1GB
+	cm := newLargeFileCacheManager(2 * size)
+	ctx := context.Background()
+
+	// Use a deterministic pattern instead of crypto/rand for speed on 1GB
+	// Fill with a repeating 1MB block of random data
+	block := make([]byte, 1024*1024)
+	if _, err := io.ReadFull(rand.Reader, block); err != nil {
+		t.Fatalf("Failed to generate random block: %v", err)
+	}
+
+	data := make([]byte, size)
+	for off := 0; off < size; off += len(block) {
+		copy(data[off:], block)
+	}
+	checksum := sha256.Sum256(data)
+
+	entry := &CacheEntry{
+		FilePath:     "/large-1gb.bin",
+		Size:         int64(len(data)),
+		LastAccessed: time.Now(),
+		Data:         data,
+	}
+
+	start := time.Now()
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put 1GB: %v", err)
+	}
+	putDuration := time.Since(start)
+
+	// Wait for background cloud persist
+	time.Sleep(5 * time.Second)
+
+	// Verify chunking
+	cm.mu.RLock()
+	e := cm.entries["/large-1gb.bin"]
+	cm.mu.RUnlock()
+
+	if !e.IsChunked {
+		t.Error("1GB file should be chunked")
+	}
+
+	expectedChunks := int64(256) // 1GB / 4MB = 256
+	if e.NumChunks != expectedChunks {
+		t.Errorf("NumChunks = %d, want %d", e.NumChunks, expectedChunks)
+	}
+
+	// Read it back
+	start = time.Now()
+	got, err := cm.Get(ctx, "/large-1gb.bin")
+	if err != nil {
+		t.Fatalf("Get 1GB: %v", err)
+	}
+	getDuration := time.Since(start)
+
+	if int64(len(got.Data)) != size {
+		t.Errorf("Got %d bytes, want %d", len(got.Data), size)
+	}
+
+	// Verify data integrity
+	gotChecksum := sha256.Sum256(got.Data)
+	if checksum != gotChecksum {
+		t.Error("1GB file data corrupted: checksum mismatch")
+	}
+
+	// Spot-check: verify a few individual chunks exist in cloud
+	for _, idx := range []int64{0, 127, 255} {
+		chunkPath := fmt.Sprintf("/large-1gb.bin_chunk_%d", idx)
+		if !cm.cloudStorage.Exists(ctx, chunkPath) {
+			t.Errorf("Chunk %d not persisted to cloud", idx)
+		}
+	}
+
+	// Verify stats
+	used, capacity := cm.Stats()
+	if used <= 0 {
+		t.Error("Stats should report non-zero NVMe usage")
+	}
+	if capacity != 2*size {
+		t.Errorf("Capacity = %d, want %d", capacity, 2*size)
+	}
+
+	// Verify metrics
+	snapshot := cm.GetMetrics()
+	if snapshot["write_count"].(int64) < 256 {
+		t.Errorf("write_count = %v, want >= 256", snapshot["write_count"])
+	}
+
+	t.Logf("1GB test passed: %d chunks, put=%v get=%v, checksum OK",
+		expectedChunks, putDuration, getDuration)
 }

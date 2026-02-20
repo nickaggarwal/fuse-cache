@@ -39,6 +39,9 @@ func main() {
 		azureKey       = flag.String("azure-key", "", "Azure storage account key")
 		azureContainer = flag.String("azure-container", "fuse-cache", "Azure blob container name")
 
+		// NVMe capacity
+		nvmeMaxGB = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+
 		help = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
@@ -74,7 +77,7 @@ func main() {
 	// Create cache configuration
 	cacheConfig := &cache.CacheConfig{
 		NVMePath:        *nvmePath,
-		MaxNVMeSize:     10 * 1024 * 1024 * 1024, // 10GB
+		MaxNVMeSize:     int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
 		MaxPeerSize:     5 * 1024 * 1024 * 1024,   // 5GB
 		PeerTimeout:     30 * time.Second,
 		CloudTimeout:    60 * time.Second,
@@ -101,7 +104,7 @@ func main() {
 		coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
 
 		// Register this peer with the remote coordinator
-		go registerPeer(ctx, coordClient, *peerID, *peerPort, *nvmePath, logger)
+		go registerPeer(ctx, coordClient, *peerID, *peerPort, *nvmePath, cacheManager, logger)
 	}
 
 	// Create API handler
@@ -159,9 +162,10 @@ func main() {
 	logger.Println("Client stopped")
 }
 
-func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port int, nvmePath string, logger *log.Logger) {
-	availableSpace := int64(10 * 1024 * 1024 * 1024) // 10GB
-	usedSpace := int64(0)
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port int, nvmePath string, cm cache.CacheManager, logger *log.Logger) {
+	used, capacity := cm.Stats()
+	availableSpace := capacity - used
+	usedSpace := used
 
 	// Use POD_IP env var if available (Kubernetes), otherwise detect local IP
 	host := os.Getenv("POD_IP")
@@ -202,7 +206,8 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := coordClient.UpdatePeerStatus(ctx, peerID, "active", availableSpace, usedSpace); err != nil {
+			used, capacity := cm.Stats()
+			if err := coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used); err != nil {
 				logger.Printf("Failed to update peer status: %v", err)
 			}
 		}

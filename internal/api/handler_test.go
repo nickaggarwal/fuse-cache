@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -49,6 +50,19 @@ func (m *mockCacheManager) List(ctx context.Context) ([]*cache.CacheEntry, error
 
 func (m *mockCacheManager) Evict(ctx context.Context, tier cache.CacheTier) error {
 	return nil
+}
+
+func (m *mockCacheManager) Stats() (used, capacity int64) {
+	return 0, 1024 * 1024 * 1024
+}
+
+func (m *mockCacheManager) WriteTo(ctx context.Context, filePath string, w io.Writer) (int64, error) {
+	e, ok := m.entries[filePath]
+	if !ok {
+		return 0, context.Canceled
+	}
+	n, err := w.Write(e.Data)
+	return int64(n), err
 }
 
 func TestHealthEndpoint(t *testing.T) {

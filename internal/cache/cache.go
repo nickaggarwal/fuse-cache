@@ -2,11 +2,15 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +31,9 @@ type CacheEntry struct {
 	LastAccessed time.Time
 	Tier         CacheTier
 	Data         []byte
+	IsChunked    bool
+	NumChunks    int64
+	Checksum     string
 }
 
 // CacheManager manages the 3-tier cache system
@@ -36,6 +43,10 @@ type CacheManager interface {
 	Delete(ctx context.Context, filePath string) error
 	List(ctx context.Context) ([]*CacheEntry, error)
 	Evict(ctx context.Context, tier CacheTier) error
+	Stats() (used, capacity int64)
+	// WriteTo streams file data to w one chunk at a time, avoiding full
+	// in-memory buffering of large chunked files. Returns total bytes written.
+	WriteTo(ctx context.Context, filePath string, w io.Writer) (int64, error)
 }
 
 // TierStorage represents storage interface for each tier
@@ -68,6 +79,13 @@ type CacheConfig struct {
 	AzureStorageAccount   string
 	AzureStorageKey       string
 	AzureContainerName    string
+
+	// Cloud retry config
+	CloudRetryCount    int
+	CloudRetryBaseWait time.Duration
+
+	// Peer replication config
+	MinPeerReplicas int
 }
 
 // DefaultCacheManager implements CacheManager
@@ -80,6 +98,7 @@ type DefaultCacheManager struct {
 	nvmeUsed     int64
 	mu           sync.RWMutex
 	logger       *log.Logger
+	metrics      *CacheMetrics
 }
 
 // NewCacheManager creates a new cache manager
@@ -92,11 +111,21 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if config.ChunkSize <= 0 {
 		config.ChunkSize = 4 * 1024 * 1024 // 4MB default
 	}
+	if config.CloudRetryCount <= 0 {
+		config.CloudRetryCount = 5
+	}
+	if config.CloudRetryBaseWait <= 0 {
+		config.CloudRetryBaseWait = 1 * time.Second
+	}
+	if config.MinPeerReplicas <= 0 {
+		config.MinPeerReplicas = 3
+	}
 
 	cm := &DefaultCacheManager{
 		config:  config,
 		entries: make(map[string]*CacheEntry),
 		logger:  log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
+		metrics: NewCacheMetrics(),
 	}
 
 	// Initialize storage tiers
@@ -132,43 +161,136 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 
 // Get retrieves a file from the cache hierarchy
 func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*CacheEntry, error) {
+	// Check if this is a chunked file
+	cm.mu.RLock()
+	if entry, ok := cm.entries[filePath]; ok && entry.IsChunked {
+		cm.mu.RUnlock()
+		result, err := cm.getChunked(ctx, entry)
+		if err == nil {
+			cm.metrics.RecordHit(TierNVMe)
+		} else {
+			cm.metrics.RecordMiss(TierNVMe)
+		}
+		return result, err
+	}
+	cm.mu.RUnlock()
+
 	// Check Tier 1: NVME
 	if entry, err := cm.getFromTier(ctx, filePath, TierNVMe); err == nil {
+		cm.metrics.RecordHit(TierNVMe)
 		return entry, nil
 	}
+	cm.metrics.RecordMiss(TierNVMe)
 
 	// Check Tier 2: Peers
 	if entry, err := cm.getFromTier(ctx, filePath, TierPeer); err == nil {
+		cm.metrics.RecordHit(TierPeer)
 		go cm.promoteToNVMe(context.Background(), entry)
 		return entry, nil
 	}
+	cm.metrics.RecordMiss(TierPeer)
 
 	// Check Tier 3: Cloud
 	if entry, err := cm.getFromTier(ctx, filePath, TierCloud); err == nil {
+		cm.metrics.RecordHit(TierCloud)
 		go cm.promoteToNVMe(context.Background(), entry)
 		return entry, nil
 	}
+	cm.metrics.RecordMiss(TierCloud)
 
 	return nil, errors.New("file not found in any tier")
 }
 
+// getChunked reassembles a chunked file from its chunks
+func (cm *DefaultCacheManager) getChunked(ctx context.Context, entry *CacheEntry) (*CacheEntry, error) {
+	var allData []byte
+	for i := int64(0); i < entry.NumChunks; i++ {
+		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
+		chunkEntry, err := cm.Get(ctx, chunkPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read chunk %d of %s: %v", i, entry.FilePath, err)
+		}
+		allData = append(allData, chunkEntry.Data...)
+	}
+
+	return &CacheEntry{
+		FilePath:     entry.FilePath,
+		StoragePath:  entry.StoragePath,
+		Size:         int64(len(allData)),
+		LastAccessed: time.Now(),
+		Tier:         entry.Tier,
+		Data:         allData,
+		IsChunked:    true,
+		NumChunks:    entry.NumChunks,
+	}, nil
+}
+
+// WriteTo streams file content to w without buffering the entire file in memory.
+// For chunked files, each chunk is read and written individually (max ~ChunkSize in memory).
+// For regular files, the data is written directly.
+func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w io.Writer) (int64, error) {
+	// Check if this is a chunked file
+	cm.mu.RLock()
+	entry, isChunked := cm.entries[filePath]
+	if isChunked {
+		isChunked = entry.IsChunked
+	}
+	cm.mu.RUnlock()
+
+	if isChunked {
+		var total int64
+		for i := int64(0); i < entry.NumChunks; i++ {
+			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
+			chunkEntry, err := cm.Get(ctx, chunkPath)
+			if err != nil {
+				return total, fmt.Errorf("failed to read chunk %d of %s: %v", i, filePath, err)
+			}
+			n, err := w.Write(chunkEntry.Data)
+			total += int64(n)
+			if err != nil {
+				return total, fmt.Errorf("failed to write chunk %d: %v", i, err)
+			}
+		}
+		cm.metrics.RecordHit(TierNVMe)
+		return total, nil
+	}
+
+	// Non-chunked: use regular Get
+	got, err := cm.Get(ctx, filePath)
+	if err != nil {
+		return 0, err
+	}
+	n, err := w.Write(got.Data)
+	return int64(n), err
+}
+
 // Put stores a file in the cache
 func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error {
+	// Compute checksum
+	if len(entry.Data) > 0 && entry.Checksum == "" {
+		h := sha256.Sum256(entry.Data)
+		entry.Checksum = hex.EncodeToString(h[:])
+	}
+
+	// Check if file needs chunking
+	if int64(len(entry.Data)) > cm.config.ChunkSize {
+		return cm.putChunked(ctx, entry)
+	}
+
 	// Try to store in NVME first (with eviction if needed)
 	if err := cm.putToNVMeWithEviction(ctx, entry); err == nil {
 		cm.mu.Lock()
 		cm.entries[entry.FilePath] = entry
 		cm.mu.Unlock()
 
-		// Background write-through to cloud for durability
-		go cm.persistToCloud(entry)
+		cm.metrics.RecordWrite(int64(len(entry.Data)))
+
+		// Deep-copy data before launching goroutine to avoid race
+		dataCopy := make([]byte, len(entry.Data))
+		copy(dataCopy, entry.Data)
+		go cm.persistToCloud(entry.FilePath, dataCopy)
 
 		return nil
-	}
-
-	// Check if file needs chunking
-	if int64(len(entry.Data)) > cm.config.ChunkSize {
-		return cm.putChunked(ctx, entry)
 	}
 
 	// Parallel Write Strategy: Race Peer and Cloud
@@ -181,17 +303,35 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Deep-copy data for goroutines
+	dataCopy := make([]byte, len(entry.Data))
+	copy(dataCopy, entry.Data)
+
 	go func() {
-		entryCopy := *entry
-		entryCopy.Tier = TierPeer
-		err := cm.putToTier(writeCtx, &entryCopy, TierPeer)
+		entryCopy := &CacheEntry{
+			FilePath:     entry.FilePath,
+			StoragePath:  entry.StoragePath,
+			Size:         entry.Size,
+			LastAccessed: entry.LastAccessed,
+			Tier:         TierPeer,
+			Data:         dataCopy,
+			Checksum:     entry.Checksum,
+		}
+		err := cm.putToTier(writeCtx, entryCopy, TierPeer)
 		resultChan <- writeResult{TierPeer, err}
 	}()
 
 	go func() {
-		entryCopy := *entry
-		entryCopy.Tier = TierCloud
-		err := cm.putToTier(writeCtx, &entryCopy, TierCloud)
+		entryCopy := &CacheEntry{
+			FilePath:     entry.FilePath,
+			StoragePath:  entry.StoragePath,
+			Size:         entry.Size,
+			LastAccessed: entry.LastAccessed,
+			Tier:         TierCloud,
+			Data:         dataCopy,
+			Checksum:     entry.Checksum,
+		}
+		err := cm.putToTier(writeCtx, entryCopy, TierCloud)
 		resultChan <- writeResult{TierCloud, err}
 	}()
 
@@ -203,6 +343,7 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 			entry.Tier = res.tier
 			cm.entries[entry.FilePath] = entry
 			cm.mu.Unlock()
+			cm.metrics.RecordWrite(int64(len(entry.Data)))
 			return nil
 		}
 	}
@@ -285,27 +426,36 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 		}
 		cm.nvmeUsed -= ref.entry.Size
 		delete(cm.entries, ref.key)
+		cm.metrics.RecordEviction()
 		cm.logger.Printf("Evicted %s (%d bytes)", ref.key, ref.entry.Size)
 	}
 
 	return nil
 }
 
-// persistToCloud asynchronously writes a copy of the entry to cloud storage for durability.
-// This runs in the background after a successful NVMe write.
-func (cm *DefaultCacheManager) persistToCloud(entry *CacheEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), cm.config.CloudTimeout)
-	defer cancel()
+// persistToCloud asynchronously writes data to cloud storage for durability with retry.
+// Data must be pre-copied by the caller to avoid races.
+func (cm *DefaultCacheManager) persistToCloud(filePath string, data []byte) {
+	var lastErr error
+	for attempt := 0; attempt < cm.config.CloudRetryCount; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), cm.config.CloudTimeout)
+		err := cm.cloudStorage.Write(ctx, filePath, data)
+		cancel()
 
-	// Make a copy of data to avoid races with the caller
-	dataCopy := make([]byte, len(entry.Data))
-	copy(dataCopy, entry.Data)
+		if err == nil {
+			cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", filePath, len(data))
+			return
+		}
 
-	if err := cm.cloudStorage.Write(ctx, entry.FilePath, dataCopy); err != nil {
-		cm.logger.Printf("Background cloud persist failed for %s: %v", entry.FilePath, err)
-		return
+		lastErr = err
+		wait := cm.config.CloudRetryBaseWait * (1 << uint(attempt))
+		cm.logger.Printf("Cloud persist attempt %d/%d failed for %s: %v (retrying in %v)",
+			attempt+1, cm.config.CloudRetryCount, filePath, err, wait)
+		time.Sleep(wait)
 	}
-	cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", entry.FilePath, len(dataCopy))
+
+	cm.logger.Printf("CRITICAL: All %d cloud persist attempts failed for %s: %v",
+		cm.config.CloudRetryCount, filePath, lastErr)
 }
 
 // putToNVMeWithEviction tries NVMe write, evicting if necessary
@@ -353,19 +503,46 @@ func (cm *DefaultCacheManager) getFromTier(ctx context.Context, filePath string,
 		return nil, err
 	}
 
-	return &CacheEntry{
+	entry := &CacheEntry{
 		FilePath:     filePath,
 		StoragePath:  filePath,
 		Size:         size,
 		LastAccessed: time.Now(),
 		Tier:         tier,
 		Data:         data,
-	}, nil
+	}
+
+	// Verify checksum on NVMe reads if sidecar exists
+	if tier == TierNVMe {
+		if checksumData, err := storage.Read(ctx, filePath+".sha256"); err == nil {
+			storedChecksum := string(checksumData)
+			h := sha256.Sum256(data)
+			actualChecksum := hex.EncodeToString(h[:])
+			if storedChecksum != actualChecksum {
+				cm.logger.Printf("Checksum mismatch for %s: stored=%s actual=%s", filePath, storedChecksum, actualChecksum)
+				return nil, fmt.Errorf("checksum mismatch for %s", filePath)
+			}
+			entry.Checksum = storedChecksum
+		}
+	}
+
+	return entry, nil
 }
 
 func (cm *DefaultCacheManager) putToTier(ctx context.Context, entry *CacheEntry, tier CacheTier) error {
 	storage := cm.getStorageForTier(tier)
-	return storage.Write(ctx, entry.FilePath, entry.Data)
+	if err := storage.Write(ctx, entry.FilePath, entry.Data); err != nil {
+		return err
+	}
+
+	// Write checksum sidecar for NVMe
+	if tier == TierNVMe && entry.Checksum != "" {
+		if err := storage.Write(ctx, entry.FilePath+".sha256", []byte(entry.Checksum)); err != nil {
+			cm.logger.Printf("Failed to write checksum sidecar for %s: %v", entry.FilePath, err)
+		}
+	}
+
+	return nil
 }
 
 func (cm *DefaultCacheManager) getStorageForTier(tier CacheTier) TierStorage {
@@ -445,9 +622,92 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 		}
 	}
 
+	entry.IsChunked = true
+	entry.NumChunks = numChunks
+
 	cm.mu.Lock()
 	cm.entries[entry.FilePath] = entry
 	cm.mu.Unlock()
 
 	return nil
+}
+
+// Stats returns current NVMe usage and capacity
+func (cm *DefaultCacheManager) Stats() (used, capacity int64) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.nvmeUsed, cm.config.MaxNVMeSize
+}
+
+// GetMetrics returns the cache metrics for reporting
+func (cm *DefaultCacheManager) GetMetrics() map[string]interface{} {
+	return cm.metrics.Snapshot()
+}
+
+// CacheMetrics tracks cache performance counters using atomic operations
+type CacheMetrics struct {
+	NVMeHits   atomic.Int64
+	NVMeMisses atomic.Int64
+	PeerHits   atomic.Int64
+	PeerMisses atomic.Int64
+	CloudHits  atomic.Int64
+	CloudMisses atomic.Int64
+	WriteCount atomic.Int64
+	WriteBytes atomic.Int64
+	EvictionCount atomic.Int64
+}
+
+// NewCacheMetrics creates a new CacheMetrics
+func NewCacheMetrics() *CacheMetrics {
+	return &CacheMetrics{}
+}
+
+// RecordHit records a cache hit for the given tier
+func (m *CacheMetrics) RecordHit(tier CacheTier) {
+	switch tier {
+	case TierNVMe:
+		m.NVMeHits.Add(1)
+	case TierPeer:
+		m.PeerHits.Add(1)
+	case TierCloud:
+		m.CloudHits.Add(1)
+	}
+}
+
+// RecordMiss records a cache miss for the given tier
+func (m *CacheMetrics) RecordMiss(tier CacheTier) {
+	switch tier {
+	case TierNVMe:
+		m.NVMeMisses.Add(1)
+	case TierPeer:
+		m.PeerMisses.Add(1)
+	case TierCloud:
+		m.CloudMisses.Add(1)
+	}
+}
+
+// RecordWrite records a write operation
+func (m *CacheMetrics) RecordWrite(bytes int64) {
+	m.WriteCount.Add(1)
+	m.WriteBytes.Add(bytes)
+}
+
+// RecordEviction records an eviction
+func (m *CacheMetrics) RecordEviction() {
+	m.EvictionCount.Add(1)
+}
+
+// Snapshot returns a point-in-time snapshot of all metrics
+func (m *CacheMetrics) Snapshot() map[string]interface{} {
+	return map[string]interface{}{
+		"nvme_hits":      m.NVMeHits.Load(),
+		"nvme_misses":    m.NVMeMisses.Load(),
+		"peer_hits":      m.PeerHits.Load(),
+		"peer_misses":    m.PeerMisses.Load(),
+		"cloud_hits":     m.CloudHits.Load(),
+		"cloud_misses":   m.CloudMisses.Load(),
+		"write_count":    m.WriteCount.Load(),
+		"write_bytes":    m.WriteBytes.Load(),
+		"eviction_count": m.EvictionCount.Load(),
+	}
 }

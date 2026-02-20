@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,6 +15,17 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 )
+
+// pathToInode generates a deterministic inode number from a path using FNV-64a
+func pathToInode(path string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(path))
+	ino := h.Sum64()
+	if ino == 0 {
+		ino = 1 // inode 0 is invalid
+	}
+	return ino
+}
 
 // FileSystem represents our FUSE filesystem
 type FileSystem struct {
@@ -76,7 +88,7 @@ type Dir struct {
 
 // Attr returns the attributes of the directory
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 1
+	a.Inode = pathToInode(d.path)
 	a.Mode = os.ModeDir | 0755
 	a.Nlink = 2
 	a.Size = 0
@@ -196,6 +208,42 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	}, nil
 }
 
+// Rename moves a file from this directory to a new name/directory
+func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
+	oldPath := filepath.Join(d.path, req.OldName)
+	newDirNode, ok := newDir.(*Dir)
+	if !ok {
+		return fuse.EIO
+	}
+	newPath := filepath.Join(newDirNode.path, req.NewName)
+
+	// Get the old entry
+	entry, err := d.fs.cacheManager.Get(ctx, oldPath)
+	if err != nil {
+		return fuse.ENOENT
+	}
+
+	// Put with new path
+	newEntry := &cache.CacheEntry{
+		FilePath:     newPath,
+		StoragePath:  newPath,
+		Size:         entry.Size,
+		LastAccessed: time.Now(),
+		Data:         entry.Data,
+	}
+	if err := d.fs.cacheManager.Put(ctx, newEntry); err != nil {
+		return fuse.EIO
+	}
+
+	// Delete old entry
+	if err := d.fs.cacheManager.Delete(ctx, oldPath); err != nil {
+		d.fs.logger.Printf("Rename: failed to delete old path %s: %v", oldPath, err)
+	}
+
+	d.fs.logger.Printf("Renamed %s -> %s", oldPath, newPath)
+	return nil
+}
+
 // Remove removes a file or directory
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	fullPath := filepath.Join(d.path, req.Name)
@@ -221,7 +269,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	a.Inode = 2
+	a.Inode = pathToInode(f.path)
 	a.Mode = 0644
 	a.Nlink = 1
 	a.Size = uint64(f.entry.Size)
@@ -338,7 +386,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		return nil, fuse.ENOENT
 	}
 
+	f.mu.Lock()
 	f.entry = entry
+	f.mu.Unlock()
 	return f, nil
 }
 

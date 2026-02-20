@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -227,22 +228,43 @@ type State struct {
 	FileLocations map[string][]*FileLocation `json:"file_locations"`
 }
 
-// SaveState saves the coordinator state to disk
+// SaveState saves the coordinator state to disk atomically
 func (cs *CoordinatorService) SaveState() error {
+	// Snapshot state under lock
 	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
 	state := State{
-		Peers:         cs.peers,
-		FileLocations: cs.fileLocations,
+		Peers:         make(map[string]*PeerInfo, len(cs.peers)),
+		FileLocations: make(map[string][]*FileLocation, len(cs.fileLocations)),
 	}
+	for k, v := range cs.peers {
+		peerCopy := *v
+		state.Peers[k] = &peerCopy
+	}
+	for k, v := range cs.fileLocations {
+		locsCopy := make([]*FileLocation, len(v))
+		for i, loc := range v {
+			locCopy := *loc
+			locsCopy[i] = &locCopy
+		}
+		state.FileLocations[k] = locsCopy
+	}
+	cs.mu.RUnlock()
 
+	// Marshal outside the lock
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile("coordinator_state.json", data, 0644)
+	// Write to temp file, then atomic rename
+	stateFile := "coordinator_state.json"
+	tmpFile := stateFile + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return err
+	}
+
+	// Ensure parent dir for rename (same dir, so no issue)
+	return os.Rename(tmpFile, filepath.Clean(stateFile))
 }
 
 // LoadState loads the coordinator state from disk

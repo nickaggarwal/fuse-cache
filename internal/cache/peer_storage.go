@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
@@ -14,16 +15,18 @@ import (
 
 // PeerStorage implements TierStorage for peer-to-peer storage
 type PeerStorage struct {
-	coordinatorAddr string
-	timeout         time.Duration
-	client          *http.Client
+	coordinatorAddr    string
+	timeout            time.Duration
+	client             *http.Client
+	minReplicationCount int
 }
 
 // NewPeerStorage creates a new peer storage instance
 func NewPeerStorage(coordinatorAddr string, timeout time.Duration) (*PeerStorage, error) {
 	return &PeerStorage{
-		coordinatorAddr: coordinatorAddr,
-		timeout:         timeout,
+		coordinatorAddr:    coordinatorAddr,
+		timeout:            timeout,
+		minReplicationCount: 3,
 		client: &http.Client{
 			Timeout: timeout,
 		},
@@ -41,21 +44,44 @@ type PeerInfo struct {
 	LastHeartbeat int64  `json:"last_heartbeat"`
 }
 
-// Read reads a file from peer storage
+// Read reads a file from peer storage using parallel fan-out
 func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	type readResult struct {
+		data []byte
+		err  error
+	}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultChan := make(chan readResult, len(peers))
+	active := 0
+
 	for _, peer := range peers {
 		if peer.Status != "active" {
 			continue
 		}
+		active++
+		go func(addr string) {
+			data, err := ps.readFromPeer(readCtx, addr, path)
+			resultChan <- readResult{data, err}
+		}(peer.Address)
+	}
 
-		data, err := ps.readFromPeer(ctx, peer.Address, path)
-		if err == nil {
-			return data, nil
+	if active == 0 {
+		return nil, fmt.Errorf("no active peers available")
+	}
+
+	for i := 0; i < active; i++ {
+		res := <-resultChan
+		if res.err == nil {
+			cancel() // cancel remaining reads
+			return res.data, nil
 		}
 	}
 
@@ -73,11 +99,10 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 	cryptoShuffle(peers)
 
 	successCount := 0
-	replicationFactor := 3
 	var lastErr error
 
 	for _, peer := range peers {
-		if successCount >= replicationFactor {
+		if successCount >= ps.minReplicationCount {
 			break
 		}
 
@@ -93,6 +118,10 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 	}
 
 	if successCount > 0 {
+		if successCount < ps.minReplicationCount {
+			log.Printf("[CACHE] WARNING: peer replication for %s: %d/%d replicas written",
+				path, successCount, ps.minReplicationCount)
+		}
 		return nil
 	}
 

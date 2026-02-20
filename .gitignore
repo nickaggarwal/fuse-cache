@@ -98,11 +98,17 @@ config.local.yaml
 config.local.json
 
 # Docker
-.dockerignore
 Dockerfile.local
 
 # Kubernetes
 k8s/local/
+
+# Coordinator state
+coordinator_state.json
+coordinator_state.json.tmp
+
+# Node
+package-lock.json
 
 # Certificates and keys
 *.pem

@@ -18,7 +18,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-const maxUploadSize = 100 * 1024 * 1024 // 100MB
+const maxUploadSize = 2 * 1024 * 1024 * 1024 // 2GB
 
 // Handler handles HTTP requests for the peer API
 type Handler struct {
@@ -121,22 +121,33 @@ func (h *Handler) handleFile(w http.ResponseWriter, r *http.Request) {
 
 // handleFileGet handles GET requests for files
 func (h *Handler) handleFileGet(w http.ResponseWriter, ctx context.Context, filePath string) {
-	entry, err := h.cacheManager.Get(ctx, filePath)
+	w.Header().Set("Content-Type", "application/octet-stream")
+
+	// Use WriteTo to stream data — avoids buffering multi-GB chunked files
+	n, err := h.cacheManager.WriteTo(ctx, filePath, w)
 	if err != nil {
-		h.logger.Printf("File not found: %s", filePath)
-		http.Error(w, "File not found", http.StatusNotFound)
+		if n == 0 {
+			// Nothing written yet, safe to send error response
+			h.logger.Printf("File not found: %s", filePath)
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		// Partial write already happened, just log
+		h.logger.Printf("Partial stream for %s: wrote %d bytes before error: %v", filePath, n, err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(entry.Size, 10))
-	w.Write(entry.Data)
-
-	h.logger.Printf("Served file: %s (%d bytes)", filePath, entry.Size)
+	h.logger.Printf("Served file: %s (%d bytes)", filePath, n)
 }
 
 // handleFilePut handles PUT requests for files
 func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
+	// Early rejection based on Content-Length header
+	if r.ContentLength > maxUploadSize {
+		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	// Limit upload size
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
@@ -317,12 +328,25 @@ func (h *Handler) handleCache(w http.ResponseWriter, r *http.Request) {
 
 // handleCacheStats handles cache statistics requests
 func (h *Handler) handleCacheStats(w http.ResponseWriter, r *http.Request) {
-	if h.coordinator == nil {
-		http.Error(w, "Coordinator not available", http.StatusServiceUnavailable)
-		return
+	stats := make(map[string]interface{})
+
+	// Add coordinator stats if available
+	if h.coordinator != nil {
+		for k, v := range h.coordinator.GetPeerStats() {
+			stats[k] = v
+		}
 	}
 
-	stats := h.coordinator.GetPeerStats()
+	// Add local cache metrics if available
+	if dcm, ok := h.cacheManager.(*cache.DefaultCacheManager); ok {
+		used, capacity := dcm.Stats()
+		stats["nvme_used"] = used
+		stats["nvme_capacity"] = capacity
+		for k, v := range dcm.GetMetrics() {
+			stats[k] = v
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }
