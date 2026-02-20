@@ -7,5 +7,5 @@ data:
   COORDINATOR_ADDR: "coordinator.fuse-system.svc.cluster.local:8080"
   COORDINATOR_GRPC_ADDR: "coordinator.fuse-system.svc.cluster.local:9080"
   NVME_CACHE_PATH: "/mnt/nvme/cache"
-  FUSE_MOUNT_PATH: "/mnt/fuse"
+  FUSE_MOUNT_PATH: "/host/mnt/fuse"
   CHUNK_SIZE_MB: "4"

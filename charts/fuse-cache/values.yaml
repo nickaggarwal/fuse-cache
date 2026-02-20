@@ -39,12 +39,13 @@ client:
   fuseDevicePath: /dev/fuse
   nvmeHostPath: /mnt
   fuseMountHostPath: /mnt/fuse
+  fuseMountContainerPath: /host/mnt/fuse
 
 config:
   coordinatorAddr: ""
   coordinatorGrpcAddr: ""
   nvmeCachePath: /mnt/nvme/cache
-  fuseMountPath: /mnt/fuse
+  fuseMountPath: /host/mnt/fuse
   chunkSizeMB: "4"
 
 secrets:

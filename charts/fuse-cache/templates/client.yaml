@@ -14,8 +14,24 @@ spec:
       labels:
         app: client
     spec:
+      hostPID: true
       nodeSelector:
         {{- toYaml .Values.client.nodeSelector | nindent 8 }}
+      initContainers:
+        - name: prepare-fuse-mount
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              mkdir -p {{ .Values.client.fuseMountContainerPath }} &&
+              (umount -l {{ .Values.client.fuseMountContainerPath }} || true)
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fuse-mount
+              mountPath: {{ .Values.client.fuseMountContainerPath }}
+              mountPropagation: Bidirectional
       containers:
         - name: client
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -55,14 +71,29 @@ spec:
               name: grpc
           securityContext:
             privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - MKNOD
           volumeMounts:
             - name: fuse-device
               mountPath: /dev/fuse
             - name: nvme-storage
               mountPath: /mnt/nvme
             - name: fuse-mount
-              mountPath: /mnt/fuse
+              mountPath: {{ .Values.client.fuseMountContainerPath }}
               mountPropagation: Bidirectional
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    fusermount3 -u -z {{ .Values.client.fuseMountContainerPath }} ||
+                    umount -l {{ .Values.client.fuseMountContainerPath }} ||
+                    true
           livenessProbe:
             httpGet:
               path: /api/health

@@ -16,6 +16,14 @@ import (
 	"bazil.org/fuse/fs"
 )
 
+const (
+	// Tuned for throughput on NVMe-backed AKS nodes while keeping cache staleness bounded.
+	attrCacheTTL      = 5 * time.Second
+	maxReadaheadBytes = 4 * 1024 * 1024 // 4 MiB
+	maxBackgroundReqs = 128
+	defaultBlockSize  = 4 * 1024
+)
+
 // pathToInode generates a deterministic inode number from a path using FNV-64a
 func pathToInode(path string) uint64 {
 	h := fnv.New64a()
@@ -53,6 +61,10 @@ func (fs *FileSystem) Mount(ctx context.Context, mountPoint string) (*fuse.Conn,
 		mountPoint,
 		fuse.FSName("fuse-client"),
 		fuse.Subtype("fuse-client"),
+		fuse.AsyncRead(),
+		fuse.MaxReadahead(maxReadaheadBytes),
+		fuse.MaxBackground(maxBackgroundReqs),
+		fuse.CongestionThreshold(maxBackgroundReqs*3/4),
 	)
 	if err != nil {
 		return nil, err
@@ -95,6 +107,8 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mtime = time.Now()
 	a.Atime = time.Now()
 	a.Ctime = time.Now()
+	a.Valid = attrCacheTTL
+	a.BlockSize = defaultBlockSize
 	return nil
 }
 
@@ -266,6 +280,7 @@ type File struct {
 	path  string
 	entry *cache.CacheEntry
 	mu    sync.RWMutex
+	dirty bool
 }
 
 // Attr returns the attributes of the file
@@ -296,6 +311,8 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mtime = entry.LastAccessed
 	a.Atime = entry.LastAccessed
 	a.Ctime = entry.LastAccessed
+	a.Valid = attrCacheTTL
+	a.BlockSize = defaultBlockSize
 	return nil
 }
 
@@ -343,11 +360,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	copy(f.entry.Data[req.Offset:], req.Data)
 	f.entry.Size = int64(len(f.entry.Data))
 	f.entry.LastAccessed = time.Now()
-
-	// Store in cache
-	if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-		return fuse.EIO
-	}
+	f.dirty = true
 
 	resp.Size = len(req.Data)
 	f.fs.logger.Printf("Wrote %d bytes to %s at offset %d", len(req.Data), f.path, req.Offset)
@@ -359,9 +372,12 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Ensure data is stored in cache
-	if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-		return fuse.EIO
+	if f.dirty {
+		// Persist accumulated buffered writes once per flush/fsync.
+		if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
+			return fuse.EIO
+		}
+		f.dirty = false
 	}
 
 	f.fs.logger.Printf("Flushed file: %s", f.path)
@@ -394,6 +410,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
 			return fuse.EIO
 		}
+		f.dirty = false
 	}
 
 	return f.Attr(ctx, &resp.Attr)
@@ -402,6 +419,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 // Open opens the file
 func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	// Keep open metadata-only. Actual download happens in Read on first access.
+	resp.Flags |= fuse.OpenKeepCache
 	return f, nil
 }
 

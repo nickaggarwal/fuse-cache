@@ -14,8 +14,23 @@ spec:
       labels:
         app: client
     spec:
+      hostPID: true
       nodeSelector:
         agentpool: userpool
+      initContainers:
+        - name: prepare-fuse-mount
+          image: stargzrepo.azurecr.io/fuse-client:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              mkdir -p /host/mnt/fuse &&
+              (umount -l /host/mnt/fuse || true)
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fuse-mount
+              mountPath: /host/mnt/fuse
+              mountPropagation: Bidirectional
       containers:
         - name: client
           image: stargzrepo.azurecr.io/fuse-client:latest
@@ -58,14 +73,29 @@ spec:
               name: grpc
           securityContext:
             privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - MKNOD
           volumeMounts:
             - name: fuse-device
               mountPath: /dev/fuse
             - name: nvme-storage
               mountPath: /mnt/nvme
             - name: fuse-mount
-              mountPath: /mnt/fuse
+              mountPath: /host/mnt/fuse
               mountPropagation: Bidirectional
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    fusermount3 -u -z /host/mnt/fuse ||
+                    umount -l /host/mnt/fuse ||
+                    true
           livenessProbe:
             httpGet:
               path: /api/health

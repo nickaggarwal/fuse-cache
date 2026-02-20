@@ -44,7 +44,7 @@ func NewHandler(cacheManager cache.CacheManager, coord coordinator.Coordinator, 
 func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Health endpoint is always public
-		if r.URL.Path == "/api/health" {
+		if r.URL.Path == "/api/health" || r.URL.Path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -81,6 +81,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 
 	// Health check
 	router.HandleFunc("/api/health", h.handleHealth).Methods("GET")
+	router.HandleFunc("/metrics", h.handlePromMetrics).Methods("GET")
 
 	return router
 }
@@ -361,6 +362,51 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(health)
+}
+
+// handlePromMetrics exposes cache/perf metrics in Prometheus text format.
+func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+	// Coordinator availability metric
+	if h.coordinator != nil {
+		fmt.Fprintln(w, "fuse_coordinator_available 1")
+	} else {
+		fmt.Fprintln(w, "fuse_coordinator_available 0")
+	}
+
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		return
+	}
+
+	used, capacity := dcm.Stats()
+	fmt.Fprintf(w, "fuse_nvme_used_bytes %d\n", used)
+	fmt.Fprintf(w, "fuse_nvme_capacity_bytes %d\n", capacity)
+
+	metrics := dcm.GetMetrics()
+	writeMetricLine(w, "fuse_cache_nvme_hits_total", metrics["nvme_hits"])
+	writeMetricLine(w, "fuse_cache_nvme_misses_total", metrics["nvme_misses"])
+	writeMetricLine(w, "fuse_cache_peer_hits_total", metrics["peer_hits"])
+	writeMetricLine(w, "fuse_cache_peer_misses_total", metrics["peer_misses"])
+	writeMetricLine(w, "fuse_cache_cloud_hits_total", metrics["cloud_hits"])
+	writeMetricLine(w, "fuse_cache_cloud_misses_total", metrics["cloud_misses"])
+	writeMetricLine(w, "fuse_cache_write_count_total", metrics["write_count"])
+	writeMetricLine(w, "fuse_cache_write_bytes_total", metrics["write_bytes"])
+	writeMetricLine(w, "fuse_cache_evictions_total", metrics["eviction_count"])
+}
+
+func writeMetricLine(w io.Writer, name string, value interface{}) {
+	switch v := value.(type) {
+	case int:
+		fmt.Fprintf(w, "%s %d\n", name, v)
+	case int64:
+		fmt.Fprintf(w, "%s %d\n", name, v)
+	case float64:
+		fmt.Fprintf(w, "%s %f\n", name, v)
+	default:
+		// omit non-numeric values
+	}
 }
 
 // StartServer starts the HTTP API server
