@@ -14,6 +14,7 @@ import (
 type PeerInfo struct {
 	ID             string    `json:"id"`
 	Address        string    `json:"address"`
+	GRPCAddress    string    `json:"grpc_address"`
 	NVMePath       string    `json:"nvme_path"`
 	AvailableSpace int64     `json:"available_space"`
 	UsedSpace      int64     `json:"used_space"`

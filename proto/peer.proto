@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "fuse-client/internal/pb";
+
+// PeerService handles peer-to-peer file operations (hot path).
+service PeerService {
+  // ReadFile streams file data back in 64KB chunks.
+  rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+
+  // WriteFile receives metadata + data chunks via client streaming.
+  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+
+  // DeleteFile removes a file from this peer's local storage.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // FileExists checks if a file exists on this peer.
+  rpc FileExists(FileExistsRequest) returns (FileExistsResponse);
+
+  // FileSize returns the size of a file on this peer.
+  rpc FileSize(FileSizeRequest) returns (FileSizeResponse);
+}
+
+message ReadFileRequest {
+  string path = 1;
+}
+
+message FileChunk {
+  bytes data = 1;
+}
+
+message WriteFileRequest {
+  // First message in the stream must set metadata (path, total_size).
+  // Subsequent messages carry data chunks.
+  string path = 1;
+  int64 total_size = 2;
+  bytes data = 3;
+}
+
+message WriteFileResponse {
+  int64 bytes_written = 1;
+}
+
+message DeleteFileRequest {
+  string path = 1;
+}
+
+message DeleteFileResponse {}
+
+message FileExistsRequest {
+  string path = 1;
+}
+
+message FileExistsResponse {
+  bool exists = 1;
+}
+
+message FileSizeRequest {
+  string path = 1;
+}
+
+message FileSizeResponse {
+  int64 size = 1;
+}

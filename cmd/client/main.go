@@ -15,14 +15,19 @@ import (
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
 	"fuse-client/internal/fuse"
+	pb "fuse-client/internal/pb"
+
+	"google.golang.org/grpc"
 )
 
 func main() {
 	var (
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
-		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator address")
-		peerPort        = flag.Int("port", 8081, "Port for peer API server")
+		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator HTTP address")
+		coordinatorGRPC = flag.String("coordinator-grpc", "localhost:9080", "Coordinator gRPC address")
+		peerPort        = flag.Int("port", 8081, "Port for peer HTTP API server")
+		grpcPort        = flag.Int("grpc-port", 9081, "Port for peer gRPC server")
 		peerID          = flag.String("peer-id", "", "Peer ID (auto-generated if not provided)")
 		chunkSizeMB     = flag.Int("chunk-size", 4, "Chunk size in MB")
 		apiKey          = flag.String("api-key", "", "API key for authentication (optional)")
@@ -72,6 +77,9 @@ func main() {
 	if v := os.Getenv("GCP_BUCKET"); v != "" && *gcpBucket == "fuse-client-cache" {
 		*gcpBucket = v
 	}
+	if v := os.Getenv("COORDINATOR_GRPC_ADDR"); v != "" {
+		*coordinatorGRPC = v
+	}
 
 	logger := log.New(os.Stdout, "[CLIENT] ", log.LstdFlags)
 	logger.Printf("Starting FUSE client with ID: %s", *peerID)
@@ -79,6 +87,23 @@ func main() {
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Create gRPC coordinator client
+	var coordClient coordinator.Coordinator
+	var grpcCoordClient *coordinator.GRPCCoordinatorClient
+	if *coordinatorGRPC != "" {
+		var err error
+		grpcCoordClient, err = coordinator.NewGRPCCoordinatorClient(*coordinatorGRPC)
+		if err != nil {
+			logger.Printf("WARNING: Failed to create gRPC coordinator client: %v, falling back to HTTP", err)
+			coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
+		} else {
+			coordClient = grpcCoordClient
+			logger.Printf("Using gRPC coordinator client at %s", *coordinatorGRPC)
+		}
+	} else if *coordinatorAddr != "" {
+		coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
+	}
 
 	// Create cache configuration
 	cacheConfig := &cache.CacheConfig{
@@ -88,6 +113,7 @@ func main() {
 		PeerTimeout:     30 * time.Second,
 		CloudTimeout:    60 * time.Second,
 		CoordinatorAddr: *coordinatorAddr,
+		Coordinator:     coordClient,
 		ChunkSize:       int64(*chunkSizeMB) * 1024 * 1024,
 
 		CloudProvider:       *cloudProvider,
@@ -105,13 +131,24 @@ func main() {
 		logger.Fatalf("Failed to create cache manager: %v", err)
 	}
 
-	// Create coordinator client (HTTP-based, talks to remote coordinator)
-	var coordClient coordinator.Coordinator
-	if *coordinatorAddr != "" {
-		coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
+	// Start peer gRPC server
+	grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", *grpcPort))
+	if err != nil {
+		logger.Fatalf("Failed to listen on gRPC port %d: %v", *grpcPort, err)
+	}
+	grpcSrv := grpc.NewServer()
+	pb.RegisterPeerServiceServer(grpcSrv, cache.NewPeerGRPCServer(cacheManager))
 
-		// Register this peer with the remote coordinator
-		go registerPeer(ctx, coordClient, *peerID, *peerPort, *nvmePath, cacheManager, logger)
+	go func() {
+		logger.Printf("Peer gRPC server listening on :%d", *grpcPort)
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			logger.Printf("Peer gRPC server error: %v", err)
+		}
+	}()
+
+	// Register this peer with the coordinator
+	if coordClient != nil {
+		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, cacheManager, logger)
 	}
 
 	// Create API handler
@@ -145,8 +182,10 @@ func main() {
 	logger.Printf("- Peer ID: %s", *peerID)
 	logger.Printf("- Mount point: %s", *mountPoint)
 	logger.Printf("- NVME cache: %s", *nvmePath)
-	logger.Printf("- API port: %d", *peerPort)
-	logger.Printf("- Coordinator: %s", *coordinatorAddr)
+	logger.Printf("- HTTP API port: %d", *peerPort)
+	logger.Printf("- gRPC port: %d", *grpcPort)
+	logger.Printf("- Coordinator HTTP: %s", *coordinatorAddr)
+	logger.Printf("- Coordinator gRPC: %s", *coordinatorGRPC)
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
 
 	// Wait for interrupt signal to gracefully shutdown
@@ -158,6 +197,11 @@ func main() {
 
 	// Graceful shutdown
 	cancel()
+	grpcSrv.GracefulStop()
+
+	if grpcCoordClient != nil {
+		grpcCoordClient.Close()
+	}
 
 	// Unmount the FUSE filesystem
 	if err := filesystem.Unmount(*mountPoint); err != nil {
@@ -169,7 +213,7 @@ func main() {
 	logger.Println("Client stopped")
 }
 
-func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port int, nvmePath string, cm cache.CacheManager, logger *log.Logger) {
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()
 	availableSpace := capacity - used
 	usedSpace := used
@@ -183,6 +227,7 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 	peerInfo := &coordinator.PeerInfo{
 		ID:             peerID,
 		Address:        fmt.Sprintf("%s:%d", host, port),
+		GRPCAddress:    fmt.Sprintf("%s:%d", host, grpcPort),
 		NVMePath:       nvmePath,
 		AvailableSpace: availableSpace,
 		UsedSpace:      usedSpace,
@@ -200,7 +245,7 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 				continue
 			}
 		}
-		logger.Printf("Peer registered successfully at %s", peerInfo.Address)
+		logger.Printf("Peer registered successfully at %s (gRPC: %s)", peerInfo.Address, peerInfo.GRPCAddress)
 		break
 	}
 

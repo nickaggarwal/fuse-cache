@@ -12,7 +12,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"fuse-client/internal/coordinator"
 )
+
+// Coordinator is an alias for the coordinator.Coordinator interface,
+// used in CacheConfig to avoid import cycles for callers.
+type Coordinator = coordinator.Coordinator
 
 // CacheTier represents different cache tiers
 type CacheTier int
@@ -66,6 +72,7 @@ type CacheConfig struct {
 	PeerTimeout     time.Duration
 	CloudTimeout    time.Duration
 	CoordinatorAddr string
+	Coordinator     Coordinator
 	ChunkSize       int64
 
 	// Cloud provider: "s3", "azure", or "gcp"
@@ -138,7 +145,13 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		return nil, err
 	}
 
-	cm.peerStorage, err = NewPeerStorage(config.CoordinatorAddr, config.PeerTimeout)
+	if config.Coordinator != nil {
+		cm.peerStorage, err = NewPeerStorage(config.Coordinator, config.PeerTimeout)
+	} else {
+		// Fallback: create a no-op peer storage if no coordinator is configured
+		cm.peerStorage = &noopStorage{}
+		err = nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -718,4 +731,20 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"write_bytes":    m.WriteBytes.Load(),
 		"eviction_count": m.EvictionCount.Load(),
 	}
+}
+
+// noopStorage is a TierStorage that always reports empty. Used as a fallback
+// when no coordinator is configured.
+type noopStorage struct{}
+
+func (n *noopStorage) Read(ctx context.Context, path string) ([]byte, error) {
+	return nil, errors.New("no peer storage configured")
+}
+func (n *noopStorage) Write(ctx context.Context, path string, data []byte) error {
+	return errors.New("no peer storage configured")
+}
+func (n *noopStorage) Delete(ctx context.Context, path string) error { return nil }
+func (n *noopStorage) Exists(ctx context.Context, path string) bool  { return false }
+func (n *noopStorage) Size(ctx context.Context, path string) (int64, error) {
+	return 0, errors.New("no peer storage configured")
 }

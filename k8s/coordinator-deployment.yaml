@@ -32,10 +32,12 @@ spec:
         - name: coordinator
           image: stargzrepo.azurecr.io/fuse-client:latest
           command: ["coordinator"]
-          args: ["-port", "8080"]
+          args: ["-port", "8080", "-grpc-port", "9080"]
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 9080
+              name: grpc
           volumeMounts:
             - name: state
               mountPath: /data
@@ -80,3 +82,7 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: http
+    - port: 9080
+      targetPort: 9080
+      protocol: TCP
+      name: grpc

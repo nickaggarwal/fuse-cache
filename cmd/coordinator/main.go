@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,12 +14,16 @@ import (
 	"time"
 
 	"fuse-client/internal/coordinator"
+	pb "fuse-client/internal/pb"
+
+	"google.golang.org/grpc"
 )
 
 func main() {
 	var (
-		port = flag.Int("port", 8080, "Port for the coordinator HTTP server")
-		help = flag.Bool("help", false, "Show help")
+		port     = flag.Int("port", 8080, "Port for the coordinator HTTP server")
+		grpcPort = flag.Int("grpc-port", 9080, "Port for the coordinator gRPC server")
+		help     = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
 
@@ -28,7 +33,7 @@ func main() {
 	}
 
 	logger := log.New(os.Stdout, "[COORDINATOR] ", log.LstdFlags)
-	logger.Printf("Starting coordinator on port %d", *port)
+	logger.Printf("Starting coordinator on HTTP port %d, gRPC port %d", *port, *grpcPort)
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,6 +42,21 @@ func main() {
 	// Create coordinator service
 	coordinatorService := coordinator.NewCoordinatorService()
 	coordinatorService.Start(ctx)
+
+	// Start gRPC server
+	grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", *grpcPort))
+	if err != nil {
+		logger.Fatalf("Failed to listen on gRPC port %d: %v", *grpcPort, err)
+	}
+	grpcSrv := grpc.NewServer()
+	pb.RegisterCoordinatorServiceServer(grpcSrv, coordinator.NewGRPCServer(coordinatorService))
+
+	go func() {
+		logger.Printf("gRPC server listening on :%d", *grpcPort)
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			logger.Printf("gRPC server error: %v", err)
+		}
+	}()
 
 	// Create HTTP server
 	mux := http.NewServeMux()
@@ -54,7 +74,7 @@ func main() {
 		}
 	}()
 
-	logger.Printf("Coordinator started on port %d", *port)
+	logger.Printf("Coordinator started on HTTP port %d, gRPC port %d", *port, *grpcPort)
 
 	// Wait for interrupt signal to gracefully shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -65,6 +85,8 @@ func main() {
 
 	// Graceful shutdown
 	cancel()
+	grpcSrv.GracefulStop()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 

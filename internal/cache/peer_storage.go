@@ -4,47 +4,67 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
-	"net/http"
+	"sync"
 	"time"
+
+	"fuse-client/internal/coordinator"
+	pb "fuse-client/internal/pb"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-// PeerStorage implements TierStorage for peer-to-peer storage
+// PeerStorage implements TierStorage for peer-to-peer storage via gRPC.
 type PeerStorage struct {
-	coordinatorAddr    string
-	timeout            time.Duration
-	client             *http.Client
+	coordinator         coordinator.Coordinator
+	timeout             time.Duration
 	minReplicationCount int
+	connMu              sync.RWMutex
+	connPool            map[string]*grpc.ClientConn
 }
 
-// NewPeerStorage creates a new peer storage instance
-func NewPeerStorage(coordinatorAddr string, timeout time.Duration) (*PeerStorage, error) {
+// NewPeerStorage creates a new peer storage instance.
+func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration) (*PeerStorage, error) {
 	return &PeerStorage{
-		coordinatorAddr:    coordinatorAddr,
-		timeout:            timeout,
+		coordinator:         coord,
+		timeout:             timeout,
 		minReplicationCount: 3,
-		client: &http.Client{
-			Timeout: timeout,
-		},
+		connPool:            make(map[string]*grpc.ClientConn),
 	}, nil
 }
 
-// PeerInfo represents peer information
-type PeerInfo struct {
-	ID            string `json:"id"`
-	Address       string `json:"address"`
-	NVMePath      string `json:"nvme_path"`
-	AvailSpace    int64  `json:"available_space"`
-	UsedSpace     int64  `json:"used_space"`
-	Status        string `json:"status"`
-	LastHeartbeat int64  `json:"last_heartbeat"`
+// getOrDial returns a cached gRPC connection or dials a new one.
+func (ps *PeerStorage) getOrDial(addr string) (*grpc.ClientConn, error) {
+	ps.connMu.RLock()
+	conn, ok := ps.connPool[addr]
+	ps.connMu.RUnlock()
+	if ok {
+		return conn, nil
+	}
+
+	ps.connMu.Lock()
+	defer ps.connMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if conn, ok := ps.connPool[addr]; ok {
+		return conn, nil
+	}
+
+	conn, err := grpc.Dial(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial peer %s: %v", addr, err)
+	}
+	ps.connPool[addr] = conn
+	return conn, nil
 }
 
-// Read reads a file from peer storage using parallel fan-out
+// Read reads a file from peer storage using parallel fan-out.
 func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
@@ -63,14 +83,14 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	active := 0
 
 	for _, peer := range peers {
-		if peer.Status != "active" {
+		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
 		active++
 		go func(addr string) {
 			data, err := ps.readFromPeer(readCtx, addr, path)
 			resultChan <- readResult{data, err}
-		}(peer.Address)
+		}(peer.GRPCAddress)
 	}
 
 	if active == 0 {
@@ -80,7 +100,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	for i := 0; i < active; i++ {
 		res := <-resultChan
 		if res.err == nil {
-			cancel() // cancel remaining reads
+			cancel()
 			return res.data, nil
 		}
 	}
@@ -88,14 +108,13 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	return nil, fmt.Errorf("file not found on any peer")
 }
 
-// Write writes a file to peer storage with replication
+// Write writes a file to peer storage with replication.
 func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) error {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Cryptographically secure shuffle
 	cryptoShuffle(peers)
 
 	successCount := 0
@@ -105,12 +124,10 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 		if successCount >= ps.minReplicationCount {
 			break
 		}
-
-		if peer.Status != "active" {
+		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
-
-		if err := ps.writeToPeer(ctx, peer.Address, path, data); err == nil {
+		if err := ps.writeToPeer(ctx, peer.GRPCAddress, path, data); err == nil {
 			successCount++
 		} else {
 			lastErr = err
@@ -131,7 +148,7 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 	return fmt.Errorf("no active peers available")
 }
 
-// Delete removes a file from peer storage
+// Delete removes a file from peer storage.
 func (ps *PeerStorage) Delete(ctx context.Context, path string) error {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
@@ -140,19 +157,17 @@ func (ps *PeerStorage) Delete(ctx context.Context, path string) error {
 
 	var lastErr error
 	for _, peer := range peers {
-		if peer.Status != "active" {
+		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
-
-		if err := ps.deleteFromPeer(ctx, peer.Address, path); err != nil {
+		if err := ps.deleteFromPeer(ctx, peer.GRPCAddress, path); err != nil {
 			lastErr = err
 		}
 	}
-
 	return lastErr
 }
 
-// Exists checks if a file exists in peer storage
+// Exists checks if a file exists in peer storage.
 func (ps *PeerStorage) Exists(ctx context.Context, path string) bool {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
@@ -160,19 +175,17 @@ func (ps *PeerStorage) Exists(ctx context.Context, path string) bool {
 	}
 
 	for _, peer := range peers {
-		if peer.Status != "active" {
+		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
-
-		if ps.existsOnPeer(ctx, peer.Address, path) {
+		if ps.existsOnPeer(ctx, peer.GRPCAddress, path) {
 			return true
 		}
 	}
-
 	return false
 }
 
-// Size returns the size of a file in peer storage
+// Size returns the size of a file in peer storage.
 func (ps *PeerStorage) Size(ctx context.Context, path string) (int64, error) {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
@@ -180,20 +193,28 @@ func (ps *PeerStorage) Size(ctx context.Context, path string) (int64, error) {
 	}
 
 	for _, peer := range peers {
-		if peer.Status != "active" {
+		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
-
-		if size, err := ps.sizeOnPeer(ctx, peer.Address, path); err == nil {
+		if size, err := ps.sizeOnPeer(ctx, peer.GRPCAddress, path); err == nil {
 			return size, nil
 		}
 	}
-
 	return 0, fmt.Errorf("file not found on any peer")
 }
 
-// cryptoShuffle performs a Fisher-Yates shuffle using crypto/rand
-func cryptoShuffle(peers []PeerInfo) {
+// Close closes all pooled gRPC connections.
+func (ps *PeerStorage) Close() {
+	ps.connMu.Lock()
+	defer ps.connMu.Unlock()
+	for addr, conn := range ps.connPool {
+		conn.Close()
+		delete(ps.connPool, addr)
+	}
+}
+
+// cryptoShuffle performs a Fisher-Yates shuffle using crypto/rand.
+func cryptoShuffle(peers []*coordinator.PeerInfo) {
 	for i := len(peers) - 1; i > 0; i-- {
 		n, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
 		if err != nil {
@@ -204,126 +225,112 @@ func cryptoShuffle(peers []PeerInfo) {
 	}
 }
 
-func (ps *PeerStorage) getPeers(ctx context.Context) ([]PeerInfo, error) {
-	url := fmt.Sprintf("http://%s/api/peers", ps.coordinatorAddr)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := ps.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var peers []PeerInfo
-	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
-		return nil, err
-	}
-
-	return peers, nil
+func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, error) {
+	return ps.coordinator.GetPeers(ctx, "")
 }
 
-func (ps *PeerStorage) readFromPeer(ctx context.Context, peerAddr, path string) ([]byte, error) {
-	url := fmt.Sprintf("http://%s/api/files/%s", peerAddr, path)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) ([]byte, error) {
+	conn, err := ps.getOrDial(grpcAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := ps.client.Do(req)
+	client := pb.NewPeerServiceClient(conn)
+	stream, err := client.ReadFile(ctx, &pb.ReadFileRequest{Path: path})
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("peer returned status: %d", resp.StatusCode)
+	var buf bytes.Buffer
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(chunk.Data)
 	}
-
-	return io.ReadAll(resp.Body)
+	return buf.Bytes(), nil
 }
 
-func (ps *PeerStorage) writeToPeer(ctx context.Context, peerAddr, path string, data []byte) error {
-	url := fmt.Sprintf("http://%s/api/files/%s", peerAddr, path)
-
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(data))
+func (ps *PeerStorage) writeToPeer(ctx context.Context, grpcAddr, path string, data []byte) error {
+	conn, err := ps.getOrDial(grpcAddr)
 	if err != nil {
 		return err
 	}
 
-	resp, err := ps.client.Do(req)
+	client := pb.NewPeerServiceClient(conn)
+	stream, err := client.WriteFile(ctx)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("peer returned status: %d", resp.StatusCode)
+	// Send first message with metadata + first chunk
+	chunkSize := grpcChunkSize
+	firstEnd := chunkSize
+	if firstEnd > len(data) {
+		firstEnd = len(data)
 	}
 
-	return nil
+	if err := stream.Send(&pb.WriteFileRequest{
+		Path:      path,
+		TotalSize: int64(len(data)),
+		Data:      data[:firstEnd],
+	}); err != nil {
+		return err
+	}
+
+	// Send remaining chunks
+	for offset := firstEnd; offset < len(data); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := stream.Send(&pb.WriteFileRequest{
+			Data: data[offset:end],
+		}); err != nil {
+			return err
+		}
+	}
+
+	_, err = stream.CloseAndRecv()
+	return err
 }
 
-func (ps *PeerStorage) deleteFromPeer(ctx context.Context, peerAddr, path string) error {
-	url := fmt.Sprintf("http://%s/api/files/%s", peerAddr, path)
-
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+func (ps *PeerStorage) deleteFromPeer(ctx context.Context, grpcAddr, path string) error {
+	conn, err := ps.getOrDial(grpcAddr)
 	if err != nil {
 		return err
 	}
-
-	resp, err := ps.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	return nil
+	client := pb.NewPeerServiceClient(conn)
+	_, err = client.DeleteFile(ctx, &pb.DeleteFileRequest{Path: path})
+	return err
 }
 
-func (ps *PeerStorage) existsOnPeer(ctx context.Context, peerAddr, path string) bool {
-	url := fmt.Sprintf("http://%s/api/files/%s", peerAddr, path)
-
-	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+func (ps *PeerStorage) existsOnPeer(ctx context.Context, grpcAddr, path string) bool {
+	conn, err := ps.getOrDial(grpcAddr)
 	if err != nil {
 		return false
 	}
-
-	resp, err := ps.client.Do(req)
+	client := pb.NewPeerServiceClient(conn)
+	resp, err := client.FileExists(ctx, &pb.FileExistsRequest{Path: path})
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
+	return resp.Exists
 }
 
-func (ps *PeerStorage) sizeOnPeer(ctx context.Context, peerAddr, path string) (int64, error) {
-	url := fmt.Sprintf("http://%s/api/files/%s/size", peerAddr, path)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func (ps *PeerStorage) sizeOnPeer(ctx context.Context, grpcAddr, path string) (int64, error) {
+	conn, err := ps.getOrDial(grpcAddr)
 	if err != nil {
 		return 0, err
 	}
-
-	resp, err := ps.client.Do(req)
+	client := pb.NewPeerServiceClient(conn)
+	resp, err := client.FileSize(ctx, &pb.FileSizeRequest{Path: path})
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("peer returned status: %d", resp.StatusCode)
-	}
-
-	var size int64
-	if err := json.NewDecoder(resp.Body).Decode(&size); err != nil {
-		return 0, err
-	}
-
-	return size, nil
+	return resp.Size, nil
 }

@@ -112,15 +112,15 @@ dev-cleanup:
 .PHONY: dev-start
 dev-start: dev-setup build
 	@echo "Starting coordinator..."
-	./$(COORDINATOR_BINARY) -port 8080 &
+	./$(COORDINATOR_BINARY) -port 8080 -grpc-port 9080 &
 	@echo "Waiting for coordinator to start..."
 	sleep 2
 	@echo "Starting client 1..."
-	./$(CLIENT_BINARY) -mount /tmp/fuse-client1 -nvme /tmp/nvme-cache1 -port 8081 -peer-id client-1 &
+	./$(CLIENT_BINARY) -mount /tmp/fuse-client1 -nvme /tmp/nvme-cache1 -port 8081 -grpc-port 9081 -coordinator-grpc localhost:9080 -peer-id client-1 &
 	@echo "Starting client 2..."
-	./$(CLIENT_BINARY) -mount /tmp/fuse-client2 -nvme /tmp/nvme-cache2 -port 8082 -peer-id client-2 &
+	./$(CLIENT_BINARY) -mount /tmp/fuse-client2 -nvme /tmp/nvme-cache2 -port 8082 -grpc-port 9082 -coordinator-grpc localhost:9080 -peer-id client-2 &
 	@echo "Starting client 3..."
-	./$(CLIENT_BINARY) -mount /tmp/fuse-client3 -nvme /tmp/nvme-cache3 -port 8083 -peer-id client-3 &
+	./$(CLIENT_BINARY) -mount /tmp/fuse-client3 -nvme /tmp/nvme-cache3 -port 8083 -grpc-port 9083 -coordinator-grpc localhost:9080 -peer-id client-3 &
 	@echo "Development environment started!"
 	@echo "Coordinator: http://localhost:8080"
 	@echo "Client 1: http://localhost:8081"
@@ -135,10 +135,14 @@ dev-stop:
 	-pkill -f "$(CLIENT_BINARY)"
 	@echo "Development environment stopped!"
 
-# Generate protobuf files (for future use)
+# Generate protobuf files
 .PHONY: proto
 proto:
-	protoc --go_out=. --go-grpc_out=. $(PROTO_DIR)/*.proto
+	mkdir -p internal/pb
+	protoc --proto_path=proto \
+	  --go_out=internal/pb --go_opt=paths=source_relative \
+	  --go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
+	  proto/coordinator.proto proto/peer.proto
 
 # Check code quality
 .PHONY: lint
