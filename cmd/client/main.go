@@ -28,7 +28,7 @@ func main() {
 		apiKey          = flag.String("api-key", "", "API key for authentication (optional)")
 
 		// Cloud provider selection
-		cloudProvider = flag.String("cloud-provider", "s3", "Cloud storage provider: s3 or azure")
+		cloudProvider = flag.String("cloud-provider", "s3", "Cloud storage provider: s3, azure, or gcp")
 
 		// S3 config
 		s3Bucket = flag.String("s3-bucket", "fuse-client-cache", "S3 bucket name")
@@ -38,6 +38,9 @@ func main() {
 		azureAccount   = flag.String("azure-account", "", "Azure storage account name")
 		azureKey       = flag.String("azure-key", "", "Azure storage account key")
 		azureContainer = flag.String("azure-container", "fuse-cache", "Azure blob container name")
+
+		// GCP config
+		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
 
 		// NVMe capacity
 		nvmeMaxGB = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
@@ -66,6 +69,9 @@ func main() {
 	if v := os.Getenv("AZURE_CONTAINER_NAME"); v != "" && *azureContainer == "" {
 		*azureContainer = v
 	}
+	if v := os.Getenv("GCP_BUCKET"); v != "" && *gcpBucket == "fuse-client-cache" {
+		*gcpBucket = v
+	}
 
 	logger := log.New(os.Stdout, "[CLIENT] ", log.LstdFlags)
 	logger.Printf("Starting FUSE client with ID: %s", *peerID)
@@ -78,7 +84,7 @@ func main() {
 	cacheConfig := &cache.CacheConfig{
 		NVMePath:        *nvmePath,
 		MaxNVMeSize:     int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
-		MaxPeerSize:     5 * 1024 * 1024 * 1024,   // 5GB
+		MaxPeerSize:     5 * 1024 * 1024 * 1024, // 5GB
 		PeerTimeout:     30 * time.Second,
 		CloudTimeout:    60 * time.Second,
 		CoordinatorAddr: *coordinatorAddr,
@@ -90,6 +96,7 @@ func main() {
 		AzureStorageAccount: *azureAccount,
 		AzureStorageKey:     *azureKey,
 		AzureContainerName:  *azureContainer,
+		GCPBucket:           *gcpBucket,
 	}
 
 	// Initialize cache manager
