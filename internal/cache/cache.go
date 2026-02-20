@@ -159,6 +159,10 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		cm.mu.Lock()
 		cm.entries[entry.FilePath] = entry
 		cm.mu.Unlock()
+
+		// Background write-through to cloud for durability
+		go cm.persistToCloud(entry)
+
 		return nil
 	}
 
@@ -285,6 +289,23 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 	}
 
 	return nil
+}
+
+// persistToCloud asynchronously writes a copy of the entry to cloud storage for durability.
+// This runs in the background after a successful NVMe write.
+func (cm *DefaultCacheManager) persistToCloud(entry *CacheEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), cm.config.CloudTimeout)
+	defer cancel()
+
+	// Make a copy of data to avoid races with the caller
+	dataCopy := make([]byte, len(entry.Data))
+	copy(dataCopy, entry.Data)
+
+	if err := cm.cloudStorage.Write(ctx, entry.FilePath, dataCopy); err != nil {
+		cm.logger.Printf("Background cloud persist failed for %s: %v", entry.FilePath, err)
+		return
+	}
+	cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", entry.FilePath, len(dataCopy))
 }
 
 // putToNVMeWithEviction tries NVMe write, evicting if necessary

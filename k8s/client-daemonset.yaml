@@ -31,11 +31,13 @@ spec:
             - "8081"
             - "-chunk-size"
             - "$(CHUNK_SIZE_MB)"
+            - "-cloud-provider"
+            - "azure"
           envFrom:
             - configMapRef:
                 name: fuse-config
             - secretRef:
-                name: aws-credentials
+                name: azure-credentials
           env:
             - name: POD_IP
               valueFrom:
