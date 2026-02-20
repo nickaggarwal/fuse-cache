@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuse-cache-dashboard
+  namespace: fuse-system
+  labels:
+    app: client
+    grafana_dashboard: "1"
+data:
+  fuse-cache-overview.json: |
+    {
+      "id": null,
+      "uid": "fuse-cache-overview",
+      "title": "FUSE Cache Overview",
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "version": 1,
+      "refresh": "10s",
+      "tags": ["fuse", "cache"],
+      "time": {
+        "from": "now-30m",
+        "to": "now"
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Coordinator Availability",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "targets": [
+            {"expr": "max(fuse_coordinator_available)", "refId": "A"}
+          ],
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "NVMe Used (GiB)",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "targets": [
+            {"expr": "sum(fuse_nvme_used_bytes) / 1024 / 1024 / 1024", "refId": "A"}
+          ],
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "NVMe Capacity (GiB)",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "targets": [
+            {"expr": "sum(fuse_nvme_capacity_bytes) / 1024 / 1024 / 1024", "refId": "A"}
+          ],
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "NVMe Usage (%)",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "targets": [
+            {"expr": "100 * sum(fuse_nvme_used_bytes) / sum(fuse_nvme_capacity_bytes)", "refId": "A"}
+          ],
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Write Throughput (MiB/s)",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "targets": [
+            {"expr": "sum(rate(fuse_cache_write_bytes_total[5m])) / 1024 / 1024", "legendFormat": "cluster", "refId": "A"}
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Write Ops/s",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "targets": [
+            {"expr": "sum(rate(fuse_cache_write_count_total[5m]))", "legendFormat": "cluster", "refId": "A"}
+          ]
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Cache Hits/s by Tier",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+          "targets": [
+            {"expr": "sum(rate(fuse_cache_nvme_hits_total[5m]))", "legendFormat": "nvme", "refId": "A"},
+            {"expr": "sum(rate(fuse_cache_peer_hits_total[5m]))", "legendFormat": "peer", "refId": "B"},
+            {"expr": "sum(rate(fuse_cache_cloud_hits_total[5m]))", "legendFormat": "cloud", "refId": "C"}
+          ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Cache Misses/s by Tier",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+          "targets": [
+            {"expr": "sum(rate(fuse_cache_nvme_misses_total[5m]))", "legendFormat": "nvme", "refId": "A"},
+            {"expr": "sum(rate(fuse_cache_peer_misses_total[5m]))", "legendFormat": "peer", "refId": "B"},
+            {"expr": "sum(rate(fuse_cache_cloud_misses_total[5m]))", "legendFormat": "cloud", "refId": "C"}
+          ]
+        },
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Hit Ratio by Tier (%)",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+          "targets": [
+            {
+              "expr": "100 * sum(rate(fuse_cache_nvme_hits_total[5m])) / clamp_min(sum(rate(fuse_cache_nvme_hits_total[5m])) + sum(rate(fuse_cache_nvme_misses_total[5m])), 1)",
+              "legendFormat": "nvme",
+              "refId": "A"
+            },
+            {
+              "expr": "100 * sum(rate(fuse_cache_peer_hits_total[5m])) / clamp_min(sum(rate(fuse_cache_peer_hits_total[5m])) + sum(rate(fuse_cache_peer_misses_total[5m])), 1)",
+              "legendFormat": "peer",
+              "refId": "B"
+            },
+            {
+              "expr": "100 * sum(rate(fuse_cache_cloud_hits_total[5m])) / clamp_min(sum(rate(fuse_cache_cloud_hits_total[5m])) + sum(rate(fuse_cache_cloud_misses_total[5m])), 1)",
+              "legendFormat": "cloud",
+              "refId": "C"
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Evictions/s",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+          "targets": [
+            {"expr": "sum(rate(fuse_cache_evictions_total[5m]))", "legendFormat": "cluster", "refId": "A"}
+          ]
+        }
+      ]
+    }

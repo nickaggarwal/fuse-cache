@@ -285,6 +285,44 @@ Key client mount settings:
 - `client.fuseMountContainerPath`: in-container bind path (default `/host/mnt/fuse`)
 - `config.fuseMountPath`: mount target used by the client process (default `/host/mnt/fuse`)
 
+Enable Prometheus scraping + Grafana dashboard objects:
+
+```bash
+helm upgrade --install fuse-cache charts/fuse-cache \
+  --namespace fuse-system \
+  --create-namespace \
+  --set monitoring.serviceMonitor.enabled=true \
+  --set monitoring.grafanaDashboard.enabled=true
+```
+
+If you need to install Prometheus + Grafana on AKS:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace
+```
+
+Monitoring values:
+
+- `monitoring.serviceMonitor.enabled`
+- `monitoring.serviceMonitor.namespace`
+- `monitoring.serviceMonitor.interval`
+- `monitoring.serviceMonitor.scrapeTimeout`
+- `monitoring.serviceMonitor.labels`
+- `monitoring.grafanaDashboard.enabled`
+- `monitoring.grafanaDashboard.namespace`
+- `monitoring.grafanaDashboard.labels`
+
+If you use raw manifests instead of Helm, apply:
+
+```bash
+kubectl apply -f k8s/servicemonitor.yaml
+kubectl apply -f k8s/grafana-dashboard-configmap.yaml
+```
+
 Install to any cluster:
 
 ```bash

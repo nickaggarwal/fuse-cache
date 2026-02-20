@@ -61,3 +61,16 @@ secrets:
     account: REPLACE_WITH_ACCOUNT_NAME
     key: REPLACE_WITH_ACCOUNT_KEY
     container: fuse-cache
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 15s
+    scrapeTimeout: 10s
+    labels: {}
+  grafanaDashboard:
+    enabled: false
+    namespace: ""
+    labels:
+      grafana_dashboard: "1"

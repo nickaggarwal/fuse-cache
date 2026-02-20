@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: client
+  namespace: fuse-system
+  labels:
+    app: client
+spec:
+  selector:
+    matchLabels:
+      app: client
+  namespaceSelector:
+    matchNames:
+      - fuse-system
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
