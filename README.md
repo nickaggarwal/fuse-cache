@@ -13,6 +13,21 @@ The system consists of:
    - **Tier 2**: Other seed peers (distributed cache)
    - **Tier 3**: Cloud storage (AWS S3 / Azure Blob / GCP Cloud Storage)
 
+## Recent Features
+
+- **Helm + AKS-ready mount model**:
+  - Privileged client DaemonSet with `hostPID: true`
+  - Dedicated host-visible mount path (`/host/mnt/fuse` in container -> `/mnt/fuse` on node)
+  - Init container and preStop hooks to reduce stale FUSE mount failures
+- **Prometheus metrics endpoint**:
+  - Client now exposes `GET /metrics` (Prometheus text format)
+  - Includes cache hits/misses, write bytes/count, eviction counters, NVMe capacity/usage, coordinator availability
+- **Large file stability improvements**:
+  - Write path uses buffered growth to avoid O(n^2) realloc/copy behavior
+  - Chunked uploads avoid unbounded goroutine fanout
+  - Chunked reads use range-based reads with chunk reuse to avoid full-file in-memory reconstruction
+- **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and 1GB benchmarking
+
 ## Components
 
 ### Master Coordinator
@@ -51,12 +66,17 @@ fuse-client/
 ├── cmd/
 │   ├── coordinator/        # Master coordinator application
 │   └── client/            # FUSE client application
+├── charts/
+│   └── fuse-cache/        # Helm chart for coordinator/client deployment
 ├── internal/
 │   ├── api/               # HTTP API handlers
 │   ├── cache/             # Cache management and tier implementations
 │   ├── coordinator/       # Coordinator service
 │   ├── fuse/             # FUSE filesystem implementation
 │   └── proto/            # Protocol buffer definitions
+├── scripts/
+│   ├── devbox/            # kind-based local cluster tooling
+│   └── ops/               # AKS/Helm operational scripts
 ├── go.mod
 ├── go.sum
 └── README.md
@@ -142,6 +162,7 @@ Options:
 - `GET /api/cache` - List cached files
 - `GET /api/cache/stats` - Get cache statistics
 - `GET /api/health` - Health check
+- `GET /metrics` - Prometheus metrics
 
 ## Cache Behavior
 
@@ -150,16 +171,20 @@ Options:
    - If not found, checks Tier 2 (Peers)
    - If not found, checks Tier 3 (Cloud)
    - Promotes files to higher tiers on access
+   - Chunked objects are served through range reads (no full-file reassembly required)
 
 2. **File Write**:
    - Tries to store in Tier 1 first
    - Falls back to Tier 2 if Tier 1 is full
    - Falls back to Tier 3 if Tier 2 is unavailable
+   - Buffered write growth reduces large-file write amplification
+   - Flush/Fsync persists accumulated buffered writes
 
 3. **Cache Management**:
    - LRU eviction within each tier
    - Automatic promotion of frequently accessed files
    - Background cleanup of inactive entries
+   - Chunked persistence uses bounded memory behavior
 
 ## Configuration
 
@@ -218,6 +243,7 @@ Default cache sizes:
 - Peer heartbeat monitoring
 - Cache statistics and metrics
 - Coordinator provides system-wide statistics
+- Prometheus scrape endpoint on clients: `GET /metrics`
 
 ## Future Enhancements
 
@@ -225,7 +251,6 @@ Default cache sizes:
 - Encryption for data in transit and at rest
 - More sophisticated cache eviction policies
 - Web UI for monitoring and management
-- Metrics integration (Prometheus/Grafana)
 
 ## Contributing
 
@@ -253,6 +278,12 @@ Validate and render chart templates:
 helm lint charts/fuse-cache
 helm template fuse-cache charts/fuse-cache
 ```
+
+Key client mount settings:
+
+- `client.fuseMountHostPath`: host path where mount appears (default `/mnt/fuse`)
+- `client.fuseMountContainerPath`: in-container bind path (default `/host/mnt/fuse`)
+- `config.fuseMountPath`: mount target used by the client process (default `/host/mnt/fuse`)
 
 Install to any cluster:
 
@@ -287,6 +318,54 @@ make k8s-devbox-create
 make k8s-devbox-deploy
 make k8s-devbox-status
 make k8s-devbox-delete
+```
+
+## Ops Scripts
+
+Reusable operational commands live under:
+
+```bash
+scripts/ops/
+```
+
+### Deploy client image tag
+
+```bash
+./scripts/ops/deploy-client-image.sh <release> <namespace> <image-tag> [chart-path]
+```
+
+Example:
+
+```bash
+./scripts/ops/deploy-client-image.sh fuse-cache-aztest fuse-system-aztest <tag> charts/fuse-cache
+```
+
+### Repair stale FUSE mount on a VMSS instance
+
+```bash
+./scripts/ops/repair-fuse-mount.sh <resource-group> <vmss-name> <instance-id> [mount-path]
+```
+
+Example:
+
+```bash
+./scripts/ops/repair-fuse-mount.sh mc_stargz-test_group_stargz-test_westus aks-memnvme-38123922-vmss 2 /mnt/fuse
+```
+
+### Run NVMe vs FUSE benchmark
+
+```bash
+./scripts/ops/bench-fuse-io.sh <namespace> [size-mb] [pod-name] [with-read]
+```
+
+Examples:
+
+```bash
+# 1GiB write-only benchmark
+./scripts/ops/bench-fuse-io.sh fuse-system-aztest 1024
+
+# 1GiB write + read benchmark
+./scripts/ops/bench-fuse-io.sh fuse-system-aztest 1024 client-abc123 with-read
 ```
 
 ## License
