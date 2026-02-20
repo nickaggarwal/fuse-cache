@@ -11,7 +11,7 @@ The system consists of:
 3. **3-Tier Cache System**:
    - **Tier 1**: NVME local storage (fastest)
    - **Tier 2**: Other seed peers (distributed cache)
-   - **Tier 3**: Cloud storage (AWS S3)
+   - **Tier 3**: Cloud storage (AWS S3 / Azure Blob / GCP Cloud Storage)
 
 ## Components
 
@@ -40,8 +40,8 @@ The system consists of:
 - HTTP-based file transfer between peers
 
 #### Tier 3: Cloud Storage
-- AWS S3 backend for persistent storage
-- Configurable timeouts and bucket settings
+- Pluggable backend for persistent storage (AWS S3, Azure Blob, or GCP Cloud Storage)
+- Configurable provider credentials, timeouts, and bucket/container settings
 - Fallback for files not found locally or on peers
 
 ## Project Structure
@@ -96,6 +96,13 @@ Options:
 - `-coordinator`: Coordinator address (default: localhost:8080)
 - `-port`: Port for peer API server (default: 8081)
 - `-peer-id`: Peer ID (auto-generated if not provided)
+- `-cloud-provider`: Cloud storage provider: s3, azure, or gcp (default: s3)
+- `-s3-bucket`: S3 bucket name (default: fuse-client-cache)
+- `-s3-region`: S3 region (default: us-east-1)
+- `-azure-account`: Azure storage account name
+- `-azure-key`: Azure storage account key
+- `-azure-container`: Azure blob container name (default: fuse-cache)
+- `-gcp-bucket`: GCP Cloud Storage bucket name (default: fuse-client-cache)
 - `-help`: Show help
 
 ### Running Multiple Clients
@@ -159,10 +166,20 @@ Options:
 ### Environment Variables
 
 ```bash
-# AWS Configuration (for cloud storage)
+# AWS S3 configuration
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_REGION=us-east-1
+
+# Azure Blob configuration
+export AZURE_STORAGE_ACCOUNT=your-account
+export AZURE_STORAGE_KEY=your-key
+export AZURE_CONTAINER_NAME=fuse-cache
+
+# GCP Cloud Storage configuration (S3 interoperability HMAC keys)
+export GCP_ACCESS_KEY_ID=your-gcs-hmac-access-key
+export GCP_SECRET_ACCESS_KEY=your-gcs-hmac-secret
+export GCP_BUCKET=fuse-client-cache
 
 # Cache Configuration
 export FUSE_NVME_SIZE=10737418240  # 10GB
@@ -176,12 +193,14 @@ export FUSE_CLOUD_TIMEOUT=60s
 Default cache sizes:
 - NVME: 10GB
 - Peer: 5GB
-- Cloud: Unlimited (depends on S3 bucket)
+- Cloud: Unlimited (depends on object storage bucket/container)
 
 ## Dependencies
 
 - `bazil.org/fuse` - FUSE implementation
 - `github.com/aws/aws-sdk-go` - AWS S3 client
+- `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob` - Azure Blob client
+- GCP support uses the AWS S3 SDK against `storage.googleapis.com` (S3 interoperability mode)
 - `github.com/gorilla/mux` - HTTP router
 - `github.com/sirupsen/logrus` - Logging
 - `google.golang.org/grpc` - gRPC (for future use)
@@ -190,7 +209,7 @@ Default cache sizes:
 
 - File access is controlled through FUSE permissions
 - Peer-to-peer communication uses HTTP (HTTPS recommended for production)
-- AWS S3 uses standard AWS security practices
+- Cloud credentials follow provider best practices (AWS IAM, Azure access keys/identity, GCP HMAC interoperability keys)
 
 ## Monitoring
 
@@ -204,7 +223,6 @@ Default cache sizes:
 - gRPC for faster peer communication
 - Encryption for data in transit and at rest
 - More sophisticated cache eviction policies
-- Support for multiple cloud providers
 - Web UI for monitoring and management
 - Metrics integration (Prometheus/Grafana)
 

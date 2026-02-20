@@ -68,7 +68,7 @@ type CacheConfig struct {
 	CoordinatorAddr string
 	ChunkSize       int64
 
-	// Cloud provider: "s3" or "azure"
+	// Cloud provider: "s3", "azure", or "gcp"
 	CloudProvider string
 
 	// S3 config
@@ -76,9 +76,12 @@ type CacheConfig struct {
 	S3Region string
 
 	// Azure config
-	AzureStorageAccount   string
-	AzureStorageKey       string
-	AzureContainerName    string
+	AzureStorageAccount string
+	AzureStorageKey     string
+	AzureContainerName  string
+
+	// GCP config
+	GCPBucket string
 
 	// Cloud retry config
 	CloudRetryCount    int
@@ -147,6 +150,11 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 			config.AzureStorageAccount,
 			config.AzureStorageKey,
 			config.AzureContainerName,
+			config.CloudTimeout,
+		)
+	case "gcp":
+		cm.cloudStorage, err = NewGCPStorage(
+			config.GCPBucket,
 			config.CloudTimeout,
 		)
 	default: // "s3" or empty
@@ -646,14 +654,14 @@ func (cm *DefaultCacheManager) GetMetrics() map[string]interface{} {
 
 // CacheMetrics tracks cache performance counters using atomic operations
 type CacheMetrics struct {
-	NVMeHits   atomic.Int64
-	NVMeMisses atomic.Int64
-	PeerHits   atomic.Int64
-	PeerMisses atomic.Int64
-	CloudHits  atomic.Int64
-	CloudMisses atomic.Int64
-	WriteCount atomic.Int64
-	WriteBytes atomic.Int64
+	NVMeHits      atomic.Int64
+	NVMeMisses    atomic.Int64
+	PeerHits      atomic.Int64
+	PeerMisses    atomic.Int64
+	CloudHits     atomic.Int64
+	CloudMisses   atomic.Int64
+	WriteCount    atomic.Int64
+	WriteBytes    atomic.Int64
 	EvictionCount atomic.Int64
 }
 

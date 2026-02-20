@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A distributed file system that mounts as a local FUSE directory on every node. Files written to the mount are cached on local NVMe for speed, replicated across peers for availability, and persisted to cloud object storage (Azure Blob / AWS S3) for durability. Reads hit the fastest tier first and fall through automatically. Large files are chunked and transferred in parallel.
+A distributed file system that mounts as a local FUSE directory on every node. Files written to the mount are cached on local NVMe for speed, replicated across peers for availability, and persisted to cloud object storage (Azure Blob / AWS S3 / GCP Cloud Storage) for durability. Reads hit the fastest tier first and fall through automatically. Large files are chunked and transferred in parallel.
 
 The end goal: any node can read any file at NVMe speed, with the guarantee that data survives node failures because every write is durably backed by cloud storage.
 
@@ -52,7 +52,7 @@ The end goal: any node can read any file at NVMe speed, with the guarantee that 
 │  │                                                             │ │
 │  │  ┌──────────┐  ┌──────────┐  ┌─────────────────────────┐   │ │
 │  │  │ Tier 1   │  │ Tier 2   │  │ Tier 3                  │   │ │
-│  │  │ NVMe     │  │ Peers    │  │ Cloud (Azure Blob / S3) │   │ │
+│  │  │ NVMe     │  │ Peers    │  │ Cloud (Azure Blob / S3 / GCS) │   │ │
 │  │  │ Local    │  │ HTTP     │  │ Durable, persistent     │   │ │
 │  │  │ ~μs      │  │ ~ms      │  │ ~100ms                  │   │ │
 │  │  │ 10GB cap │  │ 3x repl  │  │ Unlimited               │   │ │
@@ -129,7 +129,7 @@ GET /api/files/model.bin
   │     → Hit → return data
   │              └─→ goroutine: promote to NVMe (copy to local for next read)
   │
-  ├─ Tier 3 (Cloud): Download from Azure Blob / S3
+  ├─ Tier 3 (Cloud): Download from Azure Blob / S3 / GCS
   │     → Hit → return data
   │              └─→ goroutine: promote to NVMe
   │
@@ -168,6 +168,7 @@ NVMe has a configurable capacity (default 10GB). When a write would exceed capac
 | | `peer_storage.go` | Tier 2: HTTP client to other peers, 3x replication, crypto/rand shuffle |
 | | `cloud_storage.go` | Tier 3 (S3): AWS SDK, configurable bucket/region |
 | | `azure_storage.go` | Tier 3 (Azure): Azure Blob SDK, configurable account/container |
+| | `gcp_storage.go` | Tier 3 (GCP): GCS via S3 interoperability endpoint, configurable bucket + HMAC keys |
 | `internal/coordinator/` | `coordinator.go` | Server-side: in-memory peer registry, file location map, state persistence |
 | | `client.go` | `Coordinator` interface + `CoordinatorClient` (HTTP). Used by client binary to talk to remote coordinator |
 | `internal/api/` | `handler.go` | Client HTTP API: file CRUD, peer ops, cache stats, health. Auth middleware, upload limits, path validation |
