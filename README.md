@@ -204,6 +204,7 @@ Default cache sizes:
 - `github.com/gorilla/mux` - HTTP router
 - `github.com/sirupsen/logrus` - Logging
 - `google.golang.org/grpc` - gRPC (for future use)
+- `helm.sh/helm/v3` - Kubernetes package manager for deployment templates
 
 ## Security
 
@@ -233,6 +234,60 @@ Default cache sizes:
 3. Make changes
 4. Add tests
 5. Submit a pull request
+
+## Kubernetes Dev Box & Helm Chart
+
+The repo now includes a Helm chart and a local kind-based dev box workflow so you can test all Kubernetes resources quickly.
+
+### Helm Chart
+
+Chart location:
+
+```bash
+charts/fuse-cache
+```
+
+Validate and render chart templates:
+
+```bash
+helm lint charts/fuse-cache
+helm template fuse-cache charts/fuse-cache
+```
+
+Install to any cluster:
+
+```bash
+helm upgrade --install fuse-cache charts/fuse-cache \
+  --namespace fuse-system \
+  --create-namespace
+```
+
+### Local Kubernetes Dev Box (kind)
+
+Install required local tools (helm/kind/kubectl) if needed:
+
+```bash
+./scripts/devbox/install-tools.sh all
+```
+
+Use the helper script:
+
+```bash
+./scripts/devbox/devbox.sh create   # create local kind cluster
+./scripts/devbox/devbox.sh deploy   # install Helm chart
+./scripts/devbox/devbox.sh status   # inspect resources
+./scripts/devbox/devbox.sh delete   # tear down cluster
+```
+
+Or use Make targets:
+
+```bash
+make k8s-devbox-install-tools
+make k8s-devbox-create
+make k8s-devbox-deploy
+make k8s-devbox-status
+make k8s-devbox-delete
+```
 
 ## License
 

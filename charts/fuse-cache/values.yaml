@@ -1,0 +1,62 @@
+namespace:
+  create: true
+  name: fuse-system
+
+image:
+  repository: stargzrepo.azurecr.io/fuse-client
+  tag: latest
+  pullPolicy: IfNotPresent
+
+coordinator:
+  replicaCount: 1
+  httpPort: 8080
+  grpcPort: 9080
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  persistence:
+    enabled: true
+    storageClassName: managed-csi
+    size: 1Gi
+
+client:
+  nodeSelector:
+    agentpool: userpool
+  httpPort: 8081
+  grpcPort: 9081
+  cloudProvider: azure
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  fuseDevicePath: /dev/fuse
+  nvmeHostPath: /mnt
+  fuseMountHostPath: /mnt/fuse
+
+config:
+  coordinatorAddr: coordinator.fuse-system.svc.cluster.local:8080
+  coordinatorGrpcAddr: coordinator.fuse-system.svc.cluster.local:9080
+  nvmeCachePath: /mnt/nvme/cache
+  fuseMountPath: /mnt/fuse
+  chunkSizeMB: "4"
+
+secrets:
+  aws:
+    create: true
+    name: aws-credentials
+    accessKeyId: REPLACE_WITH_ACCESS_KEY
+    secretAccessKey: REPLACE_WITH_SECRET_KEY
+    region: us-east-1
+  azure:
+    create: true
+    name: azure-credentials
+    account: REPLACE_WITH_ACCOUNT_NAME
+    key: REPLACE_WITH_ACCOUNT_KEY
+    container: fuse-cache

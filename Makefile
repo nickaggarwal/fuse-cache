@@ -175,4 +175,31 @@ help:
 	@echo "  dev-stop      - Stop development environment"
 	@echo ""
 	@echo "  docker-build  - Build Docker image"
-	@echo "  help          - Show this help message" 
+	@echo ""
+	@echo "  k8s-devbox-install-tools - Install helm/kind/kubectl tools locally"
+	@echo "  k8s-devbox-create - Create local kind cluster for Kubernetes testing"
+	@echo "  k8s-devbox-deploy - Deploy Helm chart into the local dev cluster"
+	@echo "  k8s-devbox-status - Show local dev cluster status"
+	@echo "  k8s-devbox-delete - Delete local dev cluster"
+	@echo "  help          - Show this help message"
+
+
+.PHONY: k8s-devbox-install-tools
+k8s-devbox-install-tools:
+	./scripts/devbox/install-tools.sh all
+
+.PHONY: k8s-devbox-create
+k8s-devbox-create:
+	./scripts/devbox/devbox.sh create
+
+.PHONY: k8s-devbox-deploy
+k8s-devbox-deploy:
+	./scripts/devbox/devbox.sh deploy
+
+.PHONY: k8s-devbox-status
+k8s-devbox-status:
+	./scripts/devbox/devbox.sh status
+
+.PHONY: k8s-devbox-delete
+k8s-devbox-delete:
+	./scripts/devbox/devbox.sh delete
