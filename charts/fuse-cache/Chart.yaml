@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fuse-cache
+description: Helm chart for the distributed FUSE cache coordinator and client daemonset
+type: application
+version: 0.1.0
+appVersion: "latest"

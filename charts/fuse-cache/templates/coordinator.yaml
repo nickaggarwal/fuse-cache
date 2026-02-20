@@ -1,0 +1,90 @@
+{{- if .Values.coordinator.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coordinator-state
+  namespace: {{ include "fuse-cache.namespace" . }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.coordinator.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.coordinator.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: {{ include "fuse-cache.namespace" . }}
+  labels:
+    app: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicaCount }}
+  selector:
+    matchLabels:
+      app: coordinator
+  template:
+    metadata:
+      labels:
+        app: coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["coordinator"]
+          args: ["-port", "{{ .Values.coordinator.httpPort }}", "-grpc-port", "{{ .Values.coordinator.grpcPort }}"]
+          ports:
+            - containerPort: {{ .Values.coordinator.httpPort }}
+              name: http
+            - containerPort: {{ .Values.coordinator.grpcPort }}
+              name: grpc
+          {{- if .Values.coordinator.persistence.enabled }}
+          volumeMounts:
+            - name: state
+              mountPath: /data
+          workingDir: /data
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.coordinator.httpPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.coordinator.httpPort }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+      {{- if .Values.coordinator.persistence.enabled }}
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: coordinator-state
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: {{ include "fuse-cache.namespace" . }}
+  labels:
+    app: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app: coordinator
+  ports:
+    - port: {{ .Values.coordinator.httpPort }}
+      targetPort: {{ .Values.coordinator.httpPort }}
+      protocol: TCP
+      name: http
+    - port: {{ .Values.coordinator.grpcPort }}
+      targetPort: {{ .Values.coordinator.grpcPort }}
+      protocol: TCP
+      name: grpc

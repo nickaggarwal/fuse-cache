@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: client
+  namespace: {{ include "fuse-cache.namespace" . }}
+  labels:
+    app: client
+spec:
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.client.nodeSelector | nindent 8 }}
+      containers:
+        - name: client
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["client"]
+          args:
+            - "-mount"
+            - "$(FUSE_MOUNT_PATH)"
+            - "-nvme"
+            - "$(NVME_CACHE_PATH)"
+            - "-coordinator"
+            - "$(COORDINATOR_ADDR)"
+            - "-coordinator-grpc"
+            - "$(COORDINATOR_GRPC_ADDR)"
+            - "-port"
+            - "{{ .Values.client.httpPort }}"
+            - "-grpc-port"
+            - "{{ .Values.client.grpcPort }}"
+            - "-chunk-size"
+            - "$(CHUNK_SIZE_MB)"
+            - "-cloud-provider"
+            - "{{ .Values.client.cloudProvider }}"
+          envFrom:
+            - configMapRef:
+                name: fuse-config
+            - secretRef:
+                name: {{ .Values.secrets.azure.name }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: {{ .Values.client.httpPort }}
+              name: http
+            - containerPort: {{ .Values.client.grpcPort }}
+              name: grpc
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fuse-device
+              mountPath: /dev/fuse
+            - name: nvme-storage
+              mountPath: /mnt/nvme
+            - name: fuse-mount
+              mountPath: /mnt/fuse
+              mountPropagation: Bidirectional
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.client.httpPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.client.httpPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.client.resources | nindent 12 }}
+      volumes:
+        - name: fuse-device
+          hostPath:
+            path: {{ .Values.client.fuseDevicePath }}
+        - name: nvme-storage
+          hostPath:
+            path: {{ .Values.client.nvmeHostPath }}
+            type: Directory
+        - name: fuse-mount
+          hostPath:
+            path: {{ .Values.client.fuseMountHostPath }}
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: client-headless
+  namespace: {{ include "fuse-cache.namespace" . }}
+  labels:
+    app: client
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: client
+  ports:
+    - port: {{ .Values.client.httpPort }}
+      targetPort: {{ .Values.client.httpPort }}
+      protocol: TCP
+      name: http
+    - port: {{ .Values.client.grpcPort }}
+      targetPort: {{ .Values.client.grpcPort }}
+      protocol: TCP
+      name: grpc
