@@ -298,16 +298,34 @@ func (f *failNTimesStorage) Size(ctx context.Context, path string) (int64, error
 }
 
 type countingStorage struct {
-	inner     *mockStorage
-	readCalls atomic.Int32
+	inner        *mockStorage
+	readCalls    atomic.Int32
+	readDelay    time.Duration
+	mu           sync.Mutex
+	perPathReads map[string]int
 }
 
 func newCountingStorage() *countingStorage {
-	return &countingStorage{inner: newMockStorage()}
+	return &countingStorage{
+		inner:        newMockStorage(),
+		perPathReads: make(map[string]int),
+	}
+}
+
+func newCountingStorageWithDelay(readDelay time.Duration) *countingStorage {
+	s := newCountingStorage()
+	s.readDelay = readDelay
+	return s
 }
 
 func (c *countingStorage) Read(ctx context.Context, path string) ([]byte, error) {
+	if c.readDelay > 0 {
+		time.Sleep(c.readDelay)
+	}
 	c.readCalls.Add(1)
+	c.mu.Lock()
+	c.perPathReads[path]++
+	c.mu.Unlock()
 	return c.inner.Read(ctx, path)
 }
 
@@ -329,6 +347,12 @@ func (c *countingStorage) Size(ctx context.Context, path string) (int64, error) 
 
 func (c *countingStorage) reads() int32 {
 	return c.readCalls.Load()
+}
+
+func (c *countingStorage) readsFor(path string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.perPathReads[path]
 }
 
 func TestCacheManager_Get_UsesPeerFirstAt5GBBoundary(t *testing.T) {
@@ -506,6 +530,64 @@ func TestCacheManager_ReadRange_HybridSplitsPeerAndCloud(t *testing.T) {
 	}
 	if cloud.reads() < 1 {
 		t.Fatalf("cloud reads = %d, want >= 1", cloud.reads())
+	}
+}
+
+func TestCacheManager_ReadRange_DedupesConcurrentChunkFetches(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	path := "/hot.bin"
+	chunkPath := path + "_chunk_0"
+	peer := newCountingStorageWithDelay(100 * time.Millisecond)
+	cm.peerStorage = peer
+	cm.cloudStorage = newCountingStorage()
+	cm.config.ChunkSize = 16
+	cm.config.RangePrefetchChunks = 0
+
+	if err := peer.Write(ctx, chunkPath, []byte("0123456789ABCDEF")); err != nil {
+		t.Fatalf("peer write chunk: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{
+		FilePath:  path,
+		Size:      16,
+		IsChunked: true,
+		NumChunks: 1,
+	}
+	cm.mu.Unlock()
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	readFn := func(offset int64) {
+		defer wg.Done()
+		<-start
+		got, err := cm.ReadRange(ctx, path, offset, 8)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(got) != 8 {
+			errCh <- fmt.Errorf("unexpected read size %d", len(got))
+		}
+	}
+
+	wg.Add(2)
+	go readFn(0)
+	go readFn(8)
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("ReadRange: %v", err)
+	}
+
+	if reads := peer.readsFor(chunkPath); reads != 1 {
+		t.Fatalf("peer reads for %s = %d, want 1", chunkPath, reads)
 	}
 }
 

@@ -9,3 +9,7 @@ data:
   NVME_CACHE_PATH: {{ .Values.config.nvmeCachePath | quote }}
   FUSE_MOUNT_PATH: {{ .Values.config.fuseMountPath | quote }}
   CHUNK_SIZE_MB: {{ .Values.config.chunkSizeMB | quote }}
+  FUSE_PARALLEL_RANGE_READS: {{ .Values.config.parallelRangeReads | quote }}
+  FUSE_RANGE_PREFETCH_CHUNKS: {{ .Values.config.rangePrefetchChunks | quote }}
+  FUSE_RANGE_CHUNK_CACHE_SIZE: {{ .Values.config.rangeChunkCacheSize | quote }}
+  FUSE_IO_PROGRESS_MB: {{ .Values.config.fuseIOProgressMB | quote }}

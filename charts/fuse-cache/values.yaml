@@ -49,7 +49,11 @@ config:
   coordinatorGrpcAddr: ""
   nvmeCachePath: /mnt/nvme/cache
   fuseMountPath: /host/mnt/fuse
-  chunkSizeMB: "4"
+  chunkSizeMB: "8"
+  parallelRangeReads: "8"
+  rangePrefetchChunks: "2"
+  rangeChunkCacheSize: "16"
+  fuseIOProgressMB: "512"
 
 secrets:
   aws:

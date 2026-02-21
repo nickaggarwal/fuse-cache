@@ -213,7 +213,7 @@ func TestPeerGRPC_ReadLargeFile(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create data larger than 64KB chunk size
+	// Create data larger than the streaming chunk size
 	data := make([]byte, 256*1024) // 256KB
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -250,8 +250,8 @@ func TestPeerGRPC_ReadLargeFile(t *testing.T) {
 		t.Error("large file data mismatch")
 	}
 
-	// Should have received multiple chunks (256KB / 64KB = 4 chunks)
-	if chunkCount < 4 {
-		t.Errorf("expected >= 4 chunks, got %d", chunkCount)
+	expectedChunks := (len(data) + grpcChunkSize - 1) / grpcChunkSize
+	if chunkCount != expectedChunks {
+		t.Errorf("expected %d chunks, got %d", expectedChunks, chunkCount)
 	}
 }

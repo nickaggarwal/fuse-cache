@@ -10,7 +10,7 @@ import (
 	pb "fuse-client/internal/pb"
 )
 
-const grpcChunkSize = 64 * 1024 // 64KB streaming chunks
+const grpcChunkSize = 1 * 1024 * 1024 // 1MiB streaming chunks
 
 // PeerGRPCServer implements the PeerService gRPC service.
 // Each client node runs this so other peers can read/write files via gRPC.
@@ -28,7 +28,7 @@ func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 	return &PeerGRPCServer{cacheManager: cm}
 }
 
-// ReadFile streams file data in 64KB chunks.
+// ReadFile streams file data in fixed-size chunks.
 func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService_ReadFileServer) error {
 	entry, err := s.getForPeerRPC(stream.Context(), req.Path)
 	if err != nil {

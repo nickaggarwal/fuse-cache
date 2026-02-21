@@ -33,7 +33,7 @@ func main() {
 		peerPort        = flag.Int("port", 8081, "Port for peer HTTP API server")
 		grpcPort        = flag.Int("grpc-port", 9081, "Port for peer gRPC server")
 		peerID          = flag.String("peer-id", "", "Peer ID (auto-generated if not provided)")
-		chunkSizeMB     = flag.Int("chunk-size", 4, "Chunk size in MB")
+		chunkSizeMB     = flag.Int("chunk-size", 8, "Chunk size in MB")
 		apiKey          = flag.String("api-key", "", "API key for authentication (optional)")
 
 		// Cloud provider selection
@@ -52,11 +52,14 @@ func main() {
 		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
 
 		// NVMe capacity
-		nvmeMaxGB    = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
-		peerMaxGB    = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
-		peerReadMBps = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
-		mountRetries = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
-		mountDelayS  = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
+		nvmeMaxGB       = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+		peerMaxGB       = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
+		peerReadMBps    = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
+		parallelReads   = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
+		prefetchChunks  = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
+		rangeChunkCache = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
+		mountRetries    = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
+		mountDelayS     = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
 		help = flag.Bool("help", false, "Show help")
 	)
@@ -115,14 +118,17 @@ func main() {
 
 	// Create cache configuration
 	cacheConfig := &cache.CacheConfig{
-		NVMePath:        *nvmePath,
-		MaxNVMeSize:     int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
-		MaxPeerSize:     int64(*peerMaxGB) * 1024 * 1024 * 1024,
-		PeerTimeout:     30 * time.Second,
-		CloudTimeout:    60 * time.Second,
-		CoordinatorAddr: *coordinatorAddr,
-		Coordinator:     coordClient,
-		ChunkSize:       int64(*chunkSizeMB) * 1024 * 1024,
+		NVMePath:            *nvmePath,
+		MaxNVMeSize:         int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
+		MaxPeerSize:         int64(*peerMaxGB) * 1024 * 1024 * 1024,
+		PeerTimeout:         30 * time.Second,
+		CloudTimeout:        60 * time.Second,
+		CoordinatorAddr:     *coordinatorAddr,
+		Coordinator:         coordClient,
+		ChunkSize:           int64(*chunkSizeMB) * 1024 * 1024,
+		ParallelRangeReads:  *parallelReads,
+		RangePrefetchChunks: *prefetchChunks,
+		RangeChunkCacheSize: *rangeChunkCache,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -146,6 +152,30 @@ func main() {
 			cacheConfig.PeerReadThroughputBytesPerSec = n * 1024 * 1024
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_PEER_READ_MBPS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_PARALLEL_RANGE_READS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.ParallelRangeReads = n
+			*parallelReads = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_PARALLEL_RANGE_READS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_PREFETCH_CHUNKS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cacheConfig.RangePrefetchChunks = n
+			*prefetchChunks = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_CHUNKS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_CHUNK_CACHE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.RangeChunkCacheSize = n
+			*rangeChunkCache = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_CHUNK_CACHE_SIZE value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_MOUNT_RETRIES"); v != "" {
@@ -227,6 +257,9 @@ func main() {
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
 	logger.Printf("- Peer read threshold bytes: %d", cacheConfig.MaxPeerSize)
 	logger.Printf("- Assumed per-peer read throughput MB/s: %d", *peerReadMBps)
+	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
+	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
+	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
 	logger.Printf("- FUSE mount retries: %d", *mountRetries)
 	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
 

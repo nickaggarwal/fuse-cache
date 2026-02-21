@@ -26,6 +26,17 @@ type PeerStorage struct {
 	localPeerID         string
 	connMu              sync.RWMutex
 	connPool            map[string]*grpc.ClientConn
+	metaMu              sync.RWMutex
+	peersCache          []*coordinator.PeerInfo
+	peersCacheAt        time.Time
+	peersCacheTTL       time.Duration
+	fileHints           map[string]fileHintCacheEntry
+	fileHintsTTL        time.Duration
+}
+
+type fileHintCacheEntry struct {
+	peerIDs   map[string]struct{}
+	expiresAt time.Time
 }
 
 // NewPeerStorage creates a new peer storage instance.
@@ -36,6 +47,9 @@ func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localP
 		minReplicationCount: 3,
 		localPeerID:         localPeerID,
 		connPool:            make(map[string]*grpc.ClientConn),
+		peersCacheTTL:       2 * time.Second,
+		fileHints:           make(map[string]fileHintCacheEntry),
+		fileHintsTTL:        5 * time.Second,
 	}, nil
 }
 
@@ -72,46 +86,126 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	preferred, fallback := ps.partitionPeersForPath(ctx, path, peers)
 
-	type readResult struct {
-		data []byte
-		err  error
-	}
-
-	readCtx, cancel := context.WithTimeout(ctx, ps.timeout)
-	defer cancel()
-
-	resultChan := make(chan readResult, len(peers))
-	active := 0
-
-	for _, peer := range peers {
-		if peer.Status != "active" || peer.GRPCAddress == "" {
-			continue
-		}
-		active++
-		go func(addr string) {
-			data, err := ps.readFromPeer(readCtx, addr, path)
-			resultChan <- readResult{data, err}
-		}(peer.GRPCAddress)
-	}
-
-	if active == 0 {
+	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
+	ordered = append(ordered, preferred...)
+	ordered = append(ordered, fallback...)
+	if len(ordered) == 0 {
 		return nil, fmt.Errorf("no active peers available")
 	}
 
-	for i := 0; i < active; i++ {
-		select {
-		case <-readCtx.Done():
-			return nil, fmt.Errorf("peer read timed out for %s: %w", path, readCtx.Err())
-		case res := <-resultChan:
-			if res.err == nil {
-				cancel()
-				return res.data, nil
-			}
+	var lastErr error
+	for _, peer := range ordered {
+		if peer == nil || peer.Status != "active" || peer.GRPCAddress == "" {
+			continue
 		}
+		data, err := ps.readFromPeer(ctx, peer.GRPCAddress, path)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
 	}
 
+	if lastErr != nil {
+		return nil, lastErr
+	}
 	return nil, fmt.Errorf("file not found on any peer")
+}
+
+func (ps *PeerStorage) partitionPeersForPath(ctx context.Context, path string, peers []*coordinator.PeerInfo) ([]*coordinator.PeerInfo, []*coordinator.PeerInfo) {
+	if len(peers) <= 1 {
+		return peers, nil
+	}
+	peerIDs := ps.peerIDsForPath(ctx, path)
+	if len(peerIDs) == 0 {
+		return nil, peers
+	}
+
+	prioritized := make([]*coordinator.PeerInfo, 0, len(peers))
+	rest := make([]*coordinator.PeerInfo, 0, len(peers))
+	for _, peer := range peers {
+		if peer == nil || peer.ID == "" {
+			continue
+		}
+		if _, ok := peerIDs[peer.ID]; ok {
+			prioritized = append(prioritized, peer)
+		} else {
+			rest = append(rest, peer)
+		}
+	}
+	if len(prioritized) == 0 {
+		return nil, peers
+	}
+	return prioritized, rest
+}
+
+func (ps *PeerStorage) peerIDsForPath(ctx context.Context, path string) map[string]struct{} {
+	now := time.Now()
+	ps.metaMu.RLock()
+	if hint, ok := ps.fileHints[path]; ok && now.Before(hint.expiresAt) {
+		peerIDs := clonePeerIDSet(hint.peerIDs)
+		ps.metaMu.RUnlock()
+		return peerIDs
+	}
+	ps.metaMu.RUnlock()
+
+	out := make(map[string]struct{})
+	collect := func(target string) bool {
+		if target == "" {
+			return false
+		}
+		callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+		defer cancel()
+		locations, err := ps.coordinator.GetFileLocation(callCtx, target)
+		if err != nil {
+			return false
+		}
+		found := false
+		for _, loc := range locations {
+			if loc == nil || loc.PeerID == "" {
+				continue
+			}
+			if loc.PeerID == ps.localPeerID {
+				continue
+			}
+			out[loc.PeerID] = struct{}{}
+			found = true
+		}
+		return found
+	}
+
+	if collect(path) {
+		ps.putFileHint(path, out)
+		return out
+	}
+	if parent, ok := parentFilePathFromChunkPath(path); ok {
+		_ = collect(parent)
+		if len(out) > 0 {
+			ps.putFileHint(path, out)
+		}
+	}
+	if len(out) == 0 {
+		ps.putFileHint(path, out)
+	}
+	return out
+}
+
+func (ps *PeerStorage) putFileHint(path string, peerIDs map[string]struct{}) {
+	ps.metaMu.Lock()
+	ps.fileHints[path] = fileHintCacheEntry{
+		peerIDs:   clonePeerIDSet(peerIDs),
+		expiresAt: time.Now().Add(ps.fileHintsTTL),
+	}
+	ps.metaMu.Unlock()
+}
+
+func clonePeerIDSet(src map[string]struct{}) map[string]struct{} {
+	dst := make(map[string]struct{}, len(src))
+	for k := range src {
+		dst[k] = struct{}{}
+	}
+	return dst
 }
 
 // Write writes a file to peer storage with replication.
@@ -232,6 +326,19 @@ func cryptoShuffle(peers []*coordinator.PeerInfo) {
 }
 
 func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, error) {
+	ps.metaMu.RLock()
+	if time.Since(ps.peersCacheAt) < ps.peersCacheTTL && len(ps.peersCache) > 0 {
+		cached := make([]*coordinator.PeerInfo, 0, len(ps.peersCache))
+		for _, peer := range ps.peersCache {
+			if peer != nil {
+				cached = append(cached, peer)
+			}
+		}
+		ps.metaMu.RUnlock()
+		return cached, nil
+	}
+	ps.metaMu.RUnlock()
+
 	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
 	defer cancel()
 	peers, err := ps.coordinator.GetPeers(callCtx, "")
@@ -239,6 +346,10 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 		return nil, err
 	}
 	if ps.localPeerID == "" {
+		ps.metaMu.Lock()
+		ps.peersCache = peers
+		ps.peersCacheAt = time.Now()
+		ps.metaMu.Unlock()
 		return peers, nil
 	}
 
@@ -252,6 +363,10 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 		}
 		filtered = append(filtered, peer)
 	}
+	ps.metaMu.Lock()
+	ps.peersCache = filtered
+	ps.peersCacheAt = time.Now()
+	ps.metaMu.Unlock()
 	return filtered, nil
 }
 

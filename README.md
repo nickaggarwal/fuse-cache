@@ -216,6 +216,9 @@ export GCP_BUCKET=fuse-client-cache
 export FUSE_NVME_SIZE=10737418240  # 10GB
 export FUSE_PEER_SIZE=5368709120   # 5GB
 export FUSE_PEER_READ_MBPS=200     # assumed MB/s per peer
+export FUSE_PARALLEL_RANGE_READS=8
+export FUSE_RANGE_PREFETCH_CHUNKS=2
+export FUSE_RANGE_CHUNK_CACHE_SIZE=16
 export FUSE_PEER_TIMEOUT=30s
 export FUSE_CLOUD_TIMEOUT=60s
 export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
@@ -223,6 +226,8 @@ export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
 
 `FUSE_PEER_SIZE` controls the remote read strategy threshold (in bytes).
 `FUSE_PEER_READ_MBPS` controls the hybrid-read throughput model.
+`FUSE_PARALLEL_RANGE_READS`, `FUSE_RANGE_PREFETCH_CHUNKS`, and
+`FUSE_RANGE_CHUNK_CACHE_SIZE` tune range-read throughput behavior.
 `FUSE_IO_PROGRESS_MB` controls periodic FUSE read/write progress logging cadence.
 
 ### Cache Sizes
@@ -256,6 +261,10 @@ Default cache sizes:
 - Cache statistics and metrics
 - Coordinator provides system-wide statistics
 - Prometheus scrape endpoint on clients: `GET /metrics`
+- Read-path throughput breakdown metrics:
+  - `fuse_cache_peer_read_bytes_total`, `fuse_cache_peer_read_seconds_total`, `fuse_cache_peer_read_mbps`
+  - `fuse_cache_cloud_read_bytes_total`, `fuse_cache_cloud_read_seconds_total`, `fuse_cache_cloud_read_mbps`
+  - `fuse_cache_nvme_read_bytes_total`, `fuse_cache_nvme_read_seconds_total`, `fuse_cache_nvme_read_mbps`
 
 ## Future Enhancements
 

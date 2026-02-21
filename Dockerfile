@@ -1,15 +1,25 @@
+# syntax=docker/dockerfile:1.7
+
 # Build stage
-FROM golang:1.20 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.20 AS builder
 
 WORKDIR /app
 
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bin/coordinator cmd/coordinator/main.go
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bin/client cmd/client/main.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/coordinator cmd/coordinator/main.go && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/client cmd/client/main.go
 
 # Runtime stage
 FROM ubuntu:22.04

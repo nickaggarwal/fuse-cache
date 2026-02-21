@@ -22,8 +22,8 @@ import (
 const (
 	// Tuned for throughput on NVMe-backed AKS nodes while keeping cache staleness bounded.
 	attrCacheTTL      = 5 * time.Second
-	maxReadaheadBytes = 4 * 1024 * 1024 // 4 MiB
-	maxBackgroundReqs = 128
+	maxReadaheadBytes = 16 * 1024 * 1024 // 16 MiB
+	maxBackgroundReqs = 512
 	defaultBlockSize  = 4 * 1024
 	defaultIOLogStep  = 512 * 1024 * 1024 // 512 MiB
 )

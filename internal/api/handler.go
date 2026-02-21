@@ -391,9 +391,32 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_cache_peer_misses_total", metrics["peer_misses"])
 	writeMetricLine(w, "fuse_cache_cloud_hits_total", metrics["cloud_hits"])
 	writeMetricLine(w, "fuse_cache_cloud_misses_total", metrics["cloud_misses"])
+	writeMetricLine(w, "fuse_cache_nvme_read_bytes_total", metrics["nvme_read_bytes"])
+	writeMetricLine(w, "fuse_cache_nvme_read_seconds_total", nanosToSeconds(metrics["nvme_read_nanos"]))
+	writeMetricLine(w, "fuse_cache_nvme_read_ops_total", metrics["nvme_read_ops"])
+	writeMetricLine(w, "fuse_cache_nvme_read_mbps", metrics["nvme_read_mbps"])
+	writeMetricLine(w, "fuse_cache_peer_read_bytes_total", metrics["peer_read_bytes"])
+	writeMetricLine(w, "fuse_cache_peer_read_seconds_total", nanosToSeconds(metrics["peer_read_nanos"]))
+	writeMetricLine(w, "fuse_cache_peer_read_ops_total", metrics["peer_read_ops"])
+	writeMetricLine(w, "fuse_cache_peer_read_mbps", metrics["peer_read_mbps"])
+	writeMetricLine(w, "fuse_cache_cloud_read_bytes_total", metrics["cloud_read_bytes"])
+	writeMetricLine(w, "fuse_cache_cloud_read_seconds_total", nanosToSeconds(metrics["cloud_read_nanos"]))
+	writeMetricLine(w, "fuse_cache_cloud_read_ops_total", metrics["cloud_read_ops"])
+	writeMetricLine(w, "fuse_cache_cloud_read_mbps", metrics["cloud_read_mbps"])
 	writeMetricLine(w, "fuse_cache_write_count_total", metrics["write_count"])
 	writeMetricLine(w, "fuse_cache_write_bytes_total", metrics["write_bytes"])
 	writeMetricLine(w, "fuse_cache_evictions_total", metrics["eviction_count"])
+}
+
+func nanosToSeconds(value interface{}) float64 {
+	switch v := value.(type) {
+	case int64:
+		return float64(v) / float64(time.Second)
+	case int:
+		return float64(v) / float64(time.Second)
+	default:
+		return 0
+	}
 }
 
 func writeMetricLine(w io.Writer, name string, value interface{}) {
