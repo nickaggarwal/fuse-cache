@@ -46,6 +46,10 @@ type rangeReader interface {
 	ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error)
 }
 
+type freshLister interface {
+	ListFresh(ctx context.Context) ([]*cache.CacheEntry, error)
+}
+
 // NewFileSystem creates a new FUSE filesystem
 func NewFileSystem(cacheManager cache.CacheManager) *FileSystem {
 	return &FileSystem{
@@ -125,7 +129,24 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
+	if node, ok := d.lookupNodeFromEntries(fullPath, entries); ok {
+		return node, nil
+	}
 
+	// On metadata miss, force a fresh coordinator snapshot before returning ENOENT.
+	if lister, ok := d.fs.cacheManager.(freshLister); ok {
+		freshEntries, err := lister.ListFresh(ctx)
+		if err == nil {
+			if node, ok := d.lookupNodeFromEntries(fullPath, freshEntries); ok {
+				return node, nil
+			}
+		}
+	}
+
+	return nil, fuse.ENOENT
+}
+
+func (d *Dir) lookupNodeFromEntries(fullPath string, entries []*cache.CacheEntry) (fs.Node, bool) {
 	// Metadata-first lookup: find file entry without triggering data fetch.
 	for _, entry := range entries {
 		if entry.FilePath != fullPath {
@@ -136,7 +157,8 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 			fs:    d.fs,
 			path:  fullPath,
 			entry: &entryCopy,
-		}, nil
+			isNew: false,
+		}, true
 	}
 
 	// Check if it's a directory by looking for files with this prefix.
@@ -145,11 +167,11 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 			return &Dir{
 				fs:   d.fs,
 				path: fullPath,
-			}, nil
+			}, true
 		}
 	}
 
-	return nil, fuse.ENOENT
+	return nil, false
 }
 
 // ReadDirAll reads all entries in the directory
@@ -203,6 +225,20 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	fullPath := filepath.Join(d.path, req.Name)
 
+	// Safe write-to-new semantics: refuse overwrite when metadata says object exists.
+	if lister, ok := d.fs.cacheManager.(freshLister); ok {
+		entries, err := lister.ListFresh(ctx)
+		if err != nil {
+			d.fs.logger.Printf("Create metadata refresh failed for %s: %v", fullPath, err)
+			return nil, nil, fuse.EIO
+		}
+		for _, entry := range entries {
+			if entry.FilePath == fullPath {
+				return nil, nil, fuse.EEXIST
+			}
+		}
+	}
+
 	entry := &cache.CacheEntry{
 		FilePath:     fullPath,
 		Size:         0,
@@ -214,6 +250,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		fs:    d.fs,
 		path:  fullPath,
 		entry: entry,
+		isNew: true,
 	}
 
 	return file, file, nil
@@ -286,6 +323,7 @@ type File struct {
 	entry *cache.CacheEntry
 	mu    sync.RWMutex
 	dirty bool
+	isNew bool
 }
 
 func growBuffer(data []byte, needed int) []byte {
@@ -385,6 +423,10 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if !f.isNew {
+		return fuse.EPERM
+	}
+
 	prevLen := len(f.entry.Data)
 
 	// Grow with headroom to avoid O(n^2) realloc/copy churn on sequential writes.
@@ -432,6 +474,9 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	defer f.mu.Unlock()
 
 	if req.Valid.Size() {
+		if !f.isNew {
+			return fuse.EPERM
+		}
 		// Truncate file
 		if req.Size < uint64(len(f.entry.Data)) {
 			f.entry.Data = f.entry.Data[:req.Size]

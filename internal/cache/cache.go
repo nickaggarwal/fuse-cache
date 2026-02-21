@@ -105,6 +105,18 @@ type CacheConfig struct {
 
 	// LocalPeerID identifies this client when publishing metadata updates.
 	LocalPeerID string
+
+	// ParallelRangeReads controls worker count when a read range spans multiple
+	// chunks. Values <=0 use a default.
+	ParallelRangeReads int
+
+	// RangePrefetchChunks controls how many chunks after the current read range
+	// are prefetched opportunistically.
+	RangePrefetchChunks int
+
+	// RangeChunkCacheSize is the maximum number of chunks cached per file for
+	// range reads.
+	RangeChunkCacheSize int
 }
 
 // DefaultCacheManager implements CacheManager
@@ -120,12 +132,12 @@ type DefaultCacheManager struct {
 	metrics      *CacheMetrics
 	metadataAt   time.Time
 	metadataView []*CacheEntry
-	rangeChunks  map[string]*chunkCacheEntry
+	rangeChunks  map[string]*chunkFileCache
 }
 
-type chunkCacheEntry struct {
-	chunkIndex int64
-	data       []byte
+type chunkFileCache struct {
+	chunks map[int64][]byte
+	order  []int64
 }
 
 // NewCacheManager creates a new cache manager
@@ -150,13 +162,22 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if config.MetadataRefreshTTL <= 0 {
 		config.MetadataRefreshTTL = 5 * time.Second
 	}
+	if config.ParallelRangeReads <= 0 {
+		config.ParallelRangeReads = 4
+	}
+	if config.RangePrefetchChunks < 0 {
+		config.RangePrefetchChunks = 0
+	}
+	if config.RangeChunkCacheSize <= 0 {
+		config.RangeChunkCacheSize = 8
+	}
 
 	cm := &DefaultCacheManager{
 		config:      config,
 		entries:     make(map[string]*CacheEntry),
 		logger:      log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
 		metrics:     NewCacheMetrics(),
-		rangeChunks: make(map[string]*chunkCacheEntry),
+		rangeChunks: make(map[string]*chunkFileCache),
 	}
 
 	// Initialize storage tiers
@@ -424,6 +445,16 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 
 // List returns all cached entries
 func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) {
+	return cm.list(ctx, false, false)
+}
+
+// ListFresh forces a coordinator metadata refresh and returns an error if the
+// remote refresh fails (when coordinator is configured).
+func (cm *DefaultCacheManager) ListFresh(ctx context.Context) ([]*CacheEntry, error) {
+	return cm.list(ctx, true, true)
+}
+
+func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRefresh bool) ([]*CacheEntry, error) {
 	cm.mu.RLock()
 	entries := make([]*CacheEntry, 0, len(cm.entries))
 	for _, entry := range cm.entries {
@@ -431,7 +462,7 @@ func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) 
 		entries = append(entries, &entryCopy)
 	}
 	coord := cm.config.Coordinator
-	metadataFresh := time.Since(cm.metadataAt) < cm.config.MetadataRefreshTTL
+	metadataFresh := !forceRefresh && time.Since(cm.metadataAt) < cm.config.MetadataRefreshTTL
 	metadataView := cm.metadataView
 	cm.mu.RUnlock()
 
@@ -446,6 +477,9 @@ func (cm *DefaultCacheManager) List(ctx context.Context) ([]*CacheEntry, error) 
 
 	locations, err := coord.ListFileLocations(ctx, "")
 	if err != nil {
+		if strictRefresh {
+			return nil, err
+		}
 		cm.logger.Printf("Metadata list fallback to local cache only: %v", err)
 		return entries, nil
 	}
@@ -815,21 +849,75 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 
 	startChunk := offset / chunkSize
 	endChunk := (end - 1) / chunkSize
-	out := make([]byte, 0, end-offset)
+	chunkCount := int(endChunk-startChunk) + 1
+	chunks := make([][]byte, chunkCount)
 
-	for i := startChunk; i <= endChunk; i++ {
-		chunkData, ok := cm.getChunkFromRangeCache(filePath, i)
-		if !ok {
-			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
-			chunkEntry, err := cm.Get(ctx, chunkPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read chunk %d for %s: %v", i, filePath, err)
-			}
-			chunkData = chunkEntry.Data
-			cm.setChunkInRangeCache(filePath, i, chunkData)
+	workerCount := cm.config.ParallelRangeReads
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > chunkCount {
+		workerCount = chunkCount
+	}
+
+	if chunkCount == 1 {
+		data, err := cm.readChunkData(ctx, filePath, startChunk)
+		if err != nil {
+			return nil, err
+		}
+		chunks[0] = data
+	} else {
+		jobs := make(chan int, chunkCount)
+		errCh := make(chan error, 1)
+		var wg sync.WaitGroup
+
+		for w := 0; w < workerCount; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for pos := range jobs {
+					chunkIndex := startChunk + int64(pos)
+					data, err := cm.readChunkData(ctx, filePath, chunkIndex)
+					if err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+						return
+					}
+					chunks[pos] = data
+				}
+			}()
 		}
 
-		chunkOffset := i * chunkSize
+		for pos := 0; pos < chunkCount; pos++ {
+			jobs <- pos
+		}
+		close(jobs)
+		wg.Wait()
+
+		select {
+		case err := <-errCh:
+			return nil, err
+		default:
+		}
+	}
+
+	// Opportunistic prefetch for nearby sequential reads.
+	for i := 1; i <= cm.config.RangePrefetchChunks; i++ {
+		prefetchChunk := endChunk + int64(i)
+		if prefetchChunk >= entry.NumChunks {
+			break
+		}
+		go func(chunkIndex int64) {
+			_, _ = cm.readChunkData(context.Background(), filePath, chunkIndex)
+		}(prefetchChunk)
+	}
+
+	out := make([]byte, 0, end-offset)
+	for pos, chunkData := range chunks {
+		chunkIndex := startChunk + int64(pos)
+		chunkOffset := chunkIndex * chunkSize
 		from := int64(0)
 		if offset > chunkOffset {
 			from = offset - chunkOffset
@@ -856,15 +944,35 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	return out, nil
 }
 
+func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath string, chunkIndex int64) ([]byte, error) {
+	chunkData, ok := cm.getChunkFromRangeCache(filePath, chunkIndex)
+	if ok {
+		return chunkData, nil
+	}
+
+	chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, chunkIndex)
+	chunkEntry, err := cm.Get(ctx, chunkPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk %d for %s: %v", chunkIndex, filePath, err)
+	}
+	chunkData = chunkEntry.Data
+	cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
+	return chunkData, nil
+}
+
 func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	cached, ok := cm.rangeChunks[filePath]
-	if !ok || cached == nil || cached.chunkIndex != chunkIndex {
+	fileCache, ok := cm.rangeChunks[filePath]
+	if !ok || fileCache == nil {
 		return nil, false
 	}
-	return cached.data, true
+	data, ok := fileCache.chunks[chunkIndex]
+	if !ok {
+		return nil, false
+	}
+	return data, true
 }
 
 func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte) {
@@ -873,9 +981,23 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	}
 
 	cm.mu.Lock()
-	cm.rangeChunks[filePath] = &chunkCacheEntry{
-		chunkIndex: chunkIndex,
-		data:       data,
+	fileCache, ok := cm.rangeChunks[filePath]
+	if !ok || fileCache == nil {
+		fileCache = &chunkFileCache{
+			chunks: make(map[int64][]byte),
+			order:  make([]int64, 0, cm.config.RangeChunkCacheSize),
+		}
+		cm.rangeChunks[filePath] = fileCache
+	}
+	if _, exists := fileCache.chunks[chunkIndex]; !exists {
+		fileCache.order = append(fileCache.order, chunkIndex)
+	}
+	fileCache.chunks[chunkIndex] = data
+
+	for len(fileCache.order) > cm.config.RangeChunkCacheSize {
+		evictChunk := fileCache.order[0]
+		fileCache.order = fileCache.order[1:]
+		delete(fileCache.chunks, evictChunk)
 	}
 	cm.mu.Unlock()
 }

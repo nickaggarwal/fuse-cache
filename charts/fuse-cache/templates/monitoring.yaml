@@ -1,12 +1,15 @@
-{{- if .Values.monitoring.serviceMonitor.enabled }}
+{{- $monitoring := .Values.monitoring | default dict -}}
+{{- $serviceMonitor := $monitoring.serviceMonitor | default dict -}}
+{{- $grafanaDashboard := $monitoring.grafanaDashboard | default dict -}}
+{{- if ($serviceMonitor.enabled | default false) }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: client
-  namespace: {{ default (include "fuse-cache.namespace" .) .Values.monitoring.serviceMonitor.namespace }}
+  namespace: {{ default (include "fuse-cache.namespace" .) $serviceMonitor.namespace }}
   labels:
     app: client
-    {{- with .Values.monitoring.serviceMonitor.labels }}
+    {{- with $serviceMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
@@ -19,19 +22,19 @@ spec:
   endpoints:
     - port: http
       path: /metrics
-      interval: {{ .Values.monitoring.serviceMonitor.interval }}
-      scrapeTimeout: {{ .Values.monitoring.serviceMonitor.scrapeTimeout }}
+      interval: {{ $serviceMonitor.interval | default "15s" }}
+      scrapeTimeout: {{ $serviceMonitor.scrapeTimeout | default "10s" }}
 {{- end }}
-{{- if .Values.monitoring.grafanaDashboard.enabled }}
+{{- if ($grafanaDashboard.enabled | default false) }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: fuse-cache-dashboard
-  namespace: {{ default (include "fuse-cache.namespace" .) .Values.monitoring.grafanaDashboard.namespace }}
+  namespace: {{ default (include "fuse-cache.namespace" .) $grafanaDashboard.namespace }}
   labels:
     app: client
-    {{- with .Values.monitoring.grafanaDashboard.labels }}
+    {{- with $grafanaDashboard.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 data:
