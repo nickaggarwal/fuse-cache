@@ -19,6 +19,10 @@ type PeerGRPCServer struct {
 	cacheManager CacheManager
 }
 
+type localGetter interface {
+	GetLocal(ctx context.Context, filePath string) (*CacheEntry, error)
+}
+
 // NewPeerGRPCServer creates a new peer gRPC server.
 func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 	return &PeerGRPCServer{cacheManager: cm}
@@ -26,7 +30,7 @@ func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 
 // ReadFile streams file data in 64KB chunks.
 func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService_ReadFileServer) error {
-	entry, err := s.cacheManager.Get(stream.Context(), req.Path)
+	entry, err := s.getForPeerRPC(stream.Context(), req.Path)
 	if err != nil {
 		return fmt.Errorf("file not found: %v", err)
 	}
@@ -101,15 +105,22 @@ func (s *PeerGRPCServer) DeleteFile(ctx context.Context, req *pb.DeleteFileReque
 
 // FileExists checks if a file exists.
 func (s *PeerGRPCServer) FileExists(ctx context.Context, req *pb.FileExistsRequest) (*pb.FileExistsResponse, error) {
-	_, err := s.cacheManager.Get(ctx, req.Path)
+	_, err := s.getForPeerRPC(ctx, req.Path)
 	return &pb.FileExistsResponse{Exists: err == nil}, nil
 }
 
 // FileSize returns the size of a file.
 func (s *PeerGRPCServer) FileSize(ctx context.Context, req *pb.FileSizeRequest) (*pb.FileSizeResponse, error) {
-	entry, err := s.cacheManager.Get(ctx, req.Path)
+	entry, err := s.getForPeerRPC(ctx, req.Path)
 	if err != nil {
 		return nil, fmt.Errorf("file not found: %v", err)
 	}
 	return &pb.FileSizeResponse{Size: entry.Size}, nil
+}
+
+func (s *PeerGRPCServer) getForPeerRPC(ctx context.Context, path string) (*CacheEntry, error) {
+	if local, ok := s.cacheManager.(localGetter); ok {
+		return local.GetLocal(ctx, path)
+	}
+	return s.cacheManager.Get(ctx, path)
 }

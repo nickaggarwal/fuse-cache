@@ -2,7 +2,9 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -50,6 +52,10 @@ type freshLister interface {
 	ListFresh(ctx context.Context) ([]*cache.CacheEntry, error)
 }
 
+type streamingPutter interface {
+	PutFromReader(ctx context.Context, filePath string, r io.Reader, size int64, lastAccessed time.Time) error
+}
+
 // NewFileSystem creates a new FUSE filesystem
 func NewFileSystem(cacheManager cache.CacheManager) *FileSystem {
 	return &FileSystem{
@@ -76,6 +82,11 @@ func (fs *FileSystem) Mount(ctx context.Context, mountPoint string) (*fuse.Conn,
 		fuse.CongestionThreshold(maxBackgroundReqs*3/4),
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := waitForFuseMount(ctx, mountPoint, 5*time.Second); err != nil {
+		_ = conn.Close()
+		_ = fuse.Unmount(mountPoint)
 		return nil, err
 	}
 
@@ -229,8 +240,15 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	if lister, ok := d.fs.cacheManager.(freshLister); ok {
 		entries, err := lister.ListFresh(ctx)
 		if err != nil {
-			d.fs.logger.Printf("Create metadata refresh failed for %s: %v", fullPath, err)
-			return nil, nil, fuse.EIO
+			// Coordinator outages should not make local writes fail. Fall back to
+			// local metadata for overwrite detection and continue if unavailable.
+			d.fs.logger.Printf("Create metadata refresh failed for %s (fallback to local metadata): %v", fullPath, err)
+			if localEntries, listErr := d.fs.cacheManager.List(ctx); listErr == nil {
+				entries = localEntries
+			} else {
+				d.fs.logger.Printf("Create local metadata fallback failed for %s: %v", fullPath, listErr)
+				entries = nil
+			}
 		}
 		for _, entry := range entries {
 			if entry.FilePath == fullPath {
@@ -324,6 +342,33 @@ type File struct {
 	mu    sync.RWMutex
 	dirty bool
 	isNew bool
+
+	writeFile *os.File
+	writePath string
+}
+
+func (f *File) ensureWriteFileLocked() error {
+	if f.writeFile != nil {
+		return nil
+	}
+	tmp, err := os.CreateTemp("", "fuse-client-write-*")
+	if err != nil {
+		return err
+	}
+	f.writeFile = tmp
+	f.writePath = tmp.Name()
+	return nil
+}
+
+func (f *File) cleanupWriteFileLocked() {
+	if f.writeFile != nil {
+		_ = f.writeFile.Close()
+		f.writeFile = nil
+	}
+	if f.writePath != "" {
+		_ = os.Remove(f.writePath)
+		f.writePath = ""
+	}
 }
 
 func growBuffer(data []byte, needed int) []byte {
@@ -386,6 +431,32 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 // Read reads data from the file
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	// Serve dirty writes for write-to-new handles directly from the spool file.
+	f.mu.RLock()
+	if f.isNew && f.dirty && f.writeFile != nil {
+		size := f.entry.Size
+		if req.Offset >= size {
+			f.mu.RUnlock()
+			return nil
+		}
+		end := req.Offset + int64(req.Size)
+		if end > size {
+			end = size
+		}
+		buf := make([]byte, end-req.Offset)
+		n, err := f.writeFile.ReadAt(buf, req.Offset)
+		f.mu.RUnlock()
+		if err != nil && err != io.EOF {
+			return fuse.EIO
+		}
+		resp.Data = buf[:n]
+		if len(resp.Data) > 0 && req.Offset%writeProgressStep == 0 {
+			f.fs.logger.Printf("Read %d bytes from staged write %s at offset %d", len(resp.Data), f.path, req.Offset)
+		}
+		return nil
+	}
+	f.mu.RUnlock()
+
 	// Prefer range reads to avoid full-file materialization for chunked objects.
 	if rr, ok := f.fs.cacheManager.(rangeReader); ok {
 		data, err := rr.ReadRange(ctx, f.path, req.Offset, req.Size)
@@ -427,21 +498,24 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		return fuse.EPERM
 	}
 
-	prevLen := len(f.entry.Data)
+	if err := f.ensureWriteFileLocked(); err != nil {
+		return fuse.EIO
+	}
+	if _, err := f.writeFile.WriteAt(req.Data, req.Offset); err != nil {
+		return fuse.EIO
+	}
 
-	// Grow with headroom to avoid O(n^2) realloc/copy churn on sequential writes.
-	needed := int(req.Offset) + len(req.Data)
-	f.entry.Data = growBuffer(f.entry.Data, needed)
-
-	// Write the data
-	copy(f.entry.Data[req.Offset:], req.Data)
-	f.entry.Size = int64(len(f.entry.Data))
+	prevSize := f.entry.Size
+	needed := req.Offset + int64(len(req.Data))
+	if needed > f.entry.Size {
+		f.entry.Size = needed
+	}
 	f.entry.LastAccessed = time.Now()
 	f.dirty = true
 
 	resp.Size = len(req.Data)
-	if (prevLen / writeProgressStep) != (needed / writeProgressStep) {
-		f.fs.logger.Printf("Write progress %s: %d bytes", f.path, needed)
+	if (prevSize / writeProgressStep) != (f.entry.Size / writeProgressStep) {
+		f.fs.logger.Printf("Write progress %s: %d bytes", f.path, f.entry.Size)
 	}
 	return nil
 }
@@ -452,8 +526,26 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	defer f.mu.Unlock()
 
 	if f.dirty {
-		// Persist accumulated buffered writes once per flush/fsync.
-		if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
+		if f.writeFile != nil {
+			reader := io.NewSectionReader(f.writeFile, 0, f.entry.Size)
+			if putter, ok := f.fs.cacheManager.(streamingPutter); ok {
+				if err := putter.PutFromReader(ctx, f.path, reader, f.entry.Size, time.Now()); err != nil {
+					return fuse.EIO
+				}
+			} else {
+				// Fallback path for non-default cache managers.
+				data := make([]byte, int(f.entry.Size))
+				if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
+					return fuse.EIO
+				}
+				f.entry.Data = data
+				if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
+					return fuse.EIO
+				}
+			}
+			f.entry.Data = nil
+			f.cleanupWriteFileLocked()
+		} else if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
 			return fuse.EIO
 		}
 		f.dirty = false
@@ -477,20 +569,15 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		if !f.isNew {
 			return fuse.EPERM
 		}
-		// Truncate file
-		if req.Size < uint64(len(f.entry.Data)) {
-			f.entry.Data = f.entry.Data[:req.Size]
-		} else if req.Size > uint64(len(f.entry.Data)) {
-			f.entry.Data = growBuffer(f.entry.Data, int(req.Size))
+		if err := f.ensureWriteFileLocked(); err != nil {
+			return fuse.EIO
+		}
+		if err := f.writeFile.Truncate(int64(req.Size)); err != nil {
+			return fuse.EIO
 		}
 		f.entry.Size = int64(req.Size)
 		f.entry.LastAccessed = time.Now()
-
-		// Store in cache
-		if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-			return fuse.EIO
-		}
-		f.dirty = false
+		f.dirty = true
 	}
 
 	return f.Attr(ctx, &resp.Attr)
@@ -503,8 +590,64 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	return f, nil
 }
 
+// Release closes any transient write spool associated with this handle.
+func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleanupWriteFileLocked()
+	return nil
+}
+
 // Unmount unmounts the FUSE filesystem
 func (fs *FileSystem) Unmount(mountPoint string) error {
 	fs.logger.Printf("Unmounting FUSE filesystem from: %s", mountPoint)
 	return fuse.Unmount(mountPoint)
+}
+
+func waitForFuseMount(ctx context.Context, mountPoint string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := isFuseMountActive(mountPoint)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("mountpoint %s did not become an active fuse mount within %v", mountPoint, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
+func isFuseMountActive(mountPoint string) (bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, " - ")
+		if len(parts) != 2 {
+			continue
+		}
+		left := strings.Fields(parts[0])
+		right := strings.Fields(parts[1])
+		if len(left) < 5 || len(right) < 1 {
+			continue
+		}
+		if left[4] != mountPoint {
+			continue
+		}
+		return strings.HasPrefix(right[0], "fuse"), nil
+	}
+	return false, nil
 }

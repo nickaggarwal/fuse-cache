@@ -23,16 +23,18 @@ type PeerStorage struct {
 	coordinator         coordinator.Coordinator
 	timeout             time.Duration
 	minReplicationCount int
+	localPeerID         string
 	connMu              sync.RWMutex
 	connPool            map[string]*grpc.ClientConn
 }
 
 // NewPeerStorage creates a new peer storage instance.
-func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration) (*PeerStorage, error) {
+func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localPeerID string) (*PeerStorage, error) {
 	return &PeerStorage{
 		coordinator:         coord,
 		timeout:             timeout,
 		minReplicationCount: 3,
+		localPeerID:         localPeerID,
 		connPool:            make(map[string]*grpc.ClientConn),
 	}, nil
 }
@@ -76,7 +78,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		err  error
 	}
 
-	readCtx, cancel := context.WithCancel(ctx)
+	readCtx, cancel := context.WithTimeout(ctx, ps.timeout)
 	defer cancel()
 
 	resultChan := make(chan readResult, len(peers))
@@ -98,10 +100,14 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	for i := 0; i < active; i++ {
-		res := <-resultChan
-		if res.err == nil {
-			cancel()
-			return res.data, nil
+		select {
+		case <-readCtx.Done():
+			return nil, fmt.Errorf("peer read timed out for %s: %w", path, readCtx.Err())
+		case res := <-resultChan:
+			if res.err == nil {
+				cancel()
+				return res.data, nil
+			}
 		}
 	}
 
@@ -226,7 +232,27 @@ func cryptoShuffle(peers []*coordinator.PeerInfo) {
 }
 
 func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, error) {
-	return ps.coordinator.GetPeers(ctx, "")
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	peers, err := ps.coordinator.GetPeers(callCtx, "")
+	if err != nil {
+		return nil, err
+	}
+	if ps.localPeerID == "" {
+		return peers, nil
+	}
+
+	filtered := make([]*coordinator.PeerInfo, 0, len(peers))
+	for _, peer := range peers {
+		if peer == nil || peer.ID == "" {
+			continue
+		}
+		if peer.ID == ps.localPeerID {
+			continue
+		}
+		filtered = append(filtered, peer)
+	}
+	return filtered, nil
 }
 
 func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) ([]byte, error) {
@@ -236,7 +262,9 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) 
 	}
 
 	client := pb.NewPeerServiceClient(conn)
-	stream, err := client.ReadFile(ctx, &pb.ReadFileRequest{Path: path})
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	stream, err := client.ReadFile(callCtx, &pb.ReadFileRequest{Path: path})
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +290,9 @@ func (ps *PeerStorage) writeToPeer(ctx context.Context, grpcAddr, path string, d
 	}
 
 	client := pb.NewPeerServiceClient(conn)
-	stream, err := client.WriteFile(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	stream, err := client.WriteFile(callCtx)
 	if err != nil {
 		return err
 	}
@@ -305,7 +335,9 @@ func (ps *PeerStorage) deleteFromPeer(ctx context.Context, grpcAddr, path string
 		return err
 	}
 	client := pb.NewPeerServiceClient(conn)
-	_, err = client.DeleteFile(ctx, &pb.DeleteFileRequest{Path: path})
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	_, err = client.DeleteFile(callCtx, &pb.DeleteFileRequest{Path: path})
 	return err
 }
 
@@ -315,7 +347,9 @@ func (ps *PeerStorage) existsOnPeer(ctx context.Context, grpcAddr, path string) 
 		return false
 	}
 	client := pb.NewPeerServiceClient(conn)
-	resp, err := client.FileExists(ctx, &pb.FileExistsRequest{Path: path})
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	resp, err := client.FileExists(callCtx, &pb.FileExistsRequest{Path: path})
 	if err != nil {
 		return false
 	}
@@ -328,7 +362,9 @@ func (ps *PeerStorage) sizeOnPeer(ctx context.Context, grpcAddr, path string) (i
 		return 0, err
 	}
 	client := pb.NewPeerServiceClient(conn)
-	resp, err := client.FileSize(ctx, &pb.FileSizeRequest{Path: path})
+	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	resp, err := client.FileSize(callCtx, &pb.FileSizeRequest{Path: path})
 	if err != nil {
 		return 0, err
 	}

@@ -24,8 +24,7 @@ coordinator:
     size: 1Gi
 
 client:
-  nodeSelector:
-    agentpool: userpool
+  nodeSelector: {}
   httpPort: 8081
   grpcPort: 9081
   cloudProvider: azure
@@ -38,8 +37,12 @@ client:
       memory: 4Gi
   fuseDevicePath: /dev/fuse
   nvmeHostPath: /mnt
+  fuseHostPath: /mnt
   fuseMountHostPath: /mnt/fuse
+  fuseRootContainerPath: /host/mnt
   fuseMountContainerPath: /host/mnt/fuse
+  mountPrepareRetries: 10
+  mountPrepareRetryDelaySeconds: 2
 
 config:
   coordinatorAddr: ""

@@ -7,16 +7,20 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"fuse-client/internal/api"
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
-	"fuse-client/internal/fuse"
+	fusefs "fuse-client/internal/fuse"
 	pb "fuse-client/internal/pb"
 
+	fusepkg "bazil.org/fuse"
 	"google.golang.org/grpc"
 )
 
@@ -48,7 +52,11 @@ func main() {
 		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
 
 		// NVMe capacity
-		nvmeMaxGB = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+		nvmeMaxGB    = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+		peerMaxGB    = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
+		peerReadMBps = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
+		mountRetries = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
+		mountDelayS  = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
 		help = flag.Bool("help", false, "Show help")
 	)
@@ -109,21 +117,50 @@ func main() {
 	cacheConfig := &cache.CacheConfig{
 		NVMePath:        *nvmePath,
 		MaxNVMeSize:     int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
-		MaxPeerSize:     5 * 1024 * 1024 * 1024, // 5GB
+		MaxPeerSize:     int64(*peerMaxGB) * 1024 * 1024 * 1024,
 		PeerTimeout:     30 * time.Second,
 		CloudTimeout:    60 * time.Second,
 		CoordinatorAddr: *coordinatorAddr,
 		Coordinator:     coordClient,
 		ChunkSize:       int64(*chunkSizeMB) * 1024 * 1024,
 
-		CloudProvider:       *cloudProvider,
-		S3Bucket:            *s3Bucket,
-		S3Region:            *s3Region,
-		AzureStorageAccount: *azureAccount,
-		AzureStorageKey:     *azureKey,
-		AzureContainerName:  *azureContainer,
-		GCPBucket:           *gcpBucket,
-		LocalPeerID:         *peerID,
+		CloudProvider:                 *cloudProvider,
+		S3Bucket:                      *s3Bucket,
+		S3Region:                      *s3Region,
+		AzureStorageAccount:           *azureAccount,
+		AzureStorageKey:               *azureKey,
+		AzureContainerName:            *azureContainer,
+		GCPBucket:                     *gcpBucket,
+		LocalPeerID:                   *peerID,
+		PeerReadThroughputBytesPerSec: *peerReadMBps * 1024 * 1024,
+	}
+	if v := os.Getenv("FUSE_PEER_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cacheConfig.MaxPeerSize = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_PEER_SIZE value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_PEER_READ_MBPS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cacheConfig.PeerReadThroughputBytesPerSec = n * 1024 * 1024
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_PEER_READ_MBPS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_MOUNT_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			*mountRetries = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_MOUNT_RETRIES value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_MOUNT_RETRY_DELAY_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			*mountDelayS = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_MOUNT_RETRY_DELAY_SEC value %q: %v", v, err)
+		}
 	}
 
 	// Initialize cache manager
@@ -163,11 +200,11 @@ func main() {
 	}()
 
 	// Create FUSE filesystem
-	filesystem := fuse.NewFileSystem(cacheManager)
+	filesystem := fusefs.NewFileSystem(cacheManager)
 
 	// Mount the FUSE filesystem
 	logger.Printf("Mounting FUSE filesystem at: %s", *mountPoint)
-	conn, err := filesystem.Mount(ctx, *mountPoint)
+	conn, err := mountWithRetry(ctx, filesystem, *mountPoint, *mountRetries, time.Duration(*mountDelayS)*time.Second, logger)
 	if err != nil {
 		logger.Fatalf("Failed to mount FUSE filesystem: %v", err)
 	}
@@ -188,6 +225,10 @@ func main() {
 	logger.Printf("- Coordinator HTTP: %s", *coordinatorAddr)
 	logger.Printf("- Coordinator gRPC: %s", *coordinatorGRPC)
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
+	logger.Printf("- Peer read threshold bytes: %d", cacheConfig.MaxPeerSize)
+	logger.Printf("- Assumed per-peer read throughput MB/s: %d", *peerReadMBps)
+	logger.Printf("- FUSE mount retries: %d", *mountRetries)
+	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
 
 	// Wait for interrupt signal to gracefully shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -235,14 +276,15 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		Status:         "active",
 	}
 
-	// Retry registration with backoff
-	for attempt := 0; attempt < 5; attempt++ {
+	// Keep retrying registration until success or shutdown.
+	for attempt := 1; ; attempt++ {
 		if err := coordClient.RegisterPeer(ctx, peerInfo); err != nil {
-			logger.Printf("Failed to register peer (attempt %d): %v", attempt+1, err)
+			wait := time.Duration(minInt(attempt, 10)) * 2 * time.Second
+			logger.Printf("Failed to register peer (attempt %d): %v; retrying in %v", attempt, err, wait)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
+			case <-time.After(wait):
 				continue
 			}
 		}
@@ -261,10 +303,22 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		case <-ticker.C:
 			used, capacity := cm.Stats()
 			if err := coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used); err != nil {
-				logger.Printf("Failed to update peer status: %v", err)
+				logger.Printf("Failed to update peer status: %v (attempting re-register)", err)
+				peerInfo.AvailableSpace = capacity - used
+				peerInfo.UsedSpace = used
+				if regErr := coordClient.RegisterPeer(ctx, peerInfo); regErr != nil {
+					logger.Printf("Re-register failed for peer %s: %v", peerID, regErr)
+				}
 			}
 		}
 	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func getLocalIP() string {
@@ -278,4 +332,67 @@ func getLocalIP() string {
 		}
 	}
 	return "localhost"
+}
+
+func mountWithRetry(ctx context.Context, filesystem *fusefs.FileSystem, mountPoint string, retries int, baseDelay time.Duration, logger *log.Logger) (*fusepkg.Conn, error) {
+	if retries < 1 {
+		retries = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = 2 * time.Second
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= retries; attempt++ {
+		if err := cleanupStaleMountpoint(ctx, mountPoint, logger); err != nil {
+			logger.Printf("Mount cleanup warning for %s: %v", mountPoint, err)
+		}
+
+		conn, err := filesystem.Mount(ctx, mountPoint)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		logger.Printf("FUSE mount attempt %d/%d failed at %s: %v", attempt, retries, mountPoint, err)
+
+		if attempt == retries {
+			break
+		}
+
+		wait := time.Duration(attempt) * baseDelay
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return nil, fmt.Errorf("mount retries exhausted for %s: %w", mountPoint, lastErr)
+}
+
+func cleanupStaleMountpoint(ctx context.Context, mountPoint string, logger *log.Logger) error {
+	commands := [][]string{
+		{"fusermount3", "-u", "-z", mountPoint},
+		{"fusermount", "-u", "-z", mountPoint},
+		{"umount", "-l", mountPoint},
+	}
+
+	var lastErr error
+	for _, cmdArgs := range commands {
+		cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			lastErr = err
+			output := strings.TrimSpace(string(out))
+			if output != "" {
+				logger.Printf("Mount cleanup command failed: %s (%v): %s", strings.Join(cmdArgs, " "), err, output)
+			}
+			continue
+		}
+		lastErr = nil
+	}
+
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		return err
+	}
+	return lastErr
 }

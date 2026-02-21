@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"fuse-client/internal/coordinator"
 )
 
 // mockStorage is a simple in-memory TierStorage for testing
@@ -86,6 +88,8 @@ func newTestCacheManager() *DefaultCacheManager {
 		entries:      make(map[string]*CacheEntry),
 		logger:       log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
+		rangeChunks:  make(map[string]*chunkFileCache),
+		hybridHints:  make(map[string]hybridReadHint),
 	}
 }
 
@@ -293,6 +297,218 @@ func (f *failNTimesStorage) Size(ctx context.Context, path string) (int64, error
 	return f.inner.Size(ctx, path)
 }
 
+type countingStorage struct {
+	inner     *mockStorage
+	readCalls atomic.Int32
+}
+
+func newCountingStorage() *countingStorage {
+	return &countingStorage{inner: newMockStorage()}
+}
+
+func (c *countingStorage) Read(ctx context.Context, path string) ([]byte, error) {
+	c.readCalls.Add(1)
+	return c.inner.Read(ctx, path)
+}
+
+func (c *countingStorage) Write(ctx context.Context, path string, data []byte) error {
+	return c.inner.Write(ctx, path, data)
+}
+
+func (c *countingStorage) Delete(ctx context.Context, path string) error {
+	return c.inner.Delete(ctx, path)
+}
+
+func (c *countingStorage) Exists(ctx context.Context, path string) bool {
+	return c.inner.Exists(ctx, path)
+}
+
+func (c *countingStorage) Size(ctx context.Context, path string) (int64, error) {
+	return c.inner.Size(ctx, path)
+}
+
+func (c *countingStorage) reads() int32 {
+	return c.readCalls.Load()
+}
+
+func TestCacheManager_Get_UsesPeerFirstAt5GBBoundary(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	const peerLimit = int64(5 * 1024 * 1024 * 1024)
+	path := "/large-5gb.bin"
+
+	peer := newCountingStorage()
+	cloud := newCountingStorage()
+	cm.peerStorage = peer
+	cm.cloudStorage = cloud
+	cm.config.MaxPeerSize = peerLimit
+
+	if err := peer.Write(ctx, path, []byte("from-peer")); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	if err := cloud.Write(ctx, path, []byte("from-cloud")); err != nil {
+		t.Fatalf("cloud write: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{FilePath: path, Size: peerLimit}
+	cm.mu.Unlock()
+
+	got, err := cm.Get(ctx, path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.Data) != "from-peer" {
+		t.Fatalf("Get data = %q, want peer path first", string(got.Data))
+	}
+	if peer.reads() != 1 {
+		t.Fatalf("peer reads = %d, want 1", peer.reads())
+	}
+}
+
+func TestCacheManager_Get_UsesPeerFirstBelowPeerLimit(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	path := "/small.bin"
+	peer := newCountingStorage()
+	cloud := newCountingStorage()
+	cm.peerStorage = peer
+	cm.cloudStorage = cloud
+	cm.config.MaxPeerSize = int64(5 * 1024 * 1024 * 1024)
+
+	if err := peer.Write(ctx, path, []byte("from-peer")); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	if err := cloud.Write(ctx, path, []byte("from-cloud")); err != nil {
+		t.Fatalf("cloud write: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{FilePath: path, Size: 64 * 1024 * 1024}
+	cm.mu.Unlock()
+
+	got, err := cm.Get(ctx, path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.Data) != "from-peer" {
+		t.Fatalf("Get data = %q, want peer path first", string(got.Data))
+	}
+	if peer.reads() != 1 {
+		t.Fatalf("peer reads = %d, want 1", peer.reads())
+	}
+	if cloud.reads() != 0 {
+		t.Fatalf("cloud reads = %d, want 0", cloud.reads())
+	}
+}
+
+func TestCacheManager_Get_ChunkUsesParentSizeHint(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	const peerLimit = int64(5 * 1024 * 1024 * 1024)
+	parent := "/large-parent.bin"
+	chunkPath := parent + "_chunk_0"
+
+	peer := newCountingStorage()
+	cloud := newCountingStorage()
+	cm.peerStorage = peer
+	cm.cloudStorage = cloud
+	cm.config.MaxPeerSize = peerLimit
+
+	if err := peer.Write(ctx, chunkPath, []byte("chunk-from-peer")); err != nil {
+		t.Fatalf("peer write: %v", err)
+	}
+	if err := cloud.Write(ctx, chunkPath, []byte("chunk-from-cloud")); err != nil {
+		t.Fatalf("cloud write: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[parent] = &CacheEntry{FilePath: parent, Size: peerLimit + 1}
+	cm.mu.Unlock()
+
+	got, err := cm.Get(ctx, chunkPath)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.Data) != "chunk-from-peer" {
+		t.Fatalf("Get data = %q, want peer-first for large parent", string(got.Data))
+	}
+	if peer.reads() != 1 {
+		t.Fatalf("peer reads = %d, want 1", peer.reads())
+	}
+}
+
+func TestCacheManager_ReadRange_HybridSplitsPeerAndCloud(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	peer := newCountingStorage()
+	cloud := newCountingStorage()
+	cm.peerStorage = peer
+	cm.cloudStorage = cloud
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 0
+	cm.config.MaxPeerSize = int64(10 * 1024 * 1024 * 1024) // keep peer-first base order
+	cm.config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
+	cm.config.MetadataRefreshTTL = 5 * time.Second
+
+	coord := coordinator.NewCoordinatorService()
+	cm.config.Coordinator = coord
+
+	path := "/hybrid.bin"
+	chunk0 := path + "_chunk_0"
+	chunk1 := path + "_chunk_1"
+
+	if err := peer.Write(ctx, chunk0, []byte("ABCD")); err != nil {
+		t.Fatalf("peer write chunk0: %v", err)
+	}
+	if err := cloud.Write(ctx, chunk0, []byte("abcd")); err != nil {
+		t.Fatalf("cloud write chunk0: %v", err)
+	}
+	if err := cloud.Write(ctx, chunk1, []byte("ijkl")); err != nil {
+		t.Fatalf("cloud write chunk1: %v", err)
+	}
+
+	// 500MB > 2 peers * 200MB/s => enable hybrid mode.
+	fileSize := int64(500 * 1024 * 1024)
+	for _, loc := range []*coordinator.FileLocation{
+		{FilePath: path, PeerID: "peer-1", StorageTier: "peer", FileSize: fileSize},
+		{FilePath: path, PeerID: "peer-2", StorageTier: "peer", FileSize: fileSize},
+		{FilePath: path, PeerID: "cloud-1", StorageTier: "cloud", FileSize: fileSize},
+	} {
+		if err := coord.UpdateFileLocation(ctx, loc); err != nil {
+			t.Fatalf("UpdateFileLocation: %v", err)
+		}
+	}
+
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{
+		FilePath:  path,
+		Size:      fileSize,
+		IsChunked: true,
+		NumChunks: 2,
+	}
+	cm.mu.Unlock()
+
+	got, err := cm.ReadRange(ctx, path, 0, 8)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if string(got) != "ABCDijkl" {
+		t.Fatalf("ReadRange data = %q, want %q", string(got), "ABCDijkl")
+	}
+	// Chunk 0 should come from peer; chunk 1 should fall back to cloud.
+	if peer.reads() < 1 {
+		t.Fatalf("peer reads = %d, want >= 1", peer.reads())
+	}
+	if cloud.reads() < 1 {
+		t.Fatalf("cloud reads = %d, want >= 1", cloud.reads())
+	}
+}
+
 func TestCacheManager_ChunkedReassembly(t *testing.T) {
 	cm := newTestCacheManager()
 	cm.config.ChunkSize = 10 // 10 bytes per chunk
@@ -332,6 +548,41 @@ func TestCacheManager_ChunkedReassembly(t *testing.T) {
 
 	if !bytes.Equal(got.Data, data) {
 		t.Errorf("Get data = %q, want %q", got.Data, data)
+	}
+}
+
+func TestCacheManager_PutFromReader_Chunked(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 4
+	ctx := context.Background()
+
+	data := []byte("hello-world")
+	if err := cm.PutFromReader(ctx, "/stream.bin", bytes.NewReader(data), int64(len(data)), time.Now()); err != nil {
+		t.Fatalf("PutFromReader: %v", err)
+	}
+
+	cm.mu.RLock()
+	meta := cm.entries["/stream.bin"]
+	cm.mu.RUnlock()
+	if meta == nil {
+		t.Fatalf("missing metadata entry")
+	}
+	if !meta.IsChunked {
+		t.Fatalf("metadata IsChunked = false, want true")
+	}
+	if meta.NumChunks != 3 {
+		t.Fatalf("NumChunks = %d, want 3", meta.NumChunks)
+	}
+	if len(meta.Data) != 0 {
+		t.Fatalf("metadata data retained, want empty")
+	}
+
+	got, err := cm.ReadRange(ctx, "/stream.bin", 0, len(data))
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("ReadRange = %q, want %q", string(got), string(data))
 	}
 }
 
@@ -499,6 +750,8 @@ func newLargeFileCacheManager(maxNVMe int64) *DefaultCacheManager {
 		entries:      make(map[string]*CacheEntry),
 		logger:       log.New(log.Writer(), "[CACHE-LARGE] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
+		rangeChunks:  make(map[string]*chunkFileCache),
+		hybridHints:  make(map[string]hybridReadHint),
 	}
 }
 

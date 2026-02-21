@@ -168,8 +168,12 @@ Options:
 
 1. **File Read**: 
    - First checks Tier 1 (NVME)
-   - If not found, checks Tier 2 (Peers)
-   - If not found, checks Tier 3 (Cloud)
+   - If not found, always tries Tier 2 (Peers) before Tier 3 (Cloud)
+   - For large files, hybrid read mode can be enabled when:
+     - multiple peers have the file metadata
+     - cloud copy is available
+     - file size `>` `(peer replicas * assumed per-peer MB/s)`
+   - In hybrid mode, peer remains primary and cloud is added in parallel to accelerate when needed
    - Promotes files to higher tiers on access
    - Chunked objects are served through range reads (no full-file reassembly required)
 
@@ -209,9 +213,13 @@ export GCP_BUCKET=fuse-client-cache
 # Cache Configuration
 export FUSE_NVME_SIZE=10737418240  # 10GB
 export FUSE_PEER_SIZE=5368709120   # 5GB
+export FUSE_PEER_READ_MBPS=200     # assumed MB/s per peer
 export FUSE_PEER_TIMEOUT=30s
 export FUSE_CLOUD_TIMEOUT=60s
 ```
+
+`FUSE_PEER_SIZE` controls the remote read strategy threshold (in bytes).
+`FUSE_PEER_READ_MBPS` controls the hybrid-read throughput model.
 
 ### Cache Sizes
 
@@ -404,6 +412,22 @@ Examples:
 
 # 1GiB write + read benchmark
 ./scripts/ops/bench-fuse-io.sh fuse-system-aztest 1024 client-abc123 with-read
+```
+
+### Run 5GiB smart-read test (peer/cloud by size)
+
+```bash
+./scripts/ops/test-smart-read-5gb.sh <namespace> [writer-pod] [reader-pod]
+```
+
+Examples:
+
+```bash
+# Auto-select writer/reader pods
+./scripts/ops/test-smart-read-5gb.sh fuse-system-aztest
+
+# Explicit writer and reader pods
+./scripts/ops/test-smart-read-5gb.sh fuse-system-aztest client-a client-b
 ```
 
 ## License
