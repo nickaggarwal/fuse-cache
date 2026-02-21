@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +25,38 @@ const (
 	maxReadaheadBytes = 4 * 1024 * 1024 // 4 MiB
 	maxBackgroundReqs = 128
 	defaultBlockSize  = 4 * 1024
-	writeProgressStep = 32 * 1024 * 1024 // 32 MiB
+	defaultIOLogStep  = 512 * 1024 * 1024 // 512 MiB
 )
+
+var (
+	// ioProgressStepBytes controls periodic read/write progress logging volume.
+	// Set FUSE_IO_PROGRESS_MB=0 to disable progress logs.
+	ioProgressStepBytes int64 = defaultIOLogStep
+)
+
+func init() {
+	v := strings.TrimSpace(os.Getenv("FUSE_IO_PROGRESS_MB"))
+	if v == "" {
+		return
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return
+	}
+	if n <= 0 {
+		ioProgressStepBytes = 0
+		return
+	}
+	ioProgressStepBytes = n * 1024 * 1024
+}
+
+func shouldLogProgressAtOffset(offset int64) bool {
+	return ioProgressStepBytes > 0 && offset >= 0 && offset%ioProgressStepBytes == 0
+}
+
+func crossedProgressBoundary(prevSize, newSize int64) bool {
+	return ioProgressStepBytes > 0 && (prevSize/ioProgressStepBytes) != (newSize/ioProgressStepBytes)
+}
 
 // pathToInode generates a deterministic inode number from a path using FNV-64a
 func pathToInode(path string) uint64 {
@@ -450,7 +481,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			return fuse.EIO
 		}
 		resp.Data = buf[:n]
-		if len(resp.Data) > 0 && req.Offset%writeProgressStep == 0 {
+		if len(resp.Data) > 0 && shouldLogProgressAtOffset(req.Offset) {
 			f.fs.logger.Printf("Read %d bytes from staged write %s at offset %d", len(resp.Data), f.path, req.Offset)
 		}
 		return nil
@@ -464,7 +495,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			return fuse.EIO
 		}
 		resp.Data = data
-		if len(data) > 0 && req.Offset%writeProgressStep == 0 {
+		if len(data) > 0 && shouldLogProgressAtOffset(req.Offset) {
 			f.fs.logger.Printf("Read %d bytes from %s at offset %d", len(data), f.path, req.Offset)
 		}
 		return nil
@@ -483,7 +514,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		end = int64(len(entry.Data))
 	}
 	resp.Data = entry.Data[req.Offset:end]
-	if len(resp.Data) > 0 && req.Offset%writeProgressStep == 0 {
+	if len(resp.Data) > 0 && shouldLogProgressAtOffset(req.Offset) {
 		f.fs.logger.Printf("Read %d bytes from %s at offset %d", len(resp.Data), f.path, req.Offset)
 	}
 	return nil
@@ -514,7 +545,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.dirty = true
 
 	resp.Size = len(req.Data)
-	if (prevSize / writeProgressStep) != (f.entry.Size / writeProgressStep) {
+	if crossedProgressBoundary(prevSize, f.entry.Size) {
 		f.fs.logger.Printf("Write progress %s: %d bytes", f.path, f.entry.Size)
 	}
 	return nil

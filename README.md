@@ -27,6 +27,8 @@ The system consists of:
   - Chunked uploads avoid unbounded goroutine fanout
   - Chunked reads use range-based reads with chunk reuse to avoid full-file in-memory reconstruction
 - **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and 1GB benchmarking
+  - `test-smart-read.sh` supports cross-pod read/write benchmarks for arbitrary sizes (e.g. 100MB/1GB/5GB)
+  - `test-smart-read-5gb.sh` remains as a compatibility wrapper
 
 ## Components
 
@@ -216,10 +218,12 @@ export FUSE_PEER_SIZE=5368709120   # 5GB
 export FUSE_PEER_READ_MBPS=200     # assumed MB/s per peer
 export FUSE_PEER_TIMEOUT=30s
 export FUSE_CLOUD_TIMEOUT=60s
+export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
 ```
 
 `FUSE_PEER_SIZE` controls the remote read strategy threshold (in bytes).
 `FUSE_PEER_READ_MBPS` controls the hybrid-read throughput model.
+`FUSE_IO_PROGRESS_MB` controls periodic FUSE read/write progress logging cadence.
 
 ### Cache Sizes
 
