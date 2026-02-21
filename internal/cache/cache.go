@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +94,10 @@ type CacheConfig struct {
 	AzureStorageAccount string
 	AzureStorageKey     string
 	AzureContainerName  string
+	// Azure parallel download tuning
+	AzureDownloadConcurrency      int
+	AzureDownloadBlockSizeBytes   int64
+	AzureParallelDownloadMinBytes int64
 
 	// GCP config
 	GCPBucket string
@@ -125,6 +131,13 @@ type CacheConfig struct {
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
+
+	// HybridCloudHedgeDelay controls how long to wait before launching cloud
+	// fallback when peer is primary in hybrid reads.
+	HybridCloudHedgeDelay time.Duration
+
+	// HybridMaxSecondaryInflight bounds concurrent hedged secondary reads.
+	HybridMaxSecondaryInflight int
 }
 
 // DefaultCacheManager implements CacheManager
@@ -143,6 +156,7 @@ type DefaultCacheManager struct {
 	rangeChunks  map[string]*chunkFileCache
 	hybridHints  map[string]hybridReadHint
 	chunkFetches map[string]*chunkFetchState
+	hedgeLimiter chan struct{}
 }
 
 type chunkFileCache struct {
@@ -162,7 +176,8 @@ type chunkFetchState struct {
 }
 
 const slowChunkReadThreshold = 2 * time.Second
-const hybridCloudHedgeDelay = 20 * time.Millisecond
+const defaultHybridCloudHedgeDelay = 20 * time.Millisecond
+const defaultHybridMaxSecondaryInflight = 16
 
 // NewCacheManager creates a new cache manager
 func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
@@ -198,6 +213,21 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if config.PeerReadThroughputBytesPerSec <= 0 {
 		config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
 	}
+	if config.AzureDownloadConcurrency <= 0 {
+		config.AzureDownloadConcurrency = 8
+	}
+	if config.AzureDownloadBlockSizeBytes <= 0 {
+		config.AzureDownloadBlockSizeBytes = 4 * 1024 * 1024
+	}
+	if config.AzureParallelDownloadMinBytes <= 0 {
+		config.AzureParallelDownloadMinBytes = 8 * 1024 * 1024
+	}
+	if config.HybridCloudHedgeDelay <= 0 {
+		config.HybridCloudHedgeDelay = defaultHybridCloudHedgeDelay
+	}
+	if config.HybridMaxSecondaryInflight <= 0 {
+		config.HybridMaxSecondaryInflight = defaultHybridMaxSecondaryInflight
+	}
 
 	cm := &DefaultCacheManager{
 		config:       config,
@@ -207,6 +237,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		rangeChunks:  make(map[string]*chunkFileCache),
 		hybridHints:  make(map[string]hybridReadHint),
 		chunkFetches: make(map[string]*chunkFetchState),
+		hedgeLimiter: make(chan struct{}, config.HybridMaxSecondaryInflight),
 	}
 
 	// Initialize storage tiers
@@ -235,6 +266,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 			config.AzureStorageKey,
 			config.AzureContainerName,
 			config.CloudTimeout,
+			config.AzureDownloadConcurrency,
+			config.AzureDownloadBlockSizeBytes,
+			config.AzureParallelDownloadMinBytes,
 		)
 	case "gcp":
 		cm.cloudStorage, err = NewGCPStorage(
@@ -321,7 +355,18 @@ func (cm *DefaultCacheManager) GetLocal(ctx context.Context, filePath string) (*
 	if chunked {
 		return cm.getChunkedLocal(ctx, entry)
 	}
-	return cm.getFromTier(ctx, filePath, TierNVMe)
+	return cm.getFromTierNoVerify(ctx, filePath, TierNVMe)
+}
+
+// LocalFilePath returns the local NVMe path for filePath if present.
+func (cm *DefaultCacheManager) LocalFilePath(ctx context.Context, filePath string) (string, bool) {
+	_ = ctx
+	fullPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/"))
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	return fullPath, true
 }
 
 func (cm *DefaultCacheManager) remoteReadOrder(filePath string) []CacheTier {
@@ -417,6 +462,10 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 	if !hasCloud {
 		// Metadata may lag async cloud persistence; probe cloud directly.
 		hasCloud = cm.cloudStorage.Exists(ctx, filePath)
+		if !hasCloud {
+			// Chunked files may exist in cloud only as chunk objects.
+			hasCloud = cm.cloudStorage.Exists(ctx, fmt.Sprintf("%s_chunk_0", filePath))
+		}
 	}
 
 	effectiveReplicas := peerReplicas
@@ -456,7 +505,7 @@ func (cm *DefaultCacheManager) getFromHybridRemote(ctx context.Context, filePath
 	go func() {
 		// Start cloud shortly after peer to keep peer primary while enabling
 		// throughput gains from hybrid hedging when peer stalls.
-		timer := time.NewTimer(hybridCloudHedgeDelay)
+		timer := time.NewTimer(cm.effectiveHybridHedgeDelay(TierPeer, TierCloud))
 		defer timer.Stop()
 		select {
 		case <-readCtx.Done():
@@ -484,6 +533,40 @@ func (cm *DefaultCacheManager) getFromHybridRemote(ctx context.Context, filePath
 		lastErr = errors.New("hybrid remote read failed")
 	}
 	return nil, lastErr
+}
+
+func (cm *DefaultCacheManager) effectiveHybridHedgeDelay(primary, secondary CacheTier) time.Duration {
+	delay := cm.config.HybridCloudHedgeDelay
+	if delay <= 0 {
+		delay = defaultHybridCloudHedgeDelay
+	}
+	primaryMBps := cm.metrics.TierReadMBps(primary)
+	secondaryMBps := cm.metrics.TierReadMBps(secondary)
+	if primaryMBps > 0 && secondaryMBps > 0 {
+		switch {
+		case primaryMBps >= secondaryMBps*1.25:
+			delay *= 2
+		case primaryMBps <= secondaryMBps*0.75:
+			delay /= 2
+		}
+	}
+	if delay < 2*time.Millisecond {
+		return 2 * time.Millisecond
+	}
+	return delay
+}
+
+func (cm *DefaultCacheManager) tryAcquireHedgeSlot() (func(), bool) {
+	limiter := cm.hedgeLimiter
+	if limiter == nil || cap(limiter) == 0 {
+		return func() {}, true
+	}
+	select {
+	case limiter <- struct{}{}:
+		return func() { <-limiter }, true
+	default:
+		return nil, false
+	}
 }
 
 // getChunked reassembles a chunked file from its chunks
@@ -514,7 +597,7 @@ func (cm *DefaultCacheManager) getChunkedLocal(ctx context.Context, entry *Cache
 	var allData []byte
 	for i := int64(0); i < entry.NumChunks; i++ {
 		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
-		chunkEntry, err := cm.getFromTier(ctx, chunkPath, TierNVMe)
+		chunkEntry, err := cm.getFromTierNoVerify(ctx, chunkPath, TierNVMe)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read local chunk %d of %s: %v", i, entry.FilePath, err)
 		}
@@ -743,6 +826,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	cm.entries[filePath] = meta
 	cm.mu.Unlock()
 	go cm.publishFileLocation(context.Background(), meta, TierNVMe)
+	go cm.persistChunkedFileToCloud(filePath, numChunks)
 	return nil
 }
 
@@ -913,6 +997,46 @@ func (cm *DefaultCacheManager) persistToCloud(filePath string, data []byte) {
 		cm.config.CloudRetryCount, filePath, lastErr)
 }
 
+// persistChunkedFileToCloud asynchronously persists chunk objects so hybrid
+// peer+cloud range reads can use both tiers for large files.
+func (cm *DefaultCacheManager) persistChunkedFileToCloud(filePath string, numChunks int64) {
+	if numChunks <= 0 || cm.cloudStorage == nil || cm.nvmeStorage == nil {
+		return
+	}
+
+	workers := cm.config.ParallelRangeReads
+	if workers < 1 {
+		workers = 4
+	}
+	if workers > 8 {
+		workers = 8
+	}
+
+	jobs := make(chan int64, workers*2)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, idx)
+				data, err := cm.nvmeStorage.Read(context.Background(), chunkPath)
+				if err != nil {
+					cm.logger.Printf("Chunk cloud persist skipped for %s: %v", chunkPath, err)
+					continue
+				}
+				cm.persistToCloud(chunkPath, data)
+			}
+		}()
+	}
+
+	for idx := int64(0); idx < numChunks; idx++ {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+}
+
 // putToNVMeWithEviction tries NVMe write, evicting if necessary
 func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry *CacheEntry) error {
 	cm.mu.RLock()
@@ -971,18 +1095,17 @@ func cacheTierToStorageTier(tier CacheTier) string {
 
 // Helper methods
 func (cm *DefaultCacheManager) getFromTier(ctx context.Context, filePath string, tier CacheTier) (*CacheEntry, error) {
+	return cm.getFromTierInternal(ctx, filePath, tier, true)
+}
+
+func (cm *DefaultCacheManager) getFromTierNoVerify(ctx context.Context, filePath string, tier CacheTier) (*CacheEntry, error) {
+	return cm.getFromTierInternal(ctx, filePath, tier, false)
+}
+
+func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath string, tier CacheTier, verifyNVMeChecksum bool) (*CacheEntry, error) {
 	storage := cm.getStorageForTier(tier)
 
-	if !storage.Exists(ctx, filePath) {
-		return nil, errors.New("file not found in tier")
-	}
-
 	data, err := storage.Read(ctx, filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	size, err := storage.Size(ctx, filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -990,14 +1113,14 @@ func (cm *DefaultCacheManager) getFromTier(ctx context.Context, filePath string,
 	entry := &CacheEntry{
 		FilePath:     filePath,
 		StoragePath:  filePath,
-		Size:         size,
+		Size:         int64(len(data)),
 		LastAccessed: time.Now(),
 		Tier:         tier,
 		Data:         data,
 	}
 
 	// Verify checksum on NVMe reads if sidecar exists
-	if tier == TierNVMe {
+	if tier == TierNVMe && verifyNVMeChecksum {
 		if checksumData, err := storage.Read(ctx, filePath+".sha256"); err == nil {
 			storedChecksum := string(checksumData)
 			h := sha256.Sum256(data)
@@ -1447,7 +1570,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	chunkStart time.Time,
 ) ([]byte, error) {
 	tierStart := time.Now()
-	if chunkEntry, err := cm.getFromTier(ctx, chunkPath, TierNVMe); err == nil {
+	if chunkEntry, err := cm.getFromTierNoVerify(ctx, chunkPath, TierNVMe); err == nil {
 		tierDur := time.Since(tierStart)
 		cm.metrics.RecordHit(TierNVMe)
 		cm.metrics.RecordTierRead(TierNVMe, int64(len(chunkEntry.Data)), tierDur)
@@ -1467,8 +1590,15 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		primary, secondary = remoteOrder[0], remoteOrder[1]
 	}
 	if hybridRead {
+		hybridPrimary := primary
+		hybridSecondary := secondary
+		// Keep peer-first startup, then stripe later chunks to aggregate peer+cloud
+		// bandwidth on sustained large sequential reads.
+		if primary == TierPeer && secondary == TierCloud && chunkIndex > 0 && chunkIndex%2 == 1 {
+			hybridPrimary, hybridSecondary = secondary, primary
+		}
 		hybridStart := time.Now()
-		if chunkEntry, tier, err := cm.readChunkHybridPreferPeer(ctx, chunkPath, primary, secondary); err == nil {
+		if chunkEntry, tier, err := cm.readChunkHybridHedged(ctx, chunkPath, hybridPrimary, hybridSecondary); err == nil {
 			tierDur := time.Since(hybridStart)
 			cm.metrics.RecordHit(tier)
 			cm.metrics.RecordTierRead(tier, int64(len(chunkEntry.Data)), tierDur)
@@ -1478,7 +1608,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 			return chunkData, nil
 		} else {
-			cm.traceChunkAttempt(chunkPath, chunkIndex, primary, hybridStart, err)
+			cm.traceChunkAttempt(chunkPath, chunkIndex, hybridPrimary, hybridStart, err)
 		}
 		// If hybrid path fails, continue with strict ordered fallback below.
 	}
@@ -1548,10 +1678,18 @@ func (cm *DefaultCacheManager) traceChunkTotal(chunkPath string, chunkIndex int6
 }
 
 func isExpectedTierMiss(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "file not found in tier")
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "file not found in tier") ||
+		strings.Contains(msg, "no such file") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "status code 404")
 }
 
-func (cm *DefaultCacheManager) readChunkHybridPreferPeer(ctx context.Context, chunkPath string, primary, secondary CacheTier) (*CacheEntry, CacheTier, error) {
+func (cm *DefaultCacheManager) readChunkHybridHedged(ctx context.Context, chunkPath string, primary, secondary CacheTier) (*CacheEntry, CacheTier, error) {
 	type readResult struct {
 		entry *CacheEntry
 		tier  CacheTier
@@ -1562,35 +1700,54 @@ func (cm *DefaultCacheManager) readChunkHybridPreferPeer(ctx context.Context, ch
 	defer cancel()
 
 	resultCh := make(chan readResult, 2)
+
 	go func() {
 		entry, err := cm.getFromTier(readCtx, chunkPath, primary)
 		resultCh <- readResult{entry: entry, tier: primary, err: err}
 	}()
-	go func() {
-		timer := time.NewTimer(hybridCloudHedgeDelay)
-		defer timer.Stop()
-		select {
-		case <-readCtx.Done():
-			return
-		case <-timer.C:
-		}
-		entry, err := cm.getFromTier(readCtx, chunkPath, secondary)
-		resultCh <- readResult{entry: entry, tier: secondary, err: err}
-	}()
 
-	var lastErr error
-	for i := 0; i < 2; i++ {
+	expectedResults := 1
+	if release, ok := cm.tryAcquireHedgeSlot(); ok {
+		expectedResults = 2
+		go func() {
+			defer release()
+			timer := time.NewTimer(cm.effectiveHybridHedgeDelay(primary, secondary))
+			defer timer.Stop()
+			select {
+			case <-readCtx.Done():
+				return
+			case <-timer.C:
+			}
+			entry, err := cm.getFromTier(readCtx, chunkPath, secondary)
+			resultCh <- readResult{entry: entry, tier: secondary, err: err}
+		}()
+	}
+
+	var primaryErr error
+	var secondaryErr error
+	for i := 0; i < expectedResults; i++ {
 		res := <-resultCh
 		if res.err == nil {
 			cancel()
 			return res.entry, res.tier, nil
 		}
-		lastErr = res.err
+		if res.tier == primary {
+			primaryErr = res.err
+		} else {
+			secondaryErr = res.err
+		}
 	}
-	if lastErr == nil {
-		lastErr = errors.New("hybrid chunk read failed")
+
+	if primaryErr != nil && secondaryErr != nil {
+		return nil, 0, fmt.Errorf("hybrid chunk read failed (primary=%v, secondary=%v)", primaryErr, secondaryErr)
 	}
-	return nil, 0, lastErr
+	if primaryErr != nil {
+		return nil, 0, primaryErr
+	}
+	if secondaryErr != nil {
+		return nil, 0, secondaryErr
+	}
+	return nil, 0, errors.New("hybrid chunk read failed")
 }
 
 func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, bool) {
@@ -1753,6 +1910,20 @@ func (m *CacheMetrics) RecordTierRead(tier CacheTier, bytes int64, dur time.Dura
 		m.CloudReadBytes.Add(bytes)
 		m.CloudReadNanos.Add(nanos)
 		m.CloudReadOps.Add(1)
+	}
+}
+
+// TierReadMBps returns the observed aggregate throughput for a tier.
+func (m *CacheMetrics) TierReadMBps(tier CacheTier) float64 {
+	switch tier {
+	case TierNVMe:
+		return bytesPerSecToMBps(m.NVMeReadBytes.Load(), m.NVMeReadNanos.Load())
+	case TierPeer:
+		return bytesPerSecToMBps(m.PeerReadBytes.Load(), m.PeerReadNanos.Load())
+	case TierCloud:
+		return bytesPerSecToMBps(m.CloudReadBytes.Load(), m.CloudReadNanos.Load())
+	default:
+		return 0
 	}
 }
 

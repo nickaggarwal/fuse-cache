@@ -1,13 +1,15 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	peerGRPCInitialWindowBytes     = 16 * 1024 * 1024
+	peerGRPCInitialConnWindowBytes = 64 * 1024 * 1024
+	peerGRPCMaxMessageBytes        = 64 * 1024 * 1024
 )
 
 // PeerStorage implements TierStorage for peer-to-peer storage via gRPC.
@@ -72,6 +80,12 @@ func (ps *PeerStorage) getOrDial(addr string) (*grpc.ClientConn, error) {
 
 	conn, err := grpc.Dial(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialWindowSize(peerGRPCInitialWindowBytes),
+		grpc.WithInitialConnWindowSize(peerGRPCInitialConnWindowBytes),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(peerGRPCMaxMessageBytes),
+			grpc.MaxCallSendMsgSize(peerGRPCMaxMessageBytes),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial peer %s: %v", addr, err)
@@ -87,6 +101,8 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	preferred, fallback := ps.partitionPeersForPath(ctx, path, peers)
+	preferred = orderedPeersForPath(preferred, path)
+	fallback = orderedPeersForPath(fallback, path+"#fallback")
 
 	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
 	ordered = append(ordered, preferred...)
@@ -111,6 +127,44 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("file not found on any peer")
+}
+
+func orderedPeersForPath(peers []*coordinator.PeerInfo, key string) []*coordinator.PeerInfo {
+	if len(peers) <= 1 {
+		return peers
+	}
+	start := peerStartIndexForKey(key, len(peers))
+	ordered := make([]*coordinator.PeerInfo, 0, len(peers))
+	ordered = append(ordered, peers[start:]...)
+	ordered = append(ordered, peers[:start]...)
+	return ordered
+}
+
+func peerStartIndexForKey(key string, count int) int {
+	if count <= 1 {
+		return 0
+	}
+	if idx, ok := chunkIndexFromPath(key); ok {
+		if idx < 0 {
+			idx = -idx
+		}
+		return int(idx % int64(count))
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(count))
+}
+
+func chunkIndexFromPath(path string) (int64, bool) {
+	idx := strings.LastIndex(path, "_chunk_")
+	if idx <= 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(path[idx+len("_chunk_"):], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func (ps *PeerStorage) partitionPeersForPath(ctx context.Context, path string, peers []*coordinator.PeerInfo) ([]*coordinator.PeerInfo, []*coordinator.PeerInfo) {
@@ -384,7 +438,22 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) 
 		return nil, err
 	}
 
-	var buf bytes.Buffer
+	first, err := stream.Recv()
+	if err == io.EOF {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Chunk streams are commonly 4MiB slices; pre-allocate enough for typical
+	// fused chunk objects to avoid repeated growth.
+	capHint := len(first.Data) * 8
+	if capHint < len(first.Data) {
+		capHint = len(first.Data)
+	}
+	data := make([]byte, 0, capHint)
+	data = append(data, first.Data...)
+
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
@@ -393,9 +462,9 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) 
 		if err != nil {
 			return nil, err
 		}
-		buf.Write(chunk.Data)
+		data = append(data, chunk.Data...)
 	}
-	return buf.Bytes(), nil
+	return data, nil
 }
 
 func (ps *PeerStorage) writeToPeer(ctx context.Context, grpcAddr, path string, data []byte) error {

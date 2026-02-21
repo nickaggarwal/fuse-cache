@@ -27,6 +27,7 @@ import (
 func main() {
 	var (
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
+		fuseBackendName = flag.String("fuse-backend", "bazil", "FUSE backend: bazil or gofuse")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
 		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator HTTP address")
 		coordinatorGRPC = flag.String("coordinator-grpc", "localhost:9080", "Coordinator gRPC address")
@@ -47,6 +48,9 @@ func main() {
 		azureAccount   = flag.String("azure-account", "", "Azure storage account name")
 		azureKey       = flag.String("azure-key", "", "Azure storage account key")
 		azureContainer = flag.String("azure-container", "fuse-cache", "Azure blob container name")
+		azureDLConc    = flag.Int("azure-download-concurrency", 8, "Azure parallel download concurrency")
+		azureDLBlockMB = flag.Int("azure-download-block-size-mb", 4, "Azure parallel download block size in MB")
+		azureDLMinMB   = flag.Int("azure-parallel-download-min-size-mb", 8, "Minimum blob size in MB to use Azure parallel download")
 
 		// GCP config
 		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
@@ -58,6 +62,8 @@ func main() {
 		parallelReads   = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
 		prefetchChunks  = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
 		rangeChunkCache = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
+		hybridHedgeMS   = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
+		hybridHedgeMax  = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
 		mountRetries    = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS     = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -91,6 +97,9 @@ func main() {
 	if v := os.Getenv("COORDINATOR_GRPC_ADDR"); v != "" {
 		*coordinatorGRPC = v
 	}
+	if v := os.Getenv("FUSE_BACKEND"); v != "" && *fuseBackendName == "bazil" {
+		*fuseBackendName = v
+	}
 
 	logger := log.New(os.Stdout, "[CLIENT] ", log.LstdFlags)
 	logger.Printf("Starting FUSE client with ID: %s", *peerID)
@@ -118,17 +127,19 @@ func main() {
 
 	// Create cache configuration
 	cacheConfig := &cache.CacheConfig{
-		NVMePath:            *nvmePath,
-		MaxNVMeSize:         int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
-		MaxPeerSize:         int64(*peerMaxGB) * 1024 * 1024 * 1024,
-		PeerTimeout:         30 * time.Second,
-		CloudTimeout:        60 * time.Second,
-		CoordinatorAddr:     *coordinatorAddr,
-		Coordinator:         coordClient,
-		ChunkSize:           int64(*chunkSizeMB) * 1024 * 1024,
-		ParallelRangeReads:  *parallelReads,
-		RangePrefetchChunks: *prefetchChunks,
-		RangeChunkCacheSize: *rangeChunkCache,
+		NVMePath:                   *nvmePath,
+		MaxNVMeSize:                int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
+		MaxPeerSize:                int64(*peerMaxGB) * 1024 * 1024 * 1024,
+		PeerTimeout:                30 * time.Second,
+		CloudTimeout:               60 * time.Second,
+		CoordinatorAddr:            *coordinatorAddr,
+		Coordinator:                coordClient,
+		ChunkSize:                  int64(*chunkSizeMB) * 1024 * 1024,
+		ParallelRangeReads:         *parallelReads,
+		RangePrefetchChunks:        *prefetchChunks,
+		RangeChunkCacheSize:        *rangeChunkCache,
+		HybridCloudHedgeDelay:      time.Duration(*hybridHedgeMS) * time.Millisecond,
+		HybridMaxSecondaryInflight: *hybridHedgeMax,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -136,6 +147,9 @@ func main() {
 		AzureStorageAccount:           *azureAccount,
 		AzureStorageKey:               *azureKey,
 		AzureContainerName:            *azureContainer,
+		AzureDownloadConcurrency:      *azureDLConc,
+		AzureDownloadBlockSizeBytes:   int64(*azureDLBlockMB) * 1024 * 1024,
+		AzureParallelDownloadMinBytes: int64(*azureDLMinMB) * 1024 * 1024,
 		GCPBucket:                     *gcpBucket,
 		LocalPeerID:                   *peerID,
 		PeerReadThroughputBytesPerSec: *peerReadMBps * 1024 * 1024,
@@ -178,6 +192,46 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_RANGE_CHUNK_CACHE_SIZE value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_AZURE_DOWNLOAD_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.AzureDownloadConcurrency = n
+			*azureDLConc = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_AZURE_DOWNLOAD_CONCURRENCY value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_AZURE_DOWNLOAD_BLOCK_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.AzureDownloadBlockSizeBytes = int64(n) * 1024 * 1024
+			*azureDLBlockMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_AZURE_DOWNLOAD_BLOCK_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_AZURE_PARALLEL_DOWNLOAD_MIN_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cacheConfig.AzureParallelDownloadMinBytes = int64(n) * 1024 * 1024
+			*azureDLMinMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_AZURE_PARALLEL_DOWNLOAD_MIN_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_HYBRID_HEDGE_DELAY_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cacheConfig.HybridCloudHedgeDelay = time.Duration(n) * time.Millisecond
+			*hybridHedgeMS = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_HYBRID_HEDGE_DELAY_MS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_HYBRID_MAX_SECONDARY_INFLIGHT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.HybridMaxSecondaryInflight = n
+			*hybridHedgeMax = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_HYBRID_MAX_SECONDARY_INFLIGHT value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_MOUNT_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			*mountRetries = n
@@ -204,7 +258,12 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Failed to listen on gRPC port %d: %v", *grpcPort, err)
 	}
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(
+		grpc.InitialWindowSize(16*1024*1024),
+		grpc.InitialConnWindowSize(64*1024*1024),
+		grpc.MaxRecvMsgSize(64*1024*1024),
+		grpc.MaxSendMsgSize(64*1024*1024),
+	)
 	pb.RegisterPeerServiceServer(grpcSrv, cache.NewPeerGRPCServer(cacheManager))
 
 	go func() {
@@ -229,19 +288,29 @@ func main() {
 		}
 	}()
 
-	// Create FUSE filesystem
-	filesystem := fusefs.NewFileSystem(cacheManager)
+	// Create FUSE backend
+	var filesystem fuseMountBackend
+	switch backend := normalizeFuseBackend(*fuseBackendName); backend {
+	case "bazil":
+		filesystem = &bazilFuseBackend{fs: fusefs.NewFileSystem(cacheManager)}
+		*fuseBackendName = "bazil"
+	case "gofuse":
+		filesystem = fusefs.NewGoFuseFileSystem(cacheManager)
+		*fuseBackendName = "gofuse"
+	default:
+		logger.Fatalf("Unsupported FUSE backend %q (expected bazil or gofuse)", *fuseBackendName)
+	}
 
 	// Mount the FUSE filesystem
-	logger.Printf("Mounting FUSE filesystem at: %s", *mountPoint)
-	conn, err := mountWithRetry(ctx, filesystem, *mountPoint, *mountRetries, time.Duration(*mountDelayS)*time.Second, logger)
+	logger.Printf("Mounting FUSE filesystem at: %s (backend=%s)", *mountPoint, *fuseBackendName)
+	err = mountWithRetry(ctx, filesystem, *mountPoint, *mountRetries, time.Duration(*mountDelayS)*time.Second, logger)
 	if err != nil {
 		logger.Fatalf("Failed to mount FUSE filesystem: %v", err)
 	}
 
 	// Start serving the filesystem in a goroutine
 	go func() {
-		if err := filesystem.Serve(ctx, conn); err != nil {
+		if err := filesystem.Serve(ctx); err != nil {
 			logger.Printf("FUSE filesystem server error: %v", err)
 		}
 	}()
@@ -254,12 +323,18 @@ func main() {
 	logger.Printf("- gRPC port: %d", *grpcPort)
 	logger.Printf("- Coordinator HTTP: %s", *coordinatorAddr)
 	logger.Printf("- Coordinator gRPC: %s", *coordinatorGRPC)
+	logger.Printf("- FUSE backend: %s", *fuseBackendName)
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
 	logger.Printf("- Peer read threshold bytes: %d", cacheConfig.MaxPeerSize)
 	logger.Printf("- Assumed per-peer read throughput MB/s: %d", *peerReadMBps)
 	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
 	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
 	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
+	logger.Printf("- Azure download concurrency: %d", cacheConfig.AzureDownloadConcurrency)
+	logger.Printf("- Azure download block size MB: %d", cacheConfig.AzureDownloadBlockSizeBytes/(1024*1024))
+	logger.Printf("- Azure parallel download min size MB: %d", cacheConfig.AzureParallelDownloadMinBytes/(1024*1024))
+	logger.Printf("- Hybrid hedge delay ms: %d", *hybridHedgeMS)
+	logger.Printf("- Hybrid max secondary inflight: %d", *hybridHedgeMax)
 	logger.Printf("- FUSE mount retries: %d", *mountRetries)
 	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
 
@@ -367,7 +442,7 @@ func getLocalIP() string {
 	return "localhost"
 }
 
-func mountWithRetry(ctx context.Context, filesystem *fusefs.FileSystem, mountPoint string, retries int, baseDelay time.Duration, logger *log.Logger) (*fusepkg.Conn, error) {
+func mountWithRetry(ctx context.Context, filesystem fuseMountBackend, mountPoint string, retries int, baseDelay time.Duration, logger *log.Logger) error {
 	if retries < 1 {
 		retries = 1
 	}
@@ -381,9 +456,9 @@ func mountWithRetry(ctx context.Context, filesystem *fusefs.FileSystem, mountPoi
 			logger.Printf("Mount cleanup warning for %s: %v", mountPoint, err)
 		}
 
-		conn, err := filesystem.Mount(ctx, mountPoint)
+		err := filesystem.Mount(ctx, mountPoint)
 		if err == nil {
-			return conn, nil
+			return nil
 		}
 		lastErr = err
 		logger.Printf("FUSE mount attempt %d/%d failed at %s: %v", attempt, retries, mountPoint, err)
@@ -395,11 +470,11 @@ func mountWithRetry(ctx context.Context, filesystem *fusefs.FileSystem, mountPoi
 		wait := time.Duration(attempt) * baseDelay
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-time.After(wait):
 		}
 	}
-	return nil, fmt.Errorf("mount retries exhausted for %s: %w", mountPoint, lastErr)
+	return fmt.Errorf("mount retries exhausted for %s: %w", mountPoint, lastErr)
 }
 
 func cleanupStaleMountpoint(ctx context.Context, mountPoint string, logger *log.Logger) error {
@@ -428,4 +503,47 @@ func cleanupStaleMountpoint(ctx context.Context, mountPoint string, logger *log.
 		return err
 	}
 	return lastErr
+}
+
+type fuseMountBackend interface {
+	Mount(ctx context.Context, mountPoint string) error
+	Serve(ctx context.Context) error
+	Unmount(mountPoint string) error
+}
+
+type bazilFuseBackend struct {
+	fs   *fusefs.FileSystem
+	conn *fusepkg.Conn
+}
+
+func (b *bazilFuseBackend) Mount(ctx context.Context, mountPoint string) error {
+	conn, err := b.fs.Mount(ctx, mountPoint)
+	if err != nil {
+		return err
+	}
+	b.conn = conn
+	return nil
+}
+
+func (b *bazilFuseBackend) Serve(ctx context.Context) error {
+	if b.conn == nil {
+		return fmt.Errorf("bazil backend serve called before mount")
+	}
+	return b.fs.Serve(ctx, b.conn)
+}
+
+func (b *bazilFuseBackend) Unmount(mountPoint string) error {
+	return b.fs.Unmount(mountPoint)
+}
+
+func normalizeFuseBackend(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "", "bazil":
+		return "bazil"
+	case "gofuse", "go-fuse", "go_fuse":
+		return "gofuse"
+	default:
+		return v
+	}
 }

@@ -10,7 +10,7 @@ import (
 	pb "fuse-client/internal/pb"
 )
 
-const grpcChunkSize = 1 * 1024 * 1024 // 1MiB streaming chunks
+const grpcChunkSize = 4 * 1024 * 1024 // 4MiB streaming chunks
 
 // PeerGRPCServer implements the PeerService gRPC service.
 // Each client node runs this so other peers can read/write files via gRPC.

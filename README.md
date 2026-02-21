@@ -26,9 +26,10 @@ The system consists of:
   - Write path uses buffered growth to avoid O(n^2) realloc/copy behavior
   - Chunked uploads avoid unbounded goroutine fanout
   - Chunked reads use range-based reads with chunk reuse to avoid full-file in-memory reconstruction
-- **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and 1GB benchmarking
+- **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and read benchmarking
   - `test-smart-read.sh` supports cross-pod read/write benchmarks for arbitrary sizes (e.g. 100MB/1GB/5GB)
   - `test-smart-read-5gb.sh` remains as a compatibility wrapper
+  - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
 
 ## Components
 
@@ -441,6 +442,19 @@ Examples:
 
 # Explicit writer and reader pods
 ./scripts/ops/test-smart-read-5gb.sh fuse-system-aztest client-a client-b
+```
+
+### Run go-fuse cached-read suite (1GiB + 5GiB)
+
+```bash
+# Ensure go-fuse backend is enabled in the release
+helm upgrade fuse-cache-aztest charts/fuse-cache -n fuse-system-aztest \
+  --reuse-values \
+  --set config.fuseBackend=gofuse \
+  --set config.goFuseEnablePassthrough=true
+
+# Run 1GiB + 5GiB cold-read vs cached-read throughput suite
+./scripts/ops/test-gofuse-cached-read-suite.sh fuse-system-aztest
 ```
 
 ## License

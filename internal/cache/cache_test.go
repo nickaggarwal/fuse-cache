@@ -74,13 +74,15 @@ func newTestCacheManager() *DefaultCacheManager {
 	cloud := newMockStorage()
 	return &DefaultCacheManager{
 		config: &CacheConfig{
-			NVMePath:           "/tmp/test",
-			MaxNVMeSize:        1024 * 1024, // 1MB
-			ChunkSize:          4 * 1024 * 1024,
-			CloudRetryCount:    1,
-			CloudRetryBaseWait: time.Millisecond,
-			MinPeerReplicas:    3,
-			CloudTimeout:       5 * time.Second,
+			NVMePath:                   "/tmp/test",
+			MaxNVMeSize:                1024 * 1024, // 1MB
+			ChunkSize:                  4 * 1024 * 1024,
+			CloudRetryCount:            1,
+			CloudRetryBaseWait:         time.Millisecond,
+			MinPeerReplicas:            3,
+			CloudTimeout:               5 * time.Second,
+			HybridCloudHedgeDelay:      20 * time.Millisecond,
+			HybridMaxSecondaryInflight: 16,
 		},
 		nvmeStorage:  nvme,
 		peerStorage:  peer,
@@ -90,6 +92,7 @@ func newTestCacheManager() *DefaultCacheManager {
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
 		hybridHints:  make(map[string]hybridReadHint),
+		hedgeLimiter: make(chan struct{}, 16),
 	}
 }
 
@@ -530,6 +533,67 @@ func TestCacheManager_ReadRange_HybridSplitsPeerAndCloud(t *testing.T) {
 	}
 	if cloud.reads() < 1 {
 		t.Fatalf("cloud reads = %d, want >= 1", cloud.reads())
+	}
+}
+
+func TestCacheManager_ReadRange_HybridHedgeUsesCloudWhenPeerStalls(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	peer := newCountingStorageWithDelay(250 * time.Millisecond)
+	cloud := newCountingStorageWithDelay(5 * time.Millisecond)
+	cm.peerStorage = peer
+	cm.cloudStorage = cloud
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 0
+	cm.config.MaxPeerSize = int64(10 * 1024 * 1024 * 1024)
+	cm.config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
+	cm.config.MetadataRefreshTTL = 5 * time.Second
+	cm.config.HybridCloudHedgeDelay = 10 * time.Millisecond
+	cm.hedgeLimiter = make(chan struct{}, 8)
+
+	coord := coordinator.NewCoordinatorService()
+	cm.config.Coordinator = coord
+
+	path := "/hybrid-hedge.bin"
+	chunk0 := path + "_chunk_0"
+
+	if err := peer.Write(ctx, chunk0, []byte("PEER")); err != nil {
+		t.Fatalf("peer write chunk0: %v", err)
+	}
+	if err := cloud.Write(ctx, chunk0, []byte("CLOD")); err != nil {
+		t.Fatalf("cloud write chunk0: %v", err)
+	}
+
+	fileSize := int64(500 * 1024 * 1024)
+	for _, loc := range []*coordinator.FileLocation{
+		{FilePath: path, PeerID: "peer-1", StorageTier: "peer", FileSize: fileSize},
+		{FilePath: path, PeerID: "cloud-1", StorageTier: "cloud", FileSize: fileSize},
+	} {
+		if err := coord.UpdateFileLocation(ctx, loc); err != nil {
+			t.Fatalf("UpdateFileLocation: %v", err)
+		}
+	}
+
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{
+		FilePath:  path,
+		Size:      fileSize,
+		IsChunked: true,
+		NumChunks: 1,
+	}
+	cm.mu.Unlock()
+
+	start := time.Now()
+	got, err := cm.ReadRange(ctx, path, 0, 4)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if string(got) != "CLOD" {
+		t.Fatalf("ReadRange data = %q, want cloud hedged result", string(got))
+	}
+	if time.Since(start) >= 200*time.Millisecond {
+		t.Fatalf("ReadRange took too long; expected hedged cloud fallback")
 	}
 }
 

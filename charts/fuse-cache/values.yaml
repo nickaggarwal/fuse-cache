@@ -53,7 +53,14 @@ config:
   parallelRangeReads: "8"
   rangePrefetchChunks: "2"
   rangeChunkCacheSize: "16"
+  azureDownloadConcurrency: "8"
+  azureDownloadBlockSizeMB: "4"
+  azureParallelDownloadMinSizeMB: "8"
+  hybridHedgeDelayMs: "20"
+  hybridMaxSecondaryInflight: "16"
   fuseIOProgressMB: "512"
+  fuseBackend: "bazil"
+  goFuseEnablePassthrough: "false"
 
 secrets:
   aws:
