@@ -38,6 +38,17 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["coordinator"]
           args: ["-port", "{{ .Values.coordinator.httpPort }}"]
+          envFrom:
+            - configMapRef:
+                name: fuse-config
+            {{- if .Values.secrets.azure.create }}
+            - secretRef:
+                name: {{ .Values.secrets.azure.name }}
+            {{- end }}
+            {{- if .Values.secrets.aws.create }}
+            - secretRef:
+                name: {{ .Values.secrets.aws.name }}
+            {{- end }}
           ports:
             - containerPort: {{ .Values.coordinator.httpPort }}
               name: http

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -63,6 +64,35 @@ func (m *mockCacheManager) WriteTo(ctx context.Context, filePath string, w io.Wr
 	}
 	n, err := w.Write(e.Data)
 	return int64(n), err
+}
+
+type mockCloudCacheManager struct {
+	*mockCacheManager
+	cloud map[string][]byte
+}
+
+func newMockCloudCacheManager() *mockCloudCacheManager {
+	return &mockCloudCacheManager{
+		mockCacheManager: newMockCacheManager(),
+		cloud:            make(map[string][]byte),
+	}
+}
+
+func (m *mockCloudCacheManager) WriteCloud(ctx context.Context, path string, data []byte) error {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	m.cloud[path] = cp
+	return nil
+}
+
+func (m *mockCloudCacheManager) ReadCloud(ctx context.Context, path string) ([]byte, error) {
+	data, ok := m.cloud[path]
+	if !ok {
+		return nil, context.Canceled
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	return cp, nil
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -269,5 +299,134 @@ func TestSanitizePath(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("sanitizePath(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestFSSnapshotAndRestore(t *testing.T) {
+	cm := newMockCacheManager()
+	cm.entries["/snap/a.txt"] = &cache.CacheEntry{
+		FilePath:     "/snap/a.txt",
+		Data:         []byte("alpha"),
+		Size:         5,
+		LastAccessed: time.Now(),
+	}
+	cm.entries["/snap/b.txt"] = &cache.CacheEntry{
+		FilePath:     "/snap/b.txt",
+		Data:         []byte("beta"),
+		Size:         4,
+		LastAccessed: time.Now(),
+	}
+
+	h := NewHandler(cm, nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	// Snapshot with data
+	reqBody := bytes.NewBufferString(`{"prefix":"/snap","include_data":true}`)
+	req := httptest.NewRequest("POST", "/api/fs/snapshot", reqBody)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var snap fsSnapshot
+	if err := json.NewDecoder(w.Body).Decode(&snap); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(snap.Files) != 2 {
+		t.Fatalf("snapshot files = %d, want 2", len(snap.Files))
+	}
+	for _, f := range snap.Files {
+		if f.ContentB64 == "" {
+			t.Fatalf("file %s missing content_b64", f.FilePath)
+		}
+		if _, err := base64.StdEncoding.DecodeString(f.ContentB64); err != nil {
+			t.Fatalf("invalid content_b64 for %s: %v", f.FilePath, err)
+		}
+	}
+
+	// Clear cache and restore from snapshot
+	cm.entries = map[string]*cache.CacheEntry{}
+	restoreBody, _ := json.Marshal(snap)
+	req = httptest.NewRequest("POST", "/api/fs/restore", bytes.NewReader(restoreBody))
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if _, ok := cm.entries["/snap/a.txt"]; !ok {
+		t.Fatalf("restored entry /snap/a.txt missing")
+	}
+	if got := string(cm.entries["/snap/a.txt"].Data); got != "alpha" {
+		t.Fatalf("restored /snap/a.txt = %q, want alpha", got)
+	}
+	if got := string(cm.entries["/snap/b.txt"].Data); got != "beta" {
+		t.Fatalf("restored /snap/b.txt = %q, want beta", got)
+	}
+}
+
+func TestFSSnapshotAndRestoreViaCloudPath(t *testing.T) {
+	cm := newMockCloudCacheManager()
+	cm.entries["/cloud/a.txt"] = &cache.CacheEntry{
+		FilePath:     "/cloud/a.txt",
+		Data:         []byte("alpha-cloud"),
+		Size:         11,
+		LastAccessed: time.Now(),
+	}
+
+	h := NewHandler(cm, nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	cloudPath := "snapshots/fs/test-peer/cloud-a.json"
+	reqBody := bytes.NewBufferString(`{"prefix":"/cloud","include_data":true,"persist_cloud":true,"cloud_path":"` + cloudPath + `"}`)
+	req := httptest.NewRequest("POST", "/api/fs/snapshot", reqBody)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var snap fsSnapshot
+	if err := json.NewDecoder(w.Body).Decode(&snap); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if !snap.PersistedToCloud || snap.CloudPath != cloudPath {
+		t.Fatalf("snapshot cloud flags not set as expected: persisted=%v path=%q", snap.PersistedToCloud, snap.CloudPath)
+	}
+	if _, ok := cm.cloud[cloudPath]; !ok {
+		t.Fatalf("cloud snapshot object missing at %s", cloudPath)
+	}
+
+	// Overwrite local data and restore from cloud path only.
+	cm.entries["/cloud/a.txt"].Data = []byte("mutated")
+	restoreReq := bytes.NewBufferString(`{"cloud_path":"` + cloudPath + `","overwrite":true}`)
+	req = httptest.NewRequest("POST", "/api/fs/restore", restoreReq)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := string(cm.entries["/cloud/a.txt"].Data); got != "alpha-cloud" {
+		t.Fatalf("restored /cloud/a.txt = %q, want alpha-cloud", got)
+	}
+}
+
+func TestNetProbeEndpoint(t *testing.T) {
+	cm := newMockCacheManager()
+	h := NewHandler(cm, nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	req := httptest.NewRequest("GET", "/api/netprobe?bytes=262144", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := len(w.Body.Bytes()); got != 262144 {
+		t.Fatalf("response bytes = %d, want 262144", got)
+	}
+	if hdr := w.Header().Get("X-Netprobe-Bytes"); hdr != "262144" {
+		t.Fatalf("X-Netprobe-Bytes = %q, want 262144", hdr)
 	}
 }

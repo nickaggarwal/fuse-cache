@@ -4,11 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -403,6 +406,29 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 	// Send periodic heartbeats
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	netProbeEnabled := true
+	if raw := strings.TrimSpace(os.Getenv("FUSE_NETPROBE_ENABLED")); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			netProbeEnabled = parsed
+		}
+	}
+	netProbeBytes := envInt("FUSE_NETPROBE_BYTES", 1*1024*1024)
+	if netProbeBytes < 4*1024 {
+		netProbeBytes = 4 * 1024
+	}
+	if netProbeBytes > 32*1024*1024 {
+		netProbeBytes = 32 * 1024 * 1024
+	}
+	netProbeEveryHB := envInt("FUSE_NETPROBE_EVERY_HEARTBEATS", 2)
+	if netProbeEveryHB < 1 {
+		netProbeEveryHB = 1
+	}
+	netProbeTimeout := time.Duration(envInt("FUSE_NETPROBE_TIMEOUT_MS", 2000)) * time.Millisecond
+	if netProbeTimeout < 250*time.Millisecond {
+		netProbeTimeout = 250 * time.Millisecond
+	}
+	logger.Printf("Network probe enabled=%t bytes=%d every_heartbeats=%d timeout_ms=%d", netProbeEnabled, netProbeBytes, netProbeEveryHB, netProbeTimeout.Milliseconds())
+	heartbeatCount := 0
 
 	for {
 		select {
@@ -410,7 +436,22 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 			return
 		case <-ticker.C:
 			used, capacity := cm.Stats()
-			if err := coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used); err != nil {
+			heartbeatCount++
+
+			metrics := (*coordinator.PeerNetworkMetrics)(nil)
+			if netProbeEnabled && heartbeatCount%netProbeEveryHB == 0 {
+				probeCtx, cancel := context.WithTimeout(ctx, netProbeTimeout)
+				metrics = measurePeerNetwork(probeCtx, coordClient, peerID, netProbeBytes, logger)
+				cancel()
+			}
+
+			var err error
+			if updater, ok := coordClient.(coordinator.NetworkStatusUpdater); ok {
+				err = updater.UpdatePeerStatusWithNetwork(ctx, peerID, "active", capacity-used, used, metrics)
+			} else {
+				err = coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used)
+			}
+			if err != nil {
 				logger.Printf("Failed to update peer status: %v (attempting re-register)", err)
 				peerInfo.AvailableSpace = capacity - used
 				peerInfo.UsedSpace = used
@@ -419,6 +460,100 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 				}
 			}
 		}
+	}
+}
+
+func envInt(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func measurePeerNetwork(ctx context.Context, coordClient coordinator.Coordinator, localPeerID string, probeBytes int, logger *log.Logger) *coordinator.PeerNetworkMetrics {
+	peers, err := coordClient.GetPeers(ctx, localPeerID)
+	if err != nil || len(peers) == 0 {
+		if err != nil {
+			logger.Printf("Network probe skipped (peers unavailable): %v", err)
+		}
+		return nil
+	}
+
+	// Deterministic target selection: lowest peer ID among active peers.
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].ID < peers[j].ID
+	})
+	var target *coordinator.PeerInfo
+	for _, peer := range peers {
+		if peer == nil || peer.Status != "active" || strings.TrimSpace(peer.Address) == "" {
+			continue
+		}
+		target = peer
+		break
+	}
+	if target == nil {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	latencyURL := fmt.Sprintf("http://%s/api/health", target.Address)
+	latencyStart := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latencyURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Printf("Network probe latency check failed for %s: %v", target.ID, err)
+		return nil
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Printf("Network probe latency check status=%d for peer %s", resp.StatusCode, target.ID)
+		return nil
+	}
+	latencyMs := float64(time.Since(latencyStart).Milliseconds())
+
+	throughputURL := fmt.Sprintf("http://%s/api/netprobe?bytes=%d", target.Address, probeBytes)
+	speedStart := time.Now()
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, throughputURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		logger.Printf("Network probe throughput check failed for %s: %v", target.ID, err)
+		return nil
+	}
+	n, copyErr := io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if copyErr != nil {
+		logger.Printf("Network probe throughput read failed for %s: %v", target.ID, copyErr)
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Printf("Network probe throughput status=%d for peer %s", resp.StatusCode, target.ID)
+		return nil
+	}
+	dur := time.Since(speedStart)
+	if dur <= 0 {
+		return nil
+	}
+
+	speedMBps := (float64(n) / (1024.0 * 1024.0)) / dur.Seconds()
+	return &coordinator.PeerNetworkMetrics{
+		SpeedMBps:   speedMBps,
+		LatencyMs:   latencyMs,
+		ProbeBytes:  n,
+		ProbeTarget: target.ID,
+		ProbedAt:    time.Now(),
 	}
 }
 

@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,6 +69,54 @@ func (c *GRPCCoordinatorClient) UpdatePeerStatus(ctx context.Context, peerID str
 		UsedSpace:      usedSpace,
 	})
 	return err
+}
+
+func (c *GRPCCoordinatorClient) UpdatePeerStatusWithNetwork(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64, metrics *PeerNetworkMetrics) error {
+	payload := map[string]interface{}{
+		"peer_id":         peerID,
+		"status":          status,
+		"available_space": availableSpace,
+		"used_space":      usedSpace,
+	}
+	if metrics != nil {
+		if metrics.SpeedMBps > 0 {
+			payload["network_speed_mbps"] = metrics.SpeedMBps
+		}
+		if metrics.LatencyMs > 0 {
+			payload["network_latency_ms"] = metrics.LatencyMs
+		}
+		if metrics.ProbeBytes > 0 {
+			payload["network_probe_bytes"] = metrics.ProbeBytes
+		}
+		if metrics.ProbeTarget != "" {
+			payload["network_probe_target"] = metrics.ProbeTarget
+		}
+		if !metrics.ProbedAt.IsZero() {
+			payload["network_probed_at"] = metrics.ProbedAt
+		}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("http://%s/api/peers/status", c.httpAddr), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("update peer status failed: http %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *GRPCCoordinatorClient) GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error) {

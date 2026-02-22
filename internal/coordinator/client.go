@@ -10,6 +10,20 @@ import (
 	"time"
 )
 
+// PeerNetworkMetrics captures optional peer-reported network probe telemetry.
+type PeerNetworkMetrics struct {
+	SpeedMBps   float64   `json:"network_speed_mbps,omitempty"`
+	LatencyMs   float64   `json:"network_latency_ms,omitempty"`
+	ProbeBytes  int64     `json:"network_probe_bytes,omitempty"`
+	ProbeTarget string    `json:"network_probe_target,omitempty"`
+	ProbedAt    time.Time `json:"network_probed_at,omitempty"`
+}
+
+// NetworkStatusUpdater extends coordinator status updates with network telemetry.
+type NetworkStatusUpdater interface {
+	UpdatePeerStatusWithNetwork(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64, metrics *PeerNetworkMetrics) error
+}
+
 // Coordinator defines the interface for coordinator operations.
 // Both CoordinatorService (server-side) and CoordinatorClient (HTTP client) implement this.
 type Coordinator interface {
@@ -88,11 +102,32 @@ func (cc *CoordinatorClient) GetPeers(ctx context.Context, requesterID string) (
 }
 
 func (cc *CoordinatorClient) UpdatePeerStatus(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64) error {
+	return cc.UpdatePeerStatusWithNetwork(ctx, peerID, status, availableSpace, usedSpace, nil)
+}
+
+func (cc *CoordinatorClient) UpdatePeerStatusWithNetwork(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64, metrics *PeerNetworkMetrics) error {
 	payload := map[string]interface{}{
 		"peer_id":         peerID,
 		"status":          status,
 		"available_space": availableSpace,
 		"used_space":      usedSpace,
+	}
+	if metrics != nil {
+		if metrics.SpeedMBps > 0 {
+			payload["network_speed_mbps"] = metrics.SpeedMBps
+		}
+		if metrics.LatencyMs > 0 {
+			payload["network_latency_ms"] = metrics.LatencyMs
+		}
+		if metrics.ProbeBytes > 0 {
+			payload["network_probe_bytes"] = metrics.ProbeBytes
+		}
+		if metrics.ProbeTarget != "" {
+			payload["network_probe_target"] = metrics.ProbeTarget
+		}
+		if !metrics.ProbedAt.IsZero() {
+			payload["network_probed_at"] = metrics.ProbedAt
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

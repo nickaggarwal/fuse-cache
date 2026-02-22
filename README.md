@@ -150,6 +150,10 @@ Options:
 - `PUT /api/peers/status` - Update peer status
 - `GET /api/files/location` - Get file location
 - `PUT /api/files/location` - Update file location
+- `GET /api/worldview` - Global metadata view of peers/files/chunks
+- `POST /api/cache/seed` - Seed a file path to a percentage of active peers
+- `POST /api/snapshot` - Snapshot coordinator metadata state to disk (optional cloud persist via `persist_cloud` + `cloud_path`)
+- `POST /api/restore` - Restore coordinator metadata state from disk (`path`) or cloud object (`cloud_path`)
 - `GET /api/stats` - Get system statistics
 - `GET /api/health` - Health check
 
@@ -164,6 +168,9 @@ Options:
 - `POST /api/peers/{peerID}/heartbeat` - Send heartbeat
 - `GET /api/cache` - List cached files
 - `GET /api/cache/stats` - Get cache statistics
+- `POST /api/fs/snapshot` - Snapshot local filesystem/cache entries (metadata + optional data payload), optionally persist snapshot JSON to cloud (`persist_cloud` + `cloud_path`)
+- `POST /api/fs/restore` - Restore local filesystem/cache entries from direct snapshot payload or from cloud snapshot object (`cloud_path`)
+- `GET /api/netprobe?bytes=N` - Stream probe payload for peer network throughput sampling
 - `GET /api/health` - Health check
 - `GET /metrics` - Prometheus metrics
 
@@ -216,13 +223,17 @@ export GCP_BUCKET=fuse-client-cache
 # Cache Configuration
 export FUSE_NVME_SIZE=10737418240  # 10GB
 export FUSE_PEER_SIZE=5368709120   # 5GB
-export FUSE_PEER_READ_MBPS=200     # assumed MB/s per peer
+export FUSE_PEER_READ_MBPS=10000   # force peer-first for cold-read performance profiling
 export FUSE_PARALLEL_RANGE_READS=8
 export FUSE_RANGE_PREFETCH_CHUNKS=2
 export FUSE_RANGE_CHUNK_CACHE_SIZE=16
 export FUSE_PEER_TIMEOUT=30s
 export FUSE_CLOUD_TIMEOUT=60s
 export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
+export FUSE_NETPROBE_ENABLED=true
+export FUSE_NETPROBE_BYTES=1048576
+export FUSE_NETPROBE_TIMEOUT_MS=2000
+export FUSE_NETPROBE_EVERY_HEARTBEATS=2
 ```
 
 `FUSE_PEER_SIZE` controls the remote read strategy threshold (in bytes).
@@ -230,6 +241,8 @@ export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
 `FUSE_PARALLEL_RANGE_READS`, `FUSE_RANGE_PREFETCH_CHUNKS`, and
 `FUSE_RANGE_CHUNK_CACHE_SIZE` tune range-read throughput behavior.
 `FUSE_IO_PROGRESS_MB` controls periodic FUSE read/write progress logging cadence.
+`FUSE_NETPROBE_*` controls optional peer-to-peer network probing and telemetry
+published to coordinator peer metadata (`network_speed_mbps`, `network_latency_ms`).
 
 ### Cache Sizes
 

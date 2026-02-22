@@ -657,6 +657,20 @@ func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w i
 
 // Put stores a file in the cache
 func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error {
+	if entry == nil {
+		return errors.New("nil cache entry")
+	}
+	if strings.TrimSpace(entry.FilePath) == "" {
+		return errors.New("empty file path")
+	}
+	// Many API callers only set FilePath. Keep StoragePath aligned by default.
+	if strings.TrimSpace(entry.StoragePath) == "" {
+		entry.StoragePath = entry.FilePath
+	}
+	if entry.Size == 0 {
+		entry.Size = int64(len(entry.Data))
+	}
+
 	cm.invalidateRangeCache(entry.FilePath)
 
 	// Compute checksum
@@ -842,7 +856,11 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	}
 
 	storage := cm.getStorageForTier(entry.Tier)
-	if err := storage.Delete(ctx, entry.StoragePath); err != nil {
+	deletePath := entry.StoragePath
+	if strings.TrimSpace(deletePath) == "" {
+		deletePath = entry.FilePath
+	}
+	if err := storage.Delete(ctx, deletePath); err != nil {
 		return err
 	}
 
@@ -853,6 +871,28 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	delete(cm.entries, filePath)
 	cm.mu.Unlock()
 	return nil
+}
+
+// WriteCloud writes arbitrary bytes to the configured cloud tier object path.
+func (cm *DefaultCacheManager) WriteCloud(ctx context.Context, path string, data []byte) error {
+	if cm.cloudStorage == nil {
+		return errors.New("cloud storage not configured")
+	}
+	if strings.TrimSpace(path) == "" {
+		return errors.New("empty cloud path")
+	}
+	return cm.cloudStorage.Write(ctx, path, data)
+}
+
+// ReadCloud reads arbitrary bytes from the configured cloud tier object path.
+func (cm *DefaultCacheManager) ReadCloud(ctx context.Context, path string) ([]byte, error) {
+	if cm.cloudStorage == nil {
+		return nil, errors.New("cloud storage not configured")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("empty cloud path")
+	}
+	return cm.cloudStorage.Read(ctx, path)
 }
 
 // List returns all cached entries

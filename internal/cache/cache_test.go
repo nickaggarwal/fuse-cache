@@ -68,6 +68,32 @@ func (m *mockStorage) Size(ctx context.Context, path string) (int64, error) {
 	return 0, context.Canceled
 }
 
+type recordingDeleteStorage struct {
+	*mockStorage
+	mu          sync.Mutex
+	lastDeleted string
+}
+
+func newRecordingDeleteStorage() *recordingDeleteStorage {
+	return &recordingDeleteStorage{mockStorage: newMockStorage()}
+}
+
+func (r *recordingDeleteStorage) Delete(ctx context.Context, path string) error {
+	r.mu.Lock()
+	r.lastDeleted = path
+	r.mu.Unlock()
+	if path == "" {
+		return fmt.Errorf("empty path delete")
+	}
+	return r.mockStorage.Delete(ctx, path)
+}
+
+func (r *recordingDeleteStorage) LastDeleted() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastDeleted
+}
+
 func newTestCacheManager() *DefaultCacheManager {
 	nvme := newMockStorage()
 	peer := newMockStorage()
@@ -145,6 +171,88 @@ func TestCacheManager_Delete(t *testing.T) {
 
 	if exists {
 		t.Error("Entry still in cache entries map after delete")
+	}
+}
+
+func TestCacheManager_PutDefaultsStoragePath(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	entry := &CacheEntry{
+		FilePath:     "/defaults.txt",
+		Size:         7,
+		LastAccessed: time.Now(),
+		Data:         []byte("payload"),
+	}
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if entry.StoragePath != entry.FilePath {
+		t.Fatalf("StoragePath = %q, want %q", entry.StoragePath, entry.FilePath)
+	}
+}
+
+func TestCacheManager_CloudObjectReadWrite(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	path := "snapshots/test.json"
+	want := []byte(`{"ok":true}`)
+	if err := cm.WriteCloud(ctx, path, want); err != nil {
+		t.Fatalf("WriteCloud: %v", err)
+	}
+	got, err := cm.ReadCloud(ctx, path)
+	if err != nil {
+		t.Fatalf("ReadCloud: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("cloud object = %q, want %q", got, want)
+	}
+}
+
+func TestCacheManager_DeleteFallsBackToFilePathWhenStoragePathMissing(t *testing.T) {
+	cm := newTestCacheManager()
+	rec := newRecordingDeleteStorage()
+	cm.nvmeStorage = rec
+	ctx := context.Background()
+
+	filePath := "/fallback-delete.txt"
+	if err := rec.Write(ctx, filePath, []byte("x")); err != nil {
+		t.Fatalf("seed storage: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[filePath] = &CacheEntry{
+		FilePath:     filePath,
+		StoragePath:  "",
+		Size:         1,
+		LastAccessed: time.Now(),
+		Tier:         TierNVMe,
+	}
+	cm.nvmeUsed = 1
+	cm.mu.Unlock()
+
+	if err := cm.Delete(ctx, filePath); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if got := rec.LastDeleted(); got != filePath {
+		t.Fatalf("delete path = %q, want %q", got, filePath)
+	}
+	if rec.Exists(ctx, filePath) {
+		t.Fatalf("file still exists in storage after delete: %s", filePath)
+	}
+
+	cm.mu.RLock()
+	_, exists := cm.entries[filePath]
+	used := cm.nvmeUsed
+	cm.mu.RUnlock()
+
+	if exists {
+		t.Fatal("entry still present after delete")
+	}
+	if used != 0 {
+		t.Fatalf("nvmeUsed = %d, want 0", used)
 	}
 }
 
