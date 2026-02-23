@@ -2,13 +2,17 @@ package fuse
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,8 +23,11 @@ import (
 )
 
 const (
-	goFuseDirMode  = uint32(syscall.S_IFDIR | 0o755)
-	goFuseFileMode = uint32(syscall.S_IFREG | 0o644)
+	goFuseDirMode            = uint32(syscall.S_IFDIR | 0o755)
+	goFuseFileMode           = uint32(syscall.S_IFREG | 0o644)
+	goFuseDefaultTraceStepMB = 8
+	goFuseSlowReadThreshold  = 2 * time.Second
+	goFuseDefaultReadTimeout = 0
 )
 
 type goFuseNodeKind int
@@ -36,6 +43,12 @@ type GoFuseFileSystem struct {
 	logger       *log.Logger
 
 	enablePassthrough bool
+	readTraceEnabled  bool
+	readTracePath     string
+	readTraceStep     int64
+	readTimeout       time.Duration
+	readReqSeq        atomic.Uint64
+	readInflight      atomic.Int64
 
 	mu         sync.Mutex
 	server     *gfuse.Server
@@ -43,10 +56,22 @@ type GoFuseFileSystem struct {
 }
 
 func NewGoFuseFileSystem(cacheManager cache.CacheManager) *GoFuseFileSystem {
+	traceStepMB := intFromEnv("FUSE_GOFUSE_READ_TRACE_STEP_MB", goFuseDefaultTraceStepMB)
+	if traceStepMB < 0 {
+		traceStepMB = 0
+	}
+	readTimeoutMS := intFromEnv("FUSE_GOFUSE_READ_TIMEOUT_MS", goFuseDefaultReadTimeout)
+	if readTimeoutMS < 0 {
+		readTimeoutMS = 0
+	}
 	return &GoFuseFileSystem{
 		cacheManager:      cacheManager,
 		logger:            log.New(log.Writer(), "[GOFUSE] ", log.LstdFlags),
 		enablePassthrough: boolFromEnv("FUSE_GOFUSE_ENABLE_PASSTHROUGH", false),
+		readTraceEnabled:  boolFromEnv("FUSE_GOFUSE_READ_TRACE", false),
+		readTracePath:     strings.TrimSpace(os.Getenv("FUSE_GOFUSE_READ_TRACE_PATH")),
+		readTraceStep:     int64(traceStepMB) * 1024 * 1024,
+		readTimeout:       time.Duration(readTimeoutMS) * time.Millisecond,
 	}
 }
 
@@ -88,6 +113,10 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 	g.mu.Unlock()
 
 	g.logger.Printf("Mounted go-fuse filesystem at: %s (passthrough=%t)", mountPoint, g.enablePassthrough)
+	if g.readTraceEnabled || g.readTimeout > 0 {
+		g.logger.Printf("Read tracing config trace=%t step_bytes=%d path_filter=%q timeout_ms=%d",
+			g.readTraceEnabled, g.readTraceStep, g.readTracePath, g.readTimeout.Milliseconds())
+	}
 	return nil
 }
 
@@ -418,9 +447,26 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 	n.mu.RUnlock()
 
 	if rr, ok := n.gfs.cacheManager.(rangeReader); ok {
-		data, err := rr.ReadRange(ctx, n.path, off, len(dest))
+		reqID := n.gfs.readReqSeq.Add(1)
+		started := time.Now()
+		inflight := n.gfs.readInflight.Add(1)
+		trace := n.gfs.shouldTraceRead(n.path, off)
+		if trace {
+			n.gfs.logger.Printf("ReadRange begin req=%d path=%s off=%d size=%d inflight=%d",
+				reqID, n.path, off, len(dest), inflight)
+		}
+
+		data, err := n.readRangeWithTimeout(ctx, rr, off, len(dest))
+		dur := time.Since(started)
+		remaining := n.gfs.readInflight.Add(-1)
 		if err != nil {
+			n.gfs.logger.Printf("ReadRange error req=%d path=%s off=%d size=%d dur=%v inflight=%d err=%v",
+				reqID, n.path, off, len(dest), dur, remaining, err)
 			return nil, syscall.EIO
+		}
+		if trace || dur >= goFuseSlowReadThreshold {
+			n.gfs.logger.Printf("ReadRange done req=%d path=%s off=%d size=%d out=%d dur=%v inflight=%d",
+				reqID, n.path, off, len(dest), len(data), dur, remaining)
 		}
 		return gfuse.ReadResultData(data), 0
 	}
@@ -437,6 +483,56 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 		end = int64(len(entry.Data))
 	}
 	return gfuse.ReadResultData(entry.Data[off:end]), 0
+}
+
+func (n *goFuseNode) readRangeWithTimeout(ctx context.Context, rr rangeReader, off int64, size int) ([]byte, error) {
+	if n.gfs.readTimeout <= 0 {
+		return rr.ReadRange(ctx, n.path, off, size)
+	}
+
+	withReadTimeout := func(parent context.Context) (context.Context, context.CancelFunc) {
+		if n.gfs.readTimeout <= 0 {
+			return parent, func() {}
+		}
+		if deadline, ok := parent.Deadline(); ok {
+			maxDeadline := time.Now().Add(n.gfs.readTimeout)
+			// Preserve shorter caller deadlines; clamp longer/noisy ones.
+			if !deadline.After(maxDeadline) {
+				return parent, func() {}
+			}
+		}
+		return context.WithTimeout(parent, n.gfs.readTimeout)
+	}
+
+	run := func() ([]byte, error, error) {
+		readCtx, cancel := withReadTimeout(ctx)
+		defer cancel()
+
+		data, err := rr.ReadRange(readCtx, n.path, off, size)
+		if err != nil {
+			return nil, err, readCtx.Err()
+		}
+		return data, nil, nil
+	}
+
+	data, err, readCtxErr := run()
+	if err == nil {
+		return data, nil
+	}
+	if ctx.Err() != nil || !errors.Is(readCtxErr, context.DeadlineExceeded) {
+		return nil, err
+	}
+
+	n.gfs.logger.Printf("ReadRange timeout retry path=%s off=%d size=%d timeout_ms=%d err=%v",
+		n.path, off, size, n.gfs.readTimeout.Milliseconds(), err)
+	retryData, retryErr, retryCtxErr := run()
+	if retryErr == nil {
+		return retryData, nil
+	}
+	if errors.Is(retryCtxErr, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("readrange timeout after retry: first=%v retry=%v", err, retryErr)
+	}
+	return nil, retryErr
 }
 
 func (n *goFuseNode) Write(ctx context.Context, f gfs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
@@ -745,4 +841,32 @@ func boolFromEnv(name string, defaultValue bool) bool {
 	default:
 		return defaultValue
 	}
+}
+
+func intFromEnv(name string, defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultValue
+	}
+	return v
+}
+
+func (g *GoFuseFileSystem) shouldTraceRead(path string, off int64) bool {
+	if !g.readTraceEnabled {
+		return false
+	}
+	if g.readTracePath != "" && !strings.Contains(path, g.readTracePath) {
+		return false
+	}
+	if g.readTraceStep <= 0 {
+		return true
+	}
+	if off < 0 {
+		return true
+	}
+	return off%g.readTraceStep == 0
 }

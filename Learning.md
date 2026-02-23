@@ -130,3 +130,43 @@
 ### Notes
 - Cached-read numbers are much higher than cold reads and likely include range/kernel cache effects.
 - Reader-side NVMe file presence is not guaranteed for this path because range reads are cached in-memory.
+
+## 2026-02-23 go-fuse Read Timeout Clamp + 1GB Offset Trace (EKS)
+- Cluster/namespace: `stargz-test-eks` / `fuse-system-awstest`
+- Image: `679004966033.dkr.ecr.us-east-1.amazonaws.com/fuse-client:eks-az6fix-amd64-readtrace-timeoutclamp-20260223-141050`
+- Pods used (healthy nodes): writer `client-6knlj`, reader `client-8pgbj`
+- Runtime trace/timeouts:
+  - `FUSE_GOFUSE_READ_TRACE=true`
+  - `FUSE_GOFUSE_READ_TRACE_STEP_MB=8`
+  - `FUSE_GOFUSE_READ_TRACE_PATH=smart-read-`
+  - `FUSE_GOFUSE_READ_TIMEOUT_MS=15000`
+
+### Code change
+- File: `internal/fuse/gofuse_backend.go`
+- Change: clamp effective `ReadRange` context deadline to `now + FUSE_GOFUSE_READ_TIMEOUT_MS` even when caller context already has a longer deadline.
+- Reason: prevent long/hung backend reads from inheriting overly long caller deadlines and stalling FUSE responses.
+
+### Commands run
+- `kubectl -n fuse-system-awstest set image daemonset/client client=679004966033.dkr.ecr.us-east-1.amazonaws.com/fuse-client:eks-az6fix-amd64-readtrace-timeoutclamp-20260223-141050`
+- `kubectl -n fuse-system-awstest set env daemonset/client FUSE_GOFUSE_READ_TRACE=true FUSE_GOFUSE_READ_TRACE_STEP_MB=8 FUSE_GOFUSE_READ_TRACE_PATH=smart-read- FUSE_GOFUSE_READ_TIMEOUT_MS=15000`
+- `HYBRID_SETTLE_SEC=20 timeout 1800 ./scripts/ops/test-smart-read.sh fuse-system-awstest 1024 client-6knlj client-8pgbj`
+- `HYBRID_SETTLE_SEC=20 timeout 2400 ./scripts/ops/test-smart-read.sh fuse-system-awstest 5120 client-6knlj client-8pgbj`
+
+### Observed performance (post-patch)
+- 1GB:
+  - write: `531 MB/s`
+  - read: `295 MB/s`
+- 5GB:
+  - write: `198 MB/s`
+  - read: `308 MB/s`
+
+### Trace around 1GB offset (5GB run)
+- File: `smart-read-5120mb-1771885827.bin`
+- `off=1065353216` -> `dur=21.060648ms`
+- `off=1073741824` -> `dur=21.239031ms`
+- `off=1082130432` -> `dur=22.656559ms`
+- No `ReadRange timeout retry` and no `ReadRange error` lines in this run.
+
+### Operational note
+- One 5GB attempt failed due `kubectl exec` stream reset (`read tcp ... connection reset by peer`) while the benchmark process was running.
+- Immediate rerun succeeded; treat that failure as API stream transport noise, not a read-path regression.
