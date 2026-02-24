@@ -89,6 +89,13 @@ type CacheConfig struct {
 	// S3 config
 	S3Bucket string
 	S3Region string
+	// S3 transfer tuning
+	S3DownloadConcurrency int
+	S3DownloadPartSize    int64
+	S3UploadConcurrency   int
+	S3UploadPartSize      int64
+	S3Endpoint            string
+	S3ForcePathStyle      bool
 
 	// Azure config
 	AzureStorageAccount string
@@ -149,6 +156,8 @@ type DefaultCacheManager struct {
 	entries      map[string]*CacheEntry
 	nvmeUsed     int64
 	mu           sync.RWMutex
+	rangeMu      sync.RWMutex
+	fetchMu      sync.Mutex
 	logger       *log.Logger
 	metrics      *CacheMetrics
 	metadataAt   time.Time
@@ -178,6 +187,8 @@ type chunkFetchState struct {
 const slowChunkReadThreshold = 2 * time.Second
 const defaultHybridCloudHedgeDelay = 20 * time.Millisecond
 const defaultHybridMaxSecondaryInflight = 16
+const chunkFetchWaitTimeout = 15 * time.Second
+const defaultHybridMetadataLookupTimeout = 500 * time.Millisecond
 
 // NewCacheManager creates a new cache manager
 func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
@@ -212,6 +223,18 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 	if config.PeerReadThroughputBytesPerSec <= 0 {
 		config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
+	}
+	if config.S3DownloadConcurrency <= 0 {
+		config.S3DownloadConcurrency = defaultS3DownloadConcurrency
+	}
+	if config.S3DownloadPartSize <= 0 {
+		config.S3DownloadPartSize = defaultS3DownloadPartSize
+	}
+	if config.S3UploadConcurrency <= 0 {
+		config.S3UploadConcurrency = defaultS3UploadConcurrency
+	}
+	if config.S3UploadPartSize <= 0 {
+		config.S3UploadPartSize = defaultS3UploadPartSize
 	}
 	if config.AzureDownloadConcurrency <= 0 {
 		config.AzureDownloadConcurrency = 8
@@ -276,7 +299,19 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 			config.CloudTimeout,
 		)
 	default: // "s3" or empty
-		cm.cloudStorage, err = NewCloudStorage(config.S3Bucket, config.S3Region, config.CloudTimeout)
+		cm.cloudStorage, err = NewCloudStorageWithTuning(
+			config.S3Bucket,
+			config.S3Region,
+			config.CloudTimeout,
+			S3TransferTuning{
+				DownloadConcurrency: config.S3DownloadConcurrency,
+				DownloadPartSize:    config.S3DownloadPartSize,
+				UploadConcurrency:   config.S3UploadConcurrency,
+				UploadPartSize:      config.S3UploadPartSize,
+				Endpoint:            config.S3Endpoint,
+				ForcePathStyle:      config.S3ForcePathStyle,
+			},
+		)
 	}
 	if err != nil {
 		return nil, err
@@ -438,7 +473,9 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 	}
 	cm.mu.RUnlock()
 
-	locations, err := cm.config.Coordinator.GetFileLocation(ctx, filePath)
+	lookupCtx, cancel := context.WithTimeout(ctx, defaultHybridMetadataLookupTimeout)
+	defer cancel()
+	locations, err := cm.config.Coordinator.GetFileLocation(lookupCtx, filePath)
 	if err != nil {
 		return false
 	}
@@ -459,21 +496,25 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 	}
 
 	peerReplicas := len(peerIDs)
-	if !hasCloud {
-		// Metadata may lag async cloud persistence; probe cloud directly.
-		hasCloud = cm.cloudStorage.Exists(ctx, filePath)
-		if !hasCloud {
-			// Chunked files may exist in cloud only as chunk objects.
-			hasCloud = cm.cloudStorage.Exists(ctx, fmt.Sprintf("%s_chunk_0", filePath))
-		}
-	}
-
 	effectiveReplicas := peerReplicas
 	if effectiveReplicas < 1 {
 		effectiveReplicas = 1
 	}
 	peerCapacity := int64(effectiveReplicas) * cm.config.PeerReadThroughputBytesPerSec
-	enabled := hasCloud && peerReplicas > 0 && fileSize > peerCapacity
+
+	// When estimated peer capacity already covers the file size, skip cloud probes.
+	// This avoids expensive cloud HEAD calls on read paths that will stay peer-first.
+	if fileSize <= peerCapacity {
+		cm.mu.Lock()
+		cm.hybridHints[filePath] = hybridReadHint{
+			enabled:   false,
+			expiresAt: now.Add(cm.config.MetadataRefreshTTL),
+		}
+		cm.mu.Unlock()
+		return false
+	}
+
+	enabled := hasCloud && peerReplicas > 0
 
 	cm.mu.Lock()
 	cm.hybridHints[filePath] = hybridReadHint{
@@ -807,11 +848,12 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 		chunkData := make([]byte, int(toRead))
 		copy(chunkData, buf[:int(toRead)])
 		chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
+		chunkLastAccessed := time.Now()
 		chunkEntry := &CacheEntry{
 			FilePath:     chunkPath,
 			StoragePath:  chunkPath,
 			Size:         int64(len(chunkData)),
-			LastAccessed: lastAccessed,
+			LastAccessed: chunkLastAccessed,
 			Tier:         TierNVMe,
 			Data:         chunkData,
 		}
@@ -831,7 +873,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 		FilePath:     filePath,
 		StoragePath:  filePath,
 		Size:         size,
-		LastAccessed: lastAccessed,
+		LastAccessed: time.Now(),
 		Tier:         TierNVMe,
 		IsChunked:    true,
 		NumChunks:    numChunks,
@@ -855,22 +897,62 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 		return errors.New("file not found in cache")
 	}
 
+	if entry.IsChunked && entry.NumChunks > 0 {
+		for i := int64(0); i < entry.NumChunks; i++ {
+			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
+			if err := cm.deleteSingleEntry(ctx, chunkPath, true); err != nil {
+				cm.logger.Printf("Chunk delete failed for %s: %v", chunkPath, err)
+			}
+		}
+	}
+
+	return cm.deleteSingleEntry(ctx, filePath, false)
+}
+
+func (cm *DefaultCacheManager) deleteSingleEntry(ctx context.Context, filePath string, ignoreMissing bool) error {
+	cm.mu.RLock()
+	entry, exists := cm.entries[filePath]
+	cm.mu.RUnlock()
+	if !exists || entry == nil {
+		if ignoreMissing {
+			return nil
+		}
+		return errors.New("file not found in cache")
+	}
+
 	storage := cm.getStorageForTier(entry.Tier)
 	deletePath := entry.StoragePath
 	if strings.TrimSpace(deletePath) == "" {
 		deletePath = entry.FilePath
 	}
-	if err := storage.Delete(ctx, deletePath); err != nil {
+	if err := storage.Delete(ctx, deletePath); err != nil && !isDeleteNotFoundError(err) {
 		return err
+	}
+	if entry.Tier == TierNVMe && entry.Checksum != "" {
+		_ = storage.Delete(ctx, deletePath+".sha256")
 	}
 
 	cm.mu.Lock()
 	if entry.Tier == TierNVMe {
 		cm.nvmeUsed -= entry.Size
+		if cm.nvmeUsed < 0 {
+			cm.nvmeUsed = 0
+		}
 	}
 	delete(cm.entries, filePath)
 	cm.mu.Unlock()
 	return nil
+}
+
+func isDeleteNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsNotExist(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "no such file")
 }
 
 // WriteCloud writes arbitrary bytes to the configured cloud tier object path.
@@ -1023,6 +1105,13 @@ func (cm *DefaultCacheManager) persistToCloud(filePath string, data []byte) {
 
 		if err == nil {
 			cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", filePath, len(data))
+			go cm.publishFileLocation(context.Background(), &CacheEntry{
+				FilePath:     filePath,
+				StoragePath:  filePath,
+				Size:         int64(len(data)),
+				LastAccessed: time.Now(),
+				Tier:         TierCloud,
+			}, TierCloud)
 			return
 		}
 
@@ -1264,8 +1353,9 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	dataLen := int64(len(entry.Data))
 	numChunks := (dataLen + cm.config.ChunkSize - 1) / cm.config.ChunkSize
 
-	// Write chunks sequentially to avoid unbounded goroutine/data fan-out
-	// that can spike memory on large files (e.g., 1GiB+ writes).
+	// Write chunks sequentially to NVMe and defer cloud persistence to the
+	// bounded background worker pool. This avoids spawning one cloud-upload
+	// goroutine per chunk, which can overwhelm S3 and throttle writes.
 	for i := int64(0); i < numChunks; i++ {
 		start := i * cm.config.ChunkSize
 		end := start + cm.config.ChunkSize
@@ -1273,18 +1363,27 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 			end = dataLen
 		}
 
-		chunkData := entry.Data[start:end]
+		chunkData := make([]byte, end-start)
+		copy(chunkData, entry.Data[start:end])
 		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
 		chunkEntry := &CacheEntry{
 			FilePath:     chunkPath,
 			StoragePath:  chunkPath,
 			Size:         int64(len(chunkData)),
 			LastAccessed: time.Now(),
+			Tier:         TierNVMe,
 			Data:         chunkData,
 		}
-		if err := cm.Put(ctx, chunkEntry); err != nil {
-			return fmt.Errorf("failed to upload chunk: %v", err)
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
+			return fmt.Errorf("failed to store chunk %d in NVMe for %s: %w", i, entry.FilePath, err)
 		}
+
+		chunkMeta := *chunkEntry
+		chunkMeta.Data = nil
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &chunkMeta
+		cm.mu.Unlock()
+		cm.metrics.RecordWrite(chunkEntry.Size)
 	}
 
 	entry.IsChunked = true
@@ -1298,6 +1397,7 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	cm.entries[entry.FilePath] = entry
 	cm.mu.Unlock()
 	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
+	go cm.persistChunkedFileToCloud(entry.FilePath, numChunks)
 
 	return nil
 }
@@ -1436,6 +1536,35 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		}
 	}
 
+	if chunkCount == 1 {
+		chunkData := chunks[0]
+		chunkOffset := startChunk * chunkSize
+		from := int64(0)
+		if offset > chunkOffset {
+			from = offset - chunkOffset
+		}
+		to := int64(len(chunkData))
+		chunkEnd := chunkOffset + int64(len(chunkData))
+		if end < chunkEnd {
+			to = end - chunkOffset
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to < from {
+			to = from
+		}
+		if to > int64(len(chunkData)) {
+			to = int64(len(chunkData))
+		}
+		dur := time.Since(started)
+		if dur >= slowChunkReadThreshold {
+			cm.logger.Printf("ReadRange slow chunked path=%s offset=%d size=%d chunks=%d workers=%d hybrid=%t dur=%v",
+				filePath, offset, size, chunkCount, workerCount, hybridRead, dur)
+		}
+		return chunkData[from:to], nil
+	}
+
 	out := make([]byte, 0, end-offset)
 	for pos, chunkData := range chunks {
 		chunkIndex := startChunk + int64(pos)
@@ -1553,31 +1682,34 @@ func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath strin
 
 	// Collapse duplicate concurrent fetches for the same chunk. Without this,
 	// parallel FUSE read requests for one chunk can cause repeated remote fetches.
-	state, leader := cm.startChunkFetch(chunkPath)
-	if !leader {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-state.done:
+	for {
+		state, leader := cm.startChunkFetch(chunkPath)
+		if !leader {
+			waitCtx, waitCancel := context.WithTimeout(ctx, chunkFetchWaitTimeout)
+			select {
+			case <-waitCtx.Done():
+				waitErr := waitCtx.Err()
+				waitCancel()
+				if errors.Is(waitErr, context.DeadlineExceeded) {
+					cm.clearStaleChunkFetch(chunkPath, state)
+					continue
+				}
+				return nil, waitErr
+			case <-state.done:
+				waitCancel()
+			}
+			if state.err != nil {
+				return nil, state.err
+			}
+			return state.data, nil
 		}
-		if state.err != nil {
-			return nil, state.err
-		}
-		return state.data, nil
+		return cm.fetchChunkAsLeader(ctx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart, state)
 	}
-
-	var err error
-	defer func() {
-		cm.completeChunkFetch(chunkPath, state, chunkData, err)
-	}()
-
-	chunkData, err = cm.readChunkDataFromTiers(ctx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart)
-	return chunkData, err
 }
 
 func (cm *DefaultCacheManager) startChunkFetch(chunkPath string) (*chunkFetchState, bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.fetchMu.Lock()
+	defer cm.fetchMu.Unlock()
 
 	if cm.chunkFetches == nil {
 		cm.chunkFetches = make(map[string]*chunkFetchState)
@@ -1592,12 +1724,51 @@ func (cm *DefaultCacheManager) startChunkFetch(chunkPath string) (*chunkFetchSta
 }
 
 func (cm *DefaultCacheManager) completeChunkFetch(chunkPath string, state *chunkFetchState, data []byte, err error) {
-	cm.mu.Lock()
+	cm.fetchMu.Lock()
 	state.data = data
 	state.err = err
 	close(state.done)
 	delete(cm.chunkFetches, chunkPath)
-	cm.mu.Unlock()
+	cm.fetchMu.Unlock()
+}
+
+func (cm *DefaultCacheManager) clearStaleChunkFetch(chunkPath string, state *chunkFetchState) {
+	cm.fetchMu.Lock()
+	defer cm.fetchMu.Unlock()
+	current, ok := cm.chunkFetches[chunkPath]
+	if !ok || current != state {
+		return
+	}
+	delete(cm.chunkFetches, chunkPath)
+}
+
+func (cm *DefaultCacheManager) fetchChunkAsLeader(
+	ctx context.Context,
+	filePath string,
+	chunkPath string,
+	chunkIndex int64,
+	remoteOrder []CacheTier,
+	hybridRead bool,
+	chunkStart time.Time,
+	state *chunkFetchState,
+) ([]byte, error) {
+	var (
+		chunkData []byte
+		err       error
+	)
+	defer func() {
+		cm.completeChunkFetch(chunkPath, state, chunkData, err)
+	}()
+
+	fetchCtx := ctx
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok && cm.config.PeerTimeout > 0 {
+		fetchCtx, cancel = context.WithTimeout(ctx, cm.config.PeerTimeout)
+	}
+	defer cancel()
+
+	chunkData, err = cm.readChunkDataFromTiers(fetchCtx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart)
+	return chunkData, err
 }
 
 func (cm *DefaultCacheManager) readChunkDataFromTiers(
@@ -1632,11 +1803,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	if hybridRead {
 		hybridPrimary := primary
 		hybridSecondary := secondary
-		// Keep peer-first startup, then stripe later chunks to aggregate peer+cloud
-		// bandwidth on sustained large sequential reads.
-		if primary == TierPeer && secondary == TierCloud && chunkIndex > 0 && chunkIndex%2 == 1 {
-			hybridPrimary, hybridSecondary = secondary, primary
-		}
+		// Keep peer as primary on all chunks; cloud remains a hedged fallback.
 		hybridStart := time.Now()
 		if chunkEntry, tier, err := cm.readChunkHybridHedged(ctx, chunkPath, hybridPrimary, hybridSecondary); err == nil {
 			tierDur := time.Since(hybridStart)
@@ -1791,8 +1958,8 @@ func (cm *DefaultCacheManager) readChunkHybridHedged(ctx context.Context, chunkP
 }
 
 func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
+	cm.rangeMu.RLock()
+	defer cm.rangeMu.RUnlock()
 
 	fileCache, ok := cm.rangeChunks[filePath]
 	if !ok || fileCache == nil {
@@ -1810,7 +1977,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 		return
 	}
 
-	cm.mu.Lock()
+	cm.rangeMu.Lock()
 	fileCache, ok := cm.rangeChunks[filePath]
 	if !ok || fileCache == nil {
 		fileCache = &chunkFileCache{
@@ -1829,15 +1996,20 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 		fileCache.order = fileCache.order[1:]
 		delete(fileCache.chunks, evictChunk)
 	}
-	cm.mu.Unlock()
+	cm.rangeMu.Unlock()
 }
 
 func (cm *DefaultCacheManager) invalidateRangeCache(filePath string) {
-	cm.mu.Lock()
+	cm.rangeMu.Lock()
 	delete(cm.rangeChunks, filePath)
-	delete(cm.hybridHints, filePath)
 	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
 		delete(cm.rangeChunks, parent)
+	}
+	cm.rangeMu.Unlock()
+
+	cm.mu.Lock()
+	delete(cm.hybridHints, filePath)
+	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
 		delete(cm.hybridHints, parent)
 	}
 	cm.mu.Unlock()

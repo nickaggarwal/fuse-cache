@@ -5,12 +5,21 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"sync"
 	"time"
 
 	pb "fuse-client/internal/pb"
 )
 
-const grpcChunkSize = 4 * 1024 * 1024 // 4MiB streaming chunks
+const grpcChunkSize = 24 * 1024 * 1024 // 24MiB streaming chunks
+
+var grpcReadBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, grpcChunkSize)
+		return &b
+	},
+}
 
 // PeerGRPCServer implements the PeerService gRPC service.
 // Each client node runs this so other peers can read/write files via gRPC.
@@ -23,6 +32,10 @@ type localGetter interface {
 	GetLocal(ctx context.Context, filePath string) (*CacheEntry, error)
 }
 
+type localPathResolver interface {
+	LocalFilePath(ctx context.Context, filePath string) (string, bool)
+}
+
 // NewPeerGRPCServer creates a new peer gRPC server.
 func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 	return &PeerGRPCServer{cacheManager: cm}
@@ -30,6 +43,15 @@ func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 
 // ReadFile streams file data in fixed-size chunks.
 func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService_ReadFileServer) error {
+	if resolver, ok := s.cacheManager.(localPathResolver); ok {
+		if localPath, ok := resolver.LocalFilePath(stream.Context(), req.Path); ok {
+			if err := streamLocalFile(localPath, stream); err == nil {
+				return nil
+			}
+			// Fall through to cache-entry path for robustness on transient local I/O errors.
+		}
+	}
+
 	entry, err := s.getForPeerRPC(stream.Context(), req.Path)
 	if err != nil {
 		return fmt.Errorf("file not found: %v", err)
@@ -46,6 +68,33 @@ func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService
 		}
 	}
 	return nil
+}
+
+func streamLocalFile(localPath string, stream pb.PeerService_ReadFileServer) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	bufPtr := grpcReadBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer grpcReadBufPool.Put(bufPtr)
+
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if err := stream.Send(&pb.FileChunk{Data: buf[:n]}); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
 
 // WriteFile receives metadata + data chunks via client streaming.

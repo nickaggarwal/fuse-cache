@@ -170,3 +170,39 @@
 ### Operational note
 - One 5GB attempt failed due `kubectl exec` stream reset (`read tcp ... connection reset by peer`) while the benchmark process was running.
 - Immediate rerun succeeded; treat that failure as API stream transport noise, not a read-path regression.
+
+## 2026-02-24 EKS Hotspot Iteration (Non-config Strategies)
+- Cluster/context: `stargz-test-eks`
+- Namespace: `fuse-system-awstest`
+- Runtime profile kept stable:
+  - `CHUNK_SIZE_MB=8`
+  - `FUSE_RANGE_PREFETCH_CHUNKS=4`
+  - `FUSE_PEER_READ_MBPS=10000`
+  - go-fuse v2 backend
+
+### Ideas tested in this iteration
+1. gRPC peer-read server buffer pooling (remove large per-request buffer allocations).
+2. `ReadRange` single-chunk zero-copy return path (avoid extra copy for 128KiB FUSE reads).
+3. Split range-cache and chunk-fetch locking away from the main cache mutex (reduce contention).
+4. go-fuse read-window cache (2MiB prefetch per read call) to reduce read syscall overhead.
+
+### A/B results
+- Baseline before iteration:
+  - 1GB read: `788 MB/s`
+  - 5GB read: `887 MB/s`
+- Iteration A (all 4 ideas enabled):
+  - 1GB read: `634-646 MB/s` (regression)
+  - 5GB read: `838 MB/s` (regression)
+- Iteration B (Idea 4 disabled, Ideas 1-3 kept):
+  - 1GB read: `1201-1244 MB/s`
+  - 5GB read: `1368-1395 MB/s`
+
+### Tier contribution (Iteration B)
+- Delta read bytes from `/api/cache/stats` over 1GB+5GB run:
+  - `peer_read_bytes=6442450944` (100%)
+  - `cloud_read_bytes=0` (0%)
+- Reads were fully peer-served in this cycle.
+
+### Outcome
+- Keep: Ideas 1, 2, 3.
+- Rejected: Idea 4 (go-fuse read-window prefetch) due clear throughput regression.
