@@ -47,6 +47,24 @@ echo "File size: ${SIZE_MB}MiB"
 echo "FUSE file: $FUSE_FILE"
 echo "Hybrid settle wait: ${HYBRID_SETTLE_SEC}s"
 
+# Best-effort cleanup of prior benchmark artifacts to prevent cache-pressure
+# skew across repeated runs.
+cleanup_pod_artifacts() {
+  local pod="$1"
+  $KUBECTL -n "$NAMESPACE" exec "$pod" -c client -- sh -lc "
+set -e
+rm -f /host/mnt/fuse/smart-read-*mb-*.bin || true
+rm -f /mnt/nvme/cache/smart-read-*mb-*.bin /mnt/nvme/cache/smart-read-*mb-*.bin.sha256 /mnt/nvme/cache/smart-read-*mb-*.bin_chunk_* /mnt/nvme/cache/smart-read-*mb-*.bin_chunk_*.sha256 || true
+sync
+echo PRE_CLEAN_OK
+" >/dev/null 2>&1 || true
+}
+
+cleanup_pod_artifacts "$WRITER_POD"
+if [[ "$READER_POD" != "$WRITER_POD" ]]; then
+  cleanup_pod_artifacts "$READER_POD"
+fi
+
 $KUBECTL -n "$NAMESPACE" exec "$WRITER_POD" -c client -- sh -lc "
 set -e
 echo WRITE_START
@@ -94,10 +112,10 @@ if [ \"\$file_size\" -lt ${EXPECTED_BYTES} ]; then
   exit 1
 fi
 s=\$(date +%s%N)
-dd_out=\$(dd if=${FUSE_FILE} of=/dev/null bs=1M count=${SIZE_MB} 2>&1 >/dev/null)
+dd_out=\$(dd if=${FUSE_FILE} of=/dev/null bs=1M count=${SIZE_MB} status=progress 2>&1 >/dev/null)
 e=\$(date +%s%N)
 dt_ms=\$(((e-s)/1000000))
-bytes=\$(printf '%s\n' \"\$dd_out\" | awk '/bytes/{print \$1; exit}')
+bytes=\$(printf '%s\n' \"\$dd_out\" | awk '/bytes/{b=\$1} END{print b}')
 if [ -z \"\$bytes\" ]; then
   echo READ_BYTES_PARSE_FAILED
   printf '%s\n' \"\$dd_out\"

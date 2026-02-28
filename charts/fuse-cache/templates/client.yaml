@@ -71,12 +71,34 @@ spec:
             - "$(CHUNK_SIZE_MB)"
             - "-cloud-provider"
             - "{{ .Values.client.cloudProvider }}"
+            - "-s3-bucket"
+            - "$(S3_BUCKET)"
+            - "-s3-region"
+            - "$(S3_REGION)"
+            - "-s3-download-concurrency"
+            - "$(FUSE_S3_DOWNLOAD_CONCURRENCY)"
+            - "-s3-download-part-size-mb"
+            - "$(FUSE_S3_DOWNLOAD_PART_SIZE_MB)"
+            - "-s3-upload-concurrency"
+            - "$(FUSE_S3_UPLOAD_CONCURRENCY)"
+            - "-s3-upload-part-size-mb"
+            - "$(FUSE_S3_UPLOAD_PART_SIZE_MB)"
+            - "-s3-endpoint"
+            - "$(S3_ENDPOINT)"
           envFrom:
             - configMapRef:
                 name: fuse-config
             - secretRef:
                 name: {{ .Values.secrets.azure.name }}
+            {{- if .Values.secrets.aws.create }}
+            - secretRef:
+                name: {{ .Values.secrets.aws.name }}
+            {{- end }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_IP
               valueFrom:
                 fieldRef:

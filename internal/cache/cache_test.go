@@ -174,6 +174,65 @@ func TestCacheManager_Delete(t *testing.T) {
 	}
 }
 
+func TestCacheManager_DeleteChunkedParentRemovesChunks(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	for i, payload := range [][]byte{[]byte("chunk0"), []byte("chunk1")} {
+		chunkPath := fmt.Sprintf("/chunked.bin_chunk_%d", i)
+		chunkEntry := &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(payload)),
+			LastAccessed: time.Now(),
+			Tier:         TierNVMe,
+			Data:         payload,
+		}
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
+			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
+		}
+		chunkMeta := *chunkEntry
+		chunkMeta.Data = nil
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &chunkMeta
+		cm.mu.Unlock()
+	}
+
+	parent := &CacheEntry{
+		FilePath:     "/chunked.bin",
+		StoragePath:  "/chunked.bin",
+		Size:         int64(len("chunk0") + len("chunk1")),
+		LastAccessed: time.Now(),
+		Tier:         TierNVMe,
+		IsChunked:    true,
+		NumChunks:    2,
+	}
+	cm.mu.Lock()
+	cm.entries[parent.FilePath] = parent
+	cm.mu.Unlock()
+
+	if err := cm.Delete(ctx, parent.FilePath); err != nil {
+		t.Fatalf("Delete chunked parent: %v", err)
+	}
+
+	cm.mu.RLock()
+	_, parentExists := cm.entries[parent.FilePath]
+	_, chunk0Exists := cm.entries["/chunked.bin_chunk_0"]
+	_, chunk1Exists := cm.entries["/chunked.bin_chunk_1"]
+	used := cm.nvmeUsed
+	cm.mu.RUnlock()
+
+	if parentExists || chunk0Exists || chunk1Exists {
+		t.Fatalf("chunked delete left entries: parent=%t chunk0=%t chunk1=%t", parentExists, chunk0Exists, chunk1Exists)
+	}
+	if used != 0 {
+		t.Fatalf("nvmeUsed = %d, want 0", used)
+	}
+	if cm.nvmeStorage.Exists(ctx, "/chunked.bin_chunk_0") || cm.nvmeStorage.Exists(ctx, "/chunked.bin_chunk_1") {
+		t.Fatalf("chunk data still exists in NVMe storage after delete")
+	}
+}
+
 func TestCacheManager_PutDefaultsStoragePath(t *testing.T) {
 	cm := newTestCacheManager()
 	ctx := context.Background()

@@ -30,6 +30,7 @@ The system consists of:
   - `test-smart-read.sh` supports cross-pod read/write benchmarks for arbitrary sizes (e.g. 100MB/1GB/5GB)
   - `test-smart-read-5gb.sh` remains as a compatibility wrapper
   - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
+  - `test-smart-read-s3-profile.sh` labels `standard` vs `s3express` runs and checks zone alignment for S3 Express endpoints
 
 ## Components
 
@@ -209,6 +210,15 @@ Options:
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_REGION=us-east-1
+export S3_BUCKET=fuse-client-cache
+export S3_REGION=us-east-1
+export FUSE_S3_DOWNLOAD_CONCURRENCY=32
+export FUSE_S3_DOWNLOAD_PART_SIZE_MB=8
+export FUSE_S3_UPLOAD_CONCURRENCY=16
+export FUSE_S3_UPLOAD_PART_SIZE_MB=8
+export FUSE_S3_FORCE_PATH_STYLE=false
+# Optional endpoint override (for S3-compatible object stores)
+export S3_ENDPOINT=
 
 # Azure Blob configuration
 export AZURE_STORAGE_ACCOUNT=your-account
@@ -240,6 +250,7 @@ export FUSE_NETPROBE_EVERY_HEARTBEATS=2
 `FUSE_PEER_READ_MBPS` controls the hybrid-read throughput model.
 `FUSE_PARALLEL_RANGE_READS`, `FUSE_RANGE_PREFETCH_CHUNKS`, and
 `FUSE_RANGE_CHUNK_CACHE_SIZE` tune range-read throughput behavior.
+`FUSE_S3_DOWNLOAD_*` and `FUSE_S3_UPLOAD_*` tune multipart transfer throughput for S3.
 `FUSE_IO_PROGRESS_MB` controls periodic FUSE read/write progress logging cadence.
 `FUSE_NETPROBE_*` controls optional peer-to-peer network probing and telemetry
 published to coordinator peer metadata (`network_speed_mbps`, `network_latency_ms`).
@@ -455,6 +466,22 @@ Examples:
 
 # Explicit writer and reader pods
 ./scripts/ops/test-smart-read-5gb.sh fuse-system-aztest client-a client-b
+```
+
+### Run profile-aware smart-read test (standard vs s3express)
+
+```bash
+./scripts/ops/test-smart-read-s3-profile.sh <namespace> <standard|s3express> <size-mb> [writer-pod] [reader-pod]
+```
+
+Examples:
+
+```bash
+# Standard S3 run (1GiB)
+./scripts/ops/test-smart-read-s3-profile.sh fuse-system-awstest standard 1024
+
+# S3 Express run (5GiB), with zone alignment check against endpoint zone-id
+./scripts/ops/test-smart-read-s3-profile.sh fuse-system-awstest s3express 5120
 ```
 
 ### Run go-fuse cached-read suite (1GiB + 5GiB)

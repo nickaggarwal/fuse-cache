@@ -122,6 +122,18 @@ func envInt(name string, fallback int) int {
 	return parsed
 }
 
+func envBool(name string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
 func newSnapshotCloudStoreFromEnv(logger *log.Logger) snapshotCloudStore {
 	provider := strings.ToLower(strings.TrimSpace(os.Getenv("CLOUD_PROVIDER")))
 	if provider == "" {
@@ -161,10 +173,18 @@ func newSnapshotCloudStoreFromEnv(logger *log.Logger) snapshotCloudStore {
 		}
 		store, err = cache.NewGCPStorage(bucket, timeout)
 	case "s3":
-		store, err = cache.NewCloudStorage(
+		store, err = cache.NewCloudStorageWithTuning(
 			strings.TrimSpace(os.Getenv("S3_BUCKET")),
 			strings.TrimSpace(os.Getenv("S3_REGION")),
 			timeout,
+			cache.S3TransferTuning{
+				DownloadConcurrency: envInt("FUSE_S3_DOWNLOAD_CONCURRENCY", 32),
+				DownloadPartSize:    int64(envInt("FUSE_S3_DOWNLOAD_PART_SIZE_MB", 8)) * 1024 * 1024,
+				UploadConcurrency:   envInt("FUSE_S3_UPLOAD_CONCURRENCY", 16),
+				UploadPartSize:      int64(envInt("FUSE_S3_UPLOAD_PART_SIZE_MB", 8)) * 1024 * 1024,
+				Endpoint:            strings.TrimSpace(os.Getenv("S3_ENDPOINT")),
+				ForcePathStyle:      envBool("FUSE_S3_FORCE_PATH_STYLE", false),
+			},
 		)
 	default:
 		logger.Printf("Coordinator snapshot cloud store disabled: unsupported provider %q", provider)

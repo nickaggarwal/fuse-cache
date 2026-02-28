@@ -44,8 +44,14 @@ func main() {
 		cloudProvider = flag.String("cloud-provider", "s3", "Cloud storage provider: s3, azure, or gcp")
 
 		// S3 config
-		s3Bucket = flag.String("s3-bucket", "fuse-client-cache", "S3 bucket name")
-		s3Region = flag.String("s3-region", "us-east-1", "S3 region")
+		s3Bucket              = flag.String("s3-bucket", "fuse-client-cache", "S3 bucket name")
+		s3Region              = flag.String("s3-region", "us-east-1", "S3 region")
+		s3DownloadConcurrency = flag.Int("s3-download-concurrency", 32, "S3 downloader concurrency")
+		s3DownloadPartMB      = flag.Int("s3-download-part-size-mb", 8, "S3 downloader part size in MB")
+		s3UploadConcurrency   = flag.Int("s3-upload-concurrency", 16, "S3 uploader concurrency")
+		s3UploadPartMB        = flag.Int("s3-upload-part-size-mb", 8, "S3 uploader part size in MB")
+		s3Endpoint            = flag.String("s3-endpoint", "", "Optional S3 endpoint override")
+		s3ForcePathStyle      = flag.Bool("s3-force-path-style", false, "Force path-style S3 addressing")
 
 		// Azure config
 		azureAccount   = flag.String("azure-account", "", "Azure storage account name")
@@ -81,7 +87,7 @@ func main() {
 
 	// Generate peer ID if not provided
 	if *peerID == "" {
-		*peerID = fmt.Sprintf("peer-%d", time.Now().Unix())
+		*peerID = defaultPeerID()
 	}
 
 	// Override from env vars if set
@@ -96,6 +102,20 @@ func main() {
 	}
 	if v := os.Getenv("GCP_BUCKET"); v != "" && *gcpBucket == "fuse-client-cache" {
 		*gcpBucket = v
+	}
+	if v := os.Getenv("S3_BUCKET"); v != "" && *s3Bucket == "fuse-client-cache" {
+		*s3Bucket = v
+	}
+	if v := os.Getenv("S3_REGION"); v != "" && *s3Region == "us-east-1" {
+		*s3Region = v
+	}
+	if v := strings.TrimSpace(os.Getenv("S3_ENDPOINT")); v != "" && *s3Endpoint == "" {
+		*s3Endpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FUSE_S3_FORCE_PATH_STYLE")); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			*s3ForcePathStyle = parsed
+		}
 	}
 	if v := os.Getenv("COORDINATOR_GRPC_ADDR"); v != "" {
 		*coordinatorGRPC = v
@@ -147,6 +167,12 @@ func main() {
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
 		S3Region:                      *s3Region,
+		S3DownloadConcurrency:         *s3DownloadConcurrency,
+		S3DownloadPartSize:            int64(*s3DownloadPartMB) * 1024 * 1024,
+		S3UploadConcurrency:           *s3UploadConcurrency,
+		S3UploadPartSize:              int64(*s3UploadPartMB) * 1024 * 1024,
+		S3Endpoint:                    strings.TrimSpace(*s3Endpoint),
+		S3ForcePathStyle:              *s3ForcePathStyle,
 		AzureStorageAccount:           *azureAccount,
 		AzureStorageKey:               *azureKey,
 		AzureContainerName:            *azureContainer,
@@ -217,6 +243,50 @@ func main() {
 			*azureDLMinMB = n
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_AZURE_PARALLEL_DOWNLOAD_MIN_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_S3_DOWNLOAD_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.S3DownloadConcurrency = n
+			*s3DownloadConcurrency = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_S3_DOWNLOAD_CONCURRENCY value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_S3_DOWNLOAD_PART_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.S3DownloadPartSize = int64(n) * 1024 * 1024
+			*s3DownloadPartMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_S3_DOWNLOAD_PART_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_S3_UPLOAD_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.S3UploadConcurrency = n
+			*s3UploadConcurrency = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_S3_UPLOAD_CONCURRENCY value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_S3_UPLOAD_PART_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.S3UploadPartSize = int64(n) * 1024 * 1024
+			*s3UploadPartMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_S3_UPLOAD_PART_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("S3_ENDPOINT")); v != "" {
+		cacheConfig.S3Endpoint = v
+		*s3Endpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("FUSE_S3_FORCE_PATH_STYLE")); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.S3ForcePathStyle = parsed
+			*s3ForcePathStyle = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_S3_FORCE_PATH_STYLE value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_HYBRID_HEDGE_DELAY_MS"); v != "" {
@@ -328,6 +398,16 @@ func main() {
 	logger.Printf("- Coordinator gRPC: %s", *coordinatorGRPC)
 	logger.Printf("- FUSE backend: %s", *fuseBackendName)
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
+	logger.Printf("- S3 bucket: %s", cacheConfig.S3Bucket)
+	logger.Printf("- S3 region: %s", cacheConfig.S3Region)
+	logger.Printf("- S3 download concurrency: %d", cacheConfig.S3DownloadConcurrency)
+	logger.Printf("- S3 download part size MB: %d", cacheConfig.S3DownloadPartSize/(1024*1024))
+	logger.Printf("- S3 upload concurrency: %d", cacheConfig.S3UploadConcurrency)
+	logger.Printf("- S3 upload part size MB: %d", cacheConfig.S3UploadPartSize/(1024*1024))
+	logger.Printf("- S3 force path style: %t", cacheConfig.S3ForcePathStyle)
+	if cacheConfig.S3Endpoint != "" {
+		logger.Printf("- S3 endpoint override: %s", cacheConfig.S3Endpoint)
+	}
 	logger.Printf("- Peer read threshold bytes: %d", cacheConfig.MaxPeerSize)
 	logger.Printf("- Assumed per-peer read throughput MB/s: %d", *peerReadMBps)
 	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
@@ -473,6 +553,19 @@ func envInt(name string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func defaultPeerID() string {
+	if podName := strings.TrimSpace(os.Getenv("POD_NAME")); podName != "" {
+		return podName
+	}
+	if host := strings.TrimSpace(os.Getenv("HOSTNAME")); host != "" {
+		return host
+	}
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return host
+	}
+	return fmt.Sprintf("peer-%d-%d", time.Now().UnixNano(), os.Getpid())
 }
 
 func measurePeerNetwork(ctx context.Context, coordClient coordinator.Coordinator, localPeerID string, probeBytes int, logger *log.Logger) *coordinator.PeerNetworkMetrics {

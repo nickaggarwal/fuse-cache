@@ -47,3 +47,17 @@ func TestOrderedPeersForPath_NonChunkIsStable(t *testing.T) {
 		}
 	}
 }
+
+func TestFileHintKey_ChunkUsesParentPath(t *testing.T) {
+	key := fileHintKey("/data.bin_chunk_128")
+	if key != "/data.bin" {
+		t.Fatalf("fileHintKey(chunk) = %q, want %q", key, "/data.bin")
+	}
+}
+
+func TestFileHintKey_NonChunkUsesOriginalPath(t *testing.T) {
+	key := fileHintKey("/regular-object")
+	if key != "/regular-object" {
+		t.Fatalf("fileHintKey(non-chunk) = %q, want %q", key, "/regular-object")
+	}
+}

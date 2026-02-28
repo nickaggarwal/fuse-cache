@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	peerGRPCInitialWindowBytes     = 16 * 1024 * 1024
-	peerGRPCInitialConnWindowBytes = 64 * 1024 * 1024
-	peerGRPCMaxMessageBytes        = 64 * 1024 * 1024
+	peerGRPCInitialWindowBytes     = 64 * 1024 * 1024
+	peerGRPCInitialConnWindowBytes = 256 * 1024 * 1024
+	peerGRPCMaxMessageBytes        = 128 * 1024 * 1024
+	peerDefaultReadConnPerPeer     = 8
 )
 
 // PeerStorage implements TierStorage for peer-to-peer storage via gRPC.
@@ -34,6 +35,9 @@ type PeerStorage struct {
 	localPeerID         string
 	connMu              sync.RWMutex
 	connPool            map[string]*grpc.ClientConn
+	readConnMu          sync.RWMutex
+	readConnPool        map[string][]*grpc.ClientConn
+	readConnPerPeer     int
 	metaMu              sync.RWMutex
 	peersCache          []*coordinator.PeerInfo
 	peersCacheAt        time.Time
@@ -55,10 +59,28 @@ func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localP
 		minReplicationCount: 3,
 		localPeerID:         localPeerID,
 		connPool:            make(map[string]*grpc.ClientConn),
+		readConnPool:        make(map[string][]*grpc.ClientConn),
+		readConnPerPeer:     peerDefaultReadConnPerPeer,
 		peersCacheTTL:       2 * time.Second,
 		fileHints:           make(map[string]fileHintCacheEntry),
 		fileHintsTTL:        5 * time.Second,
 	}, nil
+}
+
+func dialPeerConn(addr string) (*grpc.ClientConn, error) {
+	conn, err := grpc.Dial(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialWindowSize(peerGRPCInitialWindowBytes),
+		grpc.WithInitialConnWindowSize(peerGRPCInitialConnWindowBytes),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(peerGRPCMaxMessageBytes),
+			grpc.MaxCallSendMsgSize(peerGRPCMaxMessageBytes),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial peer %s: %v", addr, err)
+	}
+	return conn, nil
 }
 
 // getOrDial returns a cached gRPC connection or dials a new one.
@@ -78,20 +100,78 @@ func (ps *PeerStorage) getOrDial(addr string) (*grpc.ClientConn, error) {
 		return conn, nil
 	}
 
-	conn, err := grpc.Dial(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithInitialWindowSize(peerGRPCInitialWindowBytes),
-		grpc.WithInitialConnWindowSize(peerGRPCInitialConnWindowBytes),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(peerGRPCMaxMessageBytes),
-			grpc.MaxCallSendMsgSize(peerGRPCMaxMessageBytes),
-		),
-	)
+	conn, err := dialPeerConn(addr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial peer %s: %v", addr, err)
+		return nil, err
 	}
 	ps.connPool[addr] = conn
 	return conn, nil
+}
+
+func (ps *PeerStorage) readConnSlot(path string) int {
+	if ps.readConnPerPeer <= 1 {
+		return 0
+	}
+	return peerStartIndexForKey(path+"#read-conn", ps.readConnPerPeer)
+}
+
+func (ps *PeerStorage) getOrDialReadConn(addr, path string) (*grpc.ClientConn, int, error) {
+	slot := ps.readConnSlot(path)
+
+	ps.readConnMu.RLock()
+	if conns, ok := ps.readConnPool[addr]; ok && slot < len(conns) && conns[slot] != nil {
+		conn := conns[slot]
+		ps.readConnMu.RUnlock()
+		return conn, slot, nil
+	}
+	ps.readConnMu.RUnlock()
+
+	ps.readConnMu.Lock()
+	defer ps.readConnMu.Unlock()
+
+	conns, ok := ps.readConnPool[addr]
+	if !ok || len(conns) < ps.readConnPerPeer {
+		newConns := make([]*grpc.ClientConn, ps.readConnPerPeer)
+		copy(newConns, conns)
+		conns = newConns
+		ps.readConnPool[addr] = conns
+	}
+	if conns[slot] != nil {
+		return conns[slot], slot, nil
+	}
+
+	conn, err := dialPeerConn(addr)
+	if err != nil {
+		return nil, slot, err
+	}
+	conns[slot] = conn
+	ps.readConnPool[addr] = conns
+	return conn, slot, nil
+}
+
+func (ps *PeerStorage) evictReadConn(addr string, slot int) {
+	ps.readConnMu.Lock()
+	var conn *grpc.ClientConn
+	if conns, ok := ps.readConnPool[addr]; ok && slot >= 0 && slot < len(conns) {
+		conn = conns[slot]
+		conns[slot] = nil
+	}
+	ps.readConnMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (ps *PeerStorage) evictConn(addr string) {
+	ps.connMu.Lock()
+	conn, ok := ps.connPool[addr]
+	if ok {
+		delete(ps.connPool, addr)
+	}
+	ps.connMu.Unlock()
+	if ok && conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // Read reads a file from peer storage using parallel fan-out.
@@ -196,8 +276,10 @@ func (ps *PeerStorage) partitionPeersForPath(ctx context.Context, path string, p
 
 func (ps *PeerStorage) peerIDsForPath(ctx context.Context, path string) map[string]struct{} {
 	now := time.Now()
+	hintKey := fileHintKey(path)
+
 	ps.metaMu.RLock()
-	if hint, ok := ps.fileHints[path]; ok && now.Before(hint.expiresAt) {
+	if hint, ok := ps.fileHints[hintKey]; ok && now.Before(hint.expiresAt) {
 		peerIDs := clonePeerIDSet(hint.peerIDs)
 		ps.metaMu.RUnlock()
 		return peerIDs
@@ -229,18 +311,19 @@ func (ps *PeerStorage) peerIDsForPath(ctx context.Context, path string) map[stri
 		return found
 	}
 
-	if collect(path) {
-		ps.putFileHint(path, out)
+	if parent, ok := parentFilePathFromChunkPath(path); ok {
+		// Chunk metadata is usually published at parent-file granularity.
+		// Avoid per-chunk coordinator lookups that add latency and pressure.
+		_ = collect(parent)
+		ps.putFileHint(hintKey, out)
 		return out
 	}
-	if parent, ok := parentFilePathFromChunkPath(path); ok {
-		_ = collect(parent)
-		if len(out) > 0 {
-			ps.putFileHint(path, out)
-		}
+	if collect(path) {
+		ps.putFileHint(hintKey, out)
+		return out
 	}
 	if len(out) == 0 {
-		ps.putFileHint(path, out)
+		ps.putFileHint(hintKey, out)
 	}
 	return out
 }
@@ -260,6 +343,13 @@ func clonePeerIDSet(src map[string]struct{}) map[string]struct{} {
 		dst[k] = struct{}{}
 	}
 	return dst
+}
+
+func fileHintKey(path string) string {
+	if parent, ok := parentFilePathFromChunkPath(path); ok {
+		return parent
+	}
+	return path
 }
 
 // Write writes a file to peer storage with replication.
@@ -360,11 +450,24 @@ func (ps *PeerStorage) Size(ctx context.Context, path string) (int64, error) {
 // Close closes all pooled gRPC connections.
 func (ps *PeerStorage) Close() {
 	ps.connMu.Lock()
-	defer ps.connMu.Unlock()
 	for addr, conn := range ps.connPool {
 		conn.Close()
 		delete(ps.connPool, addr)
 	}
+	ps.connMu.Unlock()
+
+	ps.readConnMu.Lock()
+	for addr, conns := range ps.readConnPool {
+		for i, conn := range conns {
+			if conn == nil {
+				continue
+			}
+			_ = conn.Close()
+			conns[i] = nil
+		}
+		delete(ps.readConnPool, addr)
+	}
+	ps.readConnMu.Unlock()
 }
 
 // cryptoShuffle performs a Fisher-Yates shuffle using crypto/rand.
@@ -425,46 +528,78 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 }
 
 func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) ([]byte, error) {
-	conn, err := ps.getOrDial(grpcAddr)
-	if err != nil {
-		return nil, err
-	}
+	readWithConn := func(conn *grpc.ClientConn) ([]byte, error) {
+		client := pb.NewPeerServiceClient(conn)
+		callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+		defer cancel()
+		stream, err := client.ReadFile(callCtx, &pb.ReadFileRequest{Path: path})
+		if err != nil {
+			return nil, err
+		}
 
-	client := pb.NewPeerServiceClient(conn)
-	callCtx, cancel := context.WithTimeout(ctx, ps.timeout)
-	defer cancel()
-	stream, err := client.ReadFile(callCtx, &pb.ReadFileRequest{Path: path})
-	if err != nil {
-		return nil, err
-	}
-
-	first, err := stream.Recv()
-	if err == io.EOF {
-		return []byte{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	// Chunk streams are commonly 4MiB slices; pre-allocate enough for typical
-	// fused chunk objects to avoid repeated growth.
-	capHint := len(first.Data) * 8
-	if capHint < len(first.Data) {
-		capHint = len(first.Data)
-	}
-	data := make([]byte, 0, capHint)
-	data = append(data, first.Data...)
-
-	for {
-		chunk, err := stream.Recv()
+		first, err := stream.Recv()
 		if err == io.EOF {
-			break
+			return []byte{}, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		data = append(data, chunk.Data...)
+
+		second, err := stream.Recv()
+		if err == io.EOF {
+			// Single-message payload (common case for 8MiB cache chunks with
+			// larger gRPC frame size): return without an extra copy.
+			return first.Data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// Multi-message payload: allocate once and append all fragments.
+		capHint := len(first.Data) + len(second.Data)*2
+		if capHint < len(first.Data)+len(second.Data) {
+			capHint = len(first.Data) + len(second.Data)
+		}
+		data := make([]byte, 0, capHint)
+		data = append(data, first.Data...)
+		data = append(data, second.Data...)
+
+		for {
+			chunk, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			data = append(data, chunk.Data...)
+		}
+		return data, nil
 	}
-	return data, nil
+
+	conn, slot, err := ps.getOrDialReadConn(grpcAddr, path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readWithConn(conn)
+	if err == nil {
+		return data, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+
+	// On stream failures, drop this read-slot connection and retry once.
+	ps.evictReadConn(grpcAddr, slot)
+	retryConn, _, dialErr := ps.getOrDialReadConn(grpcAddr, path)
+	if dialErr != nil {
+		return nil, fmt.Errorf("peer read failed and reconnect failed for %s: read=%v reconnect=%v", grpcAddr, err, dialErr)
+	}
+	retryData, retryErr := readWithConn(retryConn)
+	if retryErr == nil {
+		return retryData, nil
+	}
+	return nil, fmt.Errorf("peer read failed after reconnect for %s: first=%v retry=%v", grpcAddr, err, retryErr)
 }
 
 func (ps *PeerStorage) writeToPeer(ctx context.Context, grpcAddr, path string, data []byte) error {
