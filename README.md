@@ -291,6 +291,47 @@ Default cache sizes:
   - `fuse_cache_cloud_read_bytes_total`, `fuse_cache_cloud_read_seconds_total`, `fuse_cache_cloud_read_mbps`
   - `fuse_cache_nvme_read_bytes_total`, `fuse_cache_nvme_read_seconds_total`, `fuse_cache_nvme_read_mbps`
 
+## Benchmark Matrix
+
+Benchmark fields captured:
+- Cloud test type
+- Machine types
+- Results (write/read)
+- Peer speed, cloud speed, object speed
+- Net start at test start (writer/reader)
+- CPU start at test start (writer/reader/coordinator)
+- Git SHA used for run
+
+Notes:
+- `Peer speed` / `Cloud speed` are computed from per-tier metric deltas on the reader pod (`/api/cache/stats`).
+- `Object speed` is end-to-end read throughput from benchmark script output (`READ_MBPS_APPROX`).
+- `Net start` comes from coordinator peer telemetry (`/api/peers` -> `network_speed_mbps`).
+- `CPU start` comes from `kubectl top pod` snapshot taken just before each run.
+- Historical rows keep `N/A` where older runs did not capture that field.
+
+### Latest E2E (2026-02-28, EKS `fuse-system-awstest`)
+
+| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
+|---|---|---|---|---:|---:|---:|---:|---:|---|---|
+| 2026-02-28 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read.sh` 1GB | `681 / 1211` | `335.5` | `0.0` | `1211` | `1012.6 / 996.0` | `44m / 2m / 1m` | `87bcb18` |
+| 2026-02-28 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read.sh` 5GB | `196 / 1225` | `351.1` | `0.0` | `1225` | `1004.1 / 921.6` | `87m / 1m / 1m` | `87bcb18` |
+| 2026-02-28 | `s3-standard` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `664 / 1203` | `336.6` | `0.0` | `1203` | `848.7 / 809.8` | `172m / 1m / 1m` | `87bcb18` |
+| 2026-02-28 | `s3express` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `670 / 1221` | `340.2` | `0.0` | `1221` | `816.4 / 787.4` | `166m / 1m / 1m` | `87bcb18` |
+
+### Historical Scenarios
+
+| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
+|---|---|---|---|---:|---:|---:|---:|---:|---|---|
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Baseline before hotspot iteration, 1GB | `699 / 788` | `N/A` | `0.0` | `788` | `N/A` | `N/A` | `25f8711` |
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Baseline before hotspot iteration, 5GB | `339 / 887` | `N/A` | `0.0` | `887` | `N/A` | `N/A` | `25f8711` |
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration A (regression), 1GB | `703 / 634-646` | `N/A` | `0.0` | `634-646` | `N/A` | `N/A` | `WIP pre-5ddcd09` |
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration A (regression), 5GB | `203 / 838` | `N/A` | `0.0` | `838` | `N/A` | `N/A` | `WIP pre-5ddcd09` |
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration B (accepted), 1GB | `697 / 1201-1244` | `N/A` | `0.0` | `1201-1244` | `N/A` | `N/A` | `5ddcd09` |
+| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration B (accepted), 5GB | `206-219 / 1368-1395` | `N/A` | `0.0` | `1368-1395` | `N/A` | `N/A` | `5ddcd09` |
+| 2026-02-21 | `azure hybrid` | `2x A100 + 1x L64s_v3` | Azure cloud optimization, 5GB run #2 | `N/A / 420` | `145.8` | `274.5` | `420` | `N/A` | `N/A` | `rev 71 image fuse-cloudopt-20260221100456` |
+| 2026-02-21 | `gofuse cached-read` | `A100 writer + A100 reader` | go-fuse cold/cached suite, 1GB | `274 / cold 547, cached 2316` | `N/A` | `N/A` | `547 (cold)` | `N/A` | `N/A` | `rev 74 image gofuse-benchfix2-20260221-110935` |
+| 2026-02-21 | `gofuse cached-read` | `A100 writer + A100 reader` | go-fuse cold/cached suite, 5GB | `271 / cold 524, cached 2518` | `N/A` | `N/A` | `524 (cold)` | `N/A` | `N/A` | `rev 74 image gofuse-benchfix2-20260221-110935` |
+
 ## Future Enhancements
 
 - gRPC for faster peer communication
