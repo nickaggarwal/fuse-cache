@@ -318,6 +318,14 @@ Notes:
 | 2026-02-28 | `s3-standard` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `664 / 1203` | `336.6` | `0.0` | `1203` | `848.7 / 809.8` | `172m / 1m / 1m` | `87bcb18` |
 | 2026-02-28 | `s3express` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `670 / 1221` | `340.2` | `0.0` | `1221` | `816.4 / 787.4` | `166m / 1m / 1m` | `87bcb18` |
 
+### Latest E2E (2026-02-28, AKS `fuse-system-aztest`)
+
+| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
+|---|---|---|---|---:|---:|---:|---:|---:|---|---|
+| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 1GB | `277 / 473` | `16.2` | `0.0` | `473` | `0.0 / 0.0` | `1m / 1m / 1m` | `87bcb18` |
+| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 5GB | `267 / 561` | `21.6` | `0.0` | `561` | `0.0 / 0.0` | `98m / 1m / 1m` | `87bcb18` |
+| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `275 / 518` | `17.6` | `0.0` | `518` | `0.0 / 0.0` | `633m / 1m / 1m` | `87bcb18` |
+
 ### Historical Scenarios
 
 | Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
