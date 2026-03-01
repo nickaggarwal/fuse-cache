@@ -12,6 +12,8 @@ WRITER_POD="${2:-}"
 READER_POD="${3:-}"
 KUBECTL="kubectl --request-timeout=0"
 HYBRID_SETTLE_SEC="${HYBRID_SETTLE_SEC:-20}"
+READ_RETRIES="${READ_RETRIES:-8}"
+READ_RETRY_DELAY_SEC="${READ_RETRY_DELAY_SEC:-5}"
 SIZES_MB=(1024 5120)
 
 if [[ -z "$WRITER_POD" ]]; then
@@ -33,6 +35,7 @@ echo "Namespace: $NAMESPACE"
 echo "Writer pod: $WRITER_POD"
 echo "Reader pod: $READER_POD"
 echo "Hybrid settle wait: ${HYBRID_SETTLE_SEC}s"
+echo "Read retries: ${READ_RETRIES} (delay ${READ_RETRY_DELAY_SEC}s)"
 
 backend="$($KUBECTL -n "$NAMESPACE" get cm fuse-config -o jsonpath='{.data.FUSE_BACKEND}' 2>/dev/null || true)"
 if [[ -z "$backend" ]]; then
@@ -53,6 +56,18 @@ for SIZE_MB in "${SIZES_MB[@]}"; do
   echo
   echo "=== SIZE ${SIZE_MB}MiB ==="
   echo "File: $FUSE_FILE"
+
+  # Keep benchmark pressure deterministic by removing stale suite artifacts.
+  $KUBECTL -n "$NAMESPACE" exec "$WRITER_POD" -c client -- sh -lc "
+set -e
+rm -f /mnt/nvme/cache/gofuse-suite-* /mnt/nvme/cache/gofuse-suite-*.sha256 /mnt/nvme/cache/gofuse-suite-*_* /mnt/nvme/cache/gofuse-suite-*_*.sha256 2>/dev/null || true
+sync
+"
+  $KUBECTL -n "$NAMESPACE" exec "$READER_POD" -c client -- sh -lc "
+set -e
+rm -f /mnt/nvme/cache/gofuse-suite-* /mnt/nvme/cache/gofuse-suite-*.sha256 /mnt/nvme/cache/gofuse-suite-*_* /mnt/nvme/cache/gofuse-suite-*_*.sha256 2>/dev/null || true
+sync
+"
 
   set +e
   write_out="$($KUBECTL -n "$NAMESPACE" exec "$WRITER_POD" -c client -- sh -lc "
@@ -86,8 +101,11 @@ rm -f /mnt/nvme/cache/${BASENAME} /mnt/nvme/cache/${BASENAME}.sha256 /mnt/nvme/c
 sync
 "
 
-  set +e
-  cold_out="$($KUBECTL -n "$NAMESPACE" exec "$READER_POD" -c client -- sh -lc "
+  cold_out=""
+  cold_rc=1
+  for attempt in $(seq 1 "$READ_RETRIES"); do
+    set +e
+    cold_out="$($KUBECTL -n "$NAMESPACE" exec "$READER_POD" -c client -- sh -lc "
 set -e
 for i in \$(seq 1 120); do
   if [ -f ${FUSE_FILE} ]; then break; fi
@@ -119,8 +137,16 @@ echo COLD_READ_MS=\$dt_ms
 echo COLD_READ_BYTES=\$bytes
 echo COLD_READ_MBPS_APPROX=\$mbps
 " 2>&1)"
-  cold_rc=$?
-  set -e
+    cold_rc=$?
+    set -e
+    if [[ $cold_rc -eq 0 ]]; then
+      break
+    fi
+    if [[ "$attempt" -lt "$READ_RETRIES" ]]; then
+      echo "Cold read attempt ${attempt}/${READ_RETRIES} failed; retrying in ${READ_RETRY_DELAY_SEC}s..."
+      sleep "$READ_RETRY_DELAY_SEC"
+    fi
+  done
   if [[ $cold_rc -ne 0 ]]; then
     printf '%s\n' "$cold_out"
     exit $cold_rc
@@ -157,8 +183,11 @@ fi
     echo "INFO: no NVMe file detected for ${BASENAME}; cached read may be served from range/kernel cache."
   fi
 
-  set +e
-  cached_out="$($KUBECTL -n "$NAMESPACE" exec "$READER_POD" -c client -- sh -lc "
+  cached_out=""
+  cached_rc=1
+  for attempt in $(seq 1 "$READ_RETRIES"); do
+    set +e
+    cached_out="$($KUBECTL -n "$NAMESPACE" exec "$READER_POD" -c client -- sh -lc "
 set -e
 s=\$(date +%s%N)
 dd_out=\$(dd if=${FUSE_FILE} of=/dev/null bs=1M count=${SIZE_MB} 2>&1 >/dev/null)
@@ -181,8 +210,16 @@ echo CACHED_READ_MS=\$dt_ms
 echo CACHED_READ_BYTES=\$bytes
 echo CACHED_READ_MBPS_APPROX=\$mbps
 " 2>&1)"
-  cached_rc=$?
-  set -e
+    cached_rc=$?
+    set -e
+    if [[ $cached_rc -eq 0 ]]; then
+      break
+    fi
+    if [[ "$attempt" -lt "$READ_RETRIES" ]]; then
+      echo "Cached read attempt ${attempt}/${READ_RETRIES} failed; retrying in ${READ_RETRY_DELAY_SEC}s..."
+      sleep "$READ_RETRY_DELAY_SEC"
+    fi
+  done
   if [[ $cached_rc -ne 0 ]]; then
     printf '%s\n' "$cached_out"
     exit $cached_rc

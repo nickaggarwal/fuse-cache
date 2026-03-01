@@ -206,3 +206,40 @@
 ### Outcome
 - Keep: Ideas 1, 2, 3.
 - Rejected: Idea 4 (go-fuse read-window prefetch) due clear throughput regression.
+
+## 2026-03-01 AKS Cached-Read + Large-File Reliability Pass
+- Cluster/namespace: `stargz-test` / `fuse-system-aztest`
+- Backend: `gofuse` with passthrough enabled
+- Helm revisions:
+  - `86`: added `-nvme-max-gb` wiring in chart, set `config.nvmeMaxGB=48`
+  - `87`: chart compatibility gate for advanced S3 flags (`config.s3AdvancedArgsEnabled=false`) to match AKS client image flag set
+
+### Failure reason found
+- 5GB cached suite intermittently failed with:
+  - `failed to read chunk 0 ... from remote tiers`
+  - FUSE read `Input/output error`
+- Root cause pattern:
+  - On writer pod, only a subset of chunks for the 5GB object existed in NVMe (for example, 192 chunks present out of expected 320 at 16MiB/chunk).
+  - With default `nvme-max-gb=10` and prior benchmark residue, older/newer chunks were evicted under pressure before async cloud persistence completed, leaving gaps.
+
+### Changes applied
+1. Increased working-set headroom on AKS via chart-configured `-nvme-max-gb` (set to `48` for benchmark run).
+2. Hardened `scripts/ops/test-gofuse-cached-read-suite.sh`:
+   - Added configurable read retries:
+     - `READ_RETRIES` (default `8`)
+     - `READ_RETRY_DELAY_SEC` (default `5`)
+   - Cleaned stale NVMe benchmark artifacts before each size iteration.
+   - Kept FUSE-mounted file deletion out of cleanup path to avoid noisy I/O cleanup errors.
+3. Added chart switch `config.s3AdvancedArgsEnabled` (default `false`) so older AKS images that do not support advanced S3 flags can still roll.
+
+### Observed results (A100 writer -> A100 reader)
+- `test-gofuse-cached-read-suite.sh`:
+  - 1GB: write `282 MB/s`, cold `436 MB/s`, cached `2003 MB/s`
+  - 5GB: write `262 MB/s`, cold `622 MB/s`, cached `2389 MB/s`
+- `test-smart-read.sh` after NVMe headroom increase:
+  - 1GB: `264 / 545 MB/s` (write/read)
+  - 5GB: `270 / 648 MB/s` (write/read)
+
+### Takeaway
+- Increasing NVMe headroom removed the worst large-file chunk availability regressions and improved 5GB cold-read throughput versus prior AKS runs.
+- Cached read remains far higher than cold read due range/kernel cache effects in the current go-fuse read path.

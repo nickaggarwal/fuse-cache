@@ -325,6 +325,15 @@ Notes:
 | 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 1GB | `277 / 473` | `16.2` | `0.0` | `473` | `0.0 / 0.0` | `1m / 1m / 1m` | `87bcb18` |
 | 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 5GB | `267 / 561` | `21.6` | `0.0` | `561` | `0.0 / 0.0` | `98m / 1m / 1m` | `87bcb18` |
 | 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `275 / 518` | `17.6` | `0.0` | `518` | `0.0 / 0.0` | `633m / 1m / 1m` | `87bcb18` |
+| 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `264 / 545` | `N/A` | `N/A` | `545` | `N/A` | `N/A` | `5fa1f9c+` |
+| 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB | `270 / 648` | `N/A` | `N/A` | `648` | `N/A` | `N/A` | `5fa1f9c+` |
+
+### Latest Cached Read (2026-03-01, AKS `fuse-system-aztest`)
+
+| Date | Machine Types | Scenario | Write MB/s | Cold Read MB/s | Cached Read MB/s | Notes | Git SHA |
+|---|---|---|---:|---:|---:|---|---|
+| 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 1GB | `282` | `436` | `2003` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
+| 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 5GB | `262` | `622` | `2389` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
 
 ### Historical Scenarios
 
@@ -540,10 +549,15 @@ Examples:
 helm upgrade fuse-cache-aztest charts/fuse-cache -n fuse-system-aztest \
   --reuse-values \
   --set config.fuseBackend=gofuse \
-  --set config.goFuseEnablePassthrough=true
+  --set config.goFuseEnablePassthrough=true \
+  --set config.nvmeMaxGB=48
 
 # Run 1GiB + 5GiB cold-read vs cached-read throughput suite
 ./scripts/ops/test-gofuse-cached-read-suite.sh fuse-system-aztest
+
+# Optional: increase cold/cached read retry budget for large-file convergence
+READ_RETRIES=12 READ_RETRY_DELAY_SEC=5 HYBRID_SETTLE_SEC=30 \
+  ./scripts/ops/test-gofuse-cached-read-suite.sh fuse-system-aztest
 ```
 
 ## License

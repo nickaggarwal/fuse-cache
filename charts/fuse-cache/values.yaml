@@ -48,6 +48,7 @@ config:
   coordinatorAddr: ""
   coordinatorGrpcAddr: ""
   nvmeCachePath: /mnt/nvme/cache
+  nvmeMaxGB: "10"
   fuseMountPath: /host/mnt/fuse
   chunkSizeMB: "16"
   parallelRangeReads: "96"
@@ -62,6 +63,7 @@ config:
   s3UploadPartSizeMB: "8"
   s3Endpoint: ""
   s3ForcePathStyle: "false"
+  s3AdvancedArgsEnabled: "false"
   azureDownloadConcurrency: "8"
   azureDownloadBlockSizeMB: "4"
   azureParallelDownloadMinSizeMB: "8"

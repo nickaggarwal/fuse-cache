@@ -63,6 +63,8 @@ spec:
             - "$(FUSE_MOUNT_PATH)"
             - "-nvme"
             - "$(NVME_CACHE_PATH)"
+            - "-nvme-max-gb"
+            - "$(FUSE_NVME_MAX_GB)"
             - "-coordinator"
             - "$(COORDINATOR_ADDR)"
             - "-port"
@@ -75,6 +77,7 @@ spec:
             - "$(S3_BUCKET)"
             - "-s3-region"
             - "$(S3_REGION)"
+            {{- if eq (.Values.config.s3AdvancedArgsEnabled | toString) "true" }}
             - "-s3-download-concurrency"
             - "$(FUSE_S3_DOWNLOAD_CONCURRENCY)"
             - "-s3-download-part-size-mb"
@@ -85,6 +88,7 @@ spec:
             - "$(FUSE_S3_UPLOAD_PART_SIZE_MB)"
             - "-s3-endpoint"
             - "$(S3_ENDPOINT)"
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: fuse-config
