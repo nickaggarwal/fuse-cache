@@ -150,6 +150,10 @@ type CacheConfig struct {
 	// HybridAlwaysMinSize enables peer+cloud hedging for files at or above this
 	// size, even if optimistic peer throughput estimates suggest peer-only.
 	HybridAlwaysMinSize int64
+
+	// HybridStripeMinSize enables deterministic peer/cloud chunk striping for
+	// large files at or above this size.
+	HybridStripeMinSize int64
 }
 
 // DefaultCacheManager implements CacheManager
@@ -198,7 +202,8 @@ type chunkFetchState struct {
 const slowChunkReadThreshold = 2 * time.Second
 const defaultHybridCloudHedgeDelay = 20 * time.Millisecond
 const defaultHybridMaxSecondaryInflight = 16
-const defaultHybridAlwaysMinSize = 512 * 1024 * 1024 // 512MiB
+const defaultHybridAlwaysMinSize = 512 * 1024 * 1024  // 512MiB
+const defaultHybridStripeMinSize = 1024 * 1024 * 1024 // 1GiB
 const chunkFetchWaitTimeout = 15 * time.Second
 const defaultHybridMetadataLookupTimeout = 500 * time.Millisecond
 
@@ -265,6 +270,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 	if config.HybridAlwaysMinSize <= 0 {
 		config.HybridAlwaysMinSize = defaultHybridAlwaysMinSize
+	}
+	if config.HybridStripeMinSize <= 0 {
+		config.HybridStripeMinSize = defaultHybridStripeMinSize
 	}
 
 	cm := &DefaultCacheManager{
@@ -537,6 +545,20 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 	cm.mu.Unlock()
 
 	return enabled
+}
+
+func (cm *DefaultCacheManager) shouldStripeHybridChunk(filePath string, chunkIndex int64) bool {
+	if cm.config.HybridStripeMinSize <= 0 {
+		return false
+	}
+	if chunkIndex < 0 || chunkIndex%2 == 0 {
+		return false
+	}
+	fileSize, ok := cm.lookupFileSizeHint(filePath)
+	if !ok {
+		return false
+	}
+	return fileSize >= cm.config.HybridStripeMinSize
 }
 
 func (cm *DefaultCacheManager) getFromHybridRemote(ctx context.Context, filePath string) (*CacheEntry, error) {
@@ -1844,10 +1866,12 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	if len(remoteOrder) >= 2 {
 		primary, secondary = remoteOrder[0], remoteOrder[1]
 	}
+	if hybridRead && cm.shouldStripeHybridChunk(filePath, chunkIndex) {
+		primary, secondary = secondary, primary
+	}
 	if hybridRead {
 		hybridPrimary := primary
 		hybridSecondary := secondary
-		// Keep peer as primary on all chunks; cloud remains a hedged fallback.
 		hybridStart := time.Now()
 		if chunkEntry, tier, err := cm.readChunkHybridHedged(ctx, chunkPath, hybridPrimary, hybridSecondary); err == nil {
 			tierDur := time.Since(hybridStart)

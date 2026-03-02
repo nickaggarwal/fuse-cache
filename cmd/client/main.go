@@ -72,6 +72,7 @@ func main() {
 		prefetchChunks  = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
 		rangeChunkCache = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
 		hybridAlwaysMB  = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
+		hybridStripeMB  = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
 		hybridHedgeMS   = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
 		hybridHedgeMax  = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
 		mountRetries    = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
@@ -163,6 +164,7 @@ func main() {
 		RangePrefetchChunks:        *prefetchChunks,
 		RangeChunkCacheSize:        *rangeChunkCache,
 		HybridAlwaysMinSize:        int64(*hybridAlwaysMB) * 1024 * 1024,
+		HybridStripeMinSize:        int64(*hybridStripeMB) * 1024 * 1024,
 		HybridCloudHedgeDelay:      time.Duration(*hybridHedgeMS) * time.Millisecond,
 		HybridMaxSecondaryInflight: *hybridHedgeMax,
 
@@ -229,6 +231,14 @@ func main() {
 			*hybridAlwaysMB = n
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_HYBRID_ALWAYS_MIN_SIZE_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_HYBRID_STRIPE_MIN_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.HybridStripeMinSize = int64(n) * 1024 * 1024
+			*hybridStripeMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_HYBRID_STRIPE_MIN_SIZE_MB value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_AZURE_DOWNLOAD_CONCURRENCY"); v != "" {
@@ -424,6 +434,7 @@ func main() {
 	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
 	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
 	logger.Printf("- Hybrid always min size MB: %d", cacheConfig.HybridAlwaysMinSize/(1024*1024))
+	logger.Printf("- Hybrid stripe min size MB: %d", cacheConfig.HybridStripeMinSize/(1024*1024))
 	logger.Printf("- Azure download concurrency: %d", cacheConfig.AzureDownloadConcurrency)
 	logger.Printf("- Azure download block size MB: %d", cacheConfig.AzureDownloadBlockSizeBytes/(1024*1024))
 	logger.Printf("- Azure parallel download min size MB: %d", cacheConfig.AzureParallelDownloadMinBytes/(1024*1024))

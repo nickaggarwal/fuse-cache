@@ -27,6 +27,7 @@ data:
   FUSE_AZURE_DOWNLOAD_BLOCK_SIZE_MB: {{ .Values.config.azureDownloadBlockSizeMB | quote }}
   FUSE_AZURE_PARALLEL_DOWNLOAD_MIN_SIZE_MB: {{ .Values.config.azureParallelDownloadMinSizeMB | quote }}
   FUSE_HYBRID_ALWAYS_MIN_SIZE_MB: {{ .Values.config.hybridAlwaysMinSizeMB | quote }}
+  FUSE_HYBRID_STRIPE_MIN_SIZE_MB: {{ .Values.config.hybridStripeMinSizeMB | quote }}
   FUSE_HYBRID_HEDGE_DELAY_MS: {{ .Values.config.hybridHedgeDelayMs | quote }}
   FUSE_HYBRID_MAX_SECONDARY_INFLIGHT: {{ .Values.config.hybridMaxSecondaryInflight | quote }}
   FUSE_IO_PROGRESS_MB: {{ .Values.config.fuseIOProgressMB | quote }}
