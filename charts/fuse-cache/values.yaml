@@ -67,6 +67,7 @@ config:
   azureDownloadConcurrency: "8"
   azureDownloadBlockSizeMB: "4"
   azureParallelDownloadMinSizeMB: "8"
+  hybridAlwaysMinSizeMB: "512"
   hybridHedgeDelayMs: "20"
   hybridMaxSecondaryInflight: "16"
   fuseIOProgressMB: "512"

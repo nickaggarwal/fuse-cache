@@ -187,15 +187,29 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
 	ordered = append(ordered, preferred...)
 	ordered = append(ordered, fallback...)
-	if len(ordered) == 0 {
-		return nil, fmt.Errorf("no active peers available")
-	}
-
-	var lastErr error
+	candidates := make([]*coordinator.PeerInfo, 0, len(ordered))
 	for _, peer := range ordered {
 		if peer == nil || peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
+		candidates = append(candidates, peer)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no active peers available")
+	}
+
+	var lastErr error
+	parallelFanout := peerReadParallelFanout(path, len(candidates))
+	if parallelFanout > 1 {
+		if data, err := ps.readFromPeersParallel(ctx, path, candidates[:parallelFanout]); err == nil {
+			return data, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	for i := parallelFanout; i < len(candidates); i++ {
+		peer := candidates[i]
 		data, err := ps.readFromPeer(ctx, peer.GRPCAddress, path)
 		if err == nil {
 			return data, nil
@@ -207,6 +221,69 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("file not found on any peer")
+}
+
+func peerReadParallelFanout(path string, candidateCount int) int {
+	if candidateCount <= 1 {
+		return candidateCount
+	}
+	// Chunk reads benefit most from immediate multi-peer fan-out.
+	if _, ok := chunkIndexFromPath(path); ok {
+		if candidateCount >= 2 {
+			return 2
+		}
+	}
+	return 1
+}
+
+func (ps *PeerStorage) readFromPeersParallel(ctx context.Context, path string, peers []*coordinator.PeerInfo) ([]byte, error) {
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("no peers provided")
+	}
+	if len(peers) == 1 {
+		return ps.readFromPeer(ctx, peers[0].GRPCAddress, path)
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultCh := make(chan readResult, len(peers))
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		p := peer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			data, err := ps.readFromPeer(readCtx, p.GRPCAddress, path)
+			resultCh <- readResult{data: data, err: err}
+		}()
+	}
+
+	var lastErr error
+	for i := 0; i < len(peers); i++ {
+		res := <-resultCh
+		if res.err == nil {
+			cancel()
+			go func() {
+				wg.Wait()
+				close(resultCh)
+			}()
+			return res.data, nil
+		}
+		lastErr = res.err
+	}
+	wg.Wait()
+	close(resultCh)
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("parallel peer read failed")
+	}
+	return nil, lastErr
 }
 
 func orderedPeersForPath(peers []*coordinator.PeerInfo, key string) []*coordinator.PeerInfo {

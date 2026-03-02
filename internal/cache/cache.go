@@ -28,7 +28,8 @@ type Coordinator = coordinator.Coordinator
 type CacheTier int
 
 const (
-	TierNVMe CacheTier = iota
+	TierUnknown CacheTier = -1
+	TierNVMe    CacheTier = iota
 	TierPeer
 	TierCloud
 )
@@ -145,6 +146,10 @@ type CacheConfig struct {
 
 	// HybridMaxSecondaryInflight bounds concurrent hedged secondary reads.
 	HybridMaxSecondaryInflight int
+
+	// HybridAlwaysMinSize enables peer+cloud hedging for files at or above this
+	// size, even if optimistic peer throughput estimates suggest peer-only.
+	HybridAlwaysMinSize int64
 }
 
 // DefaultCacheManager implements CacheManager
@@ -181,12 +186,14 @@ type hybridReadHint struct {
 type chunkFetchState struct {
 	done chan struct{}
 	data []byte
+	tier CacheTier
 	err  error
 }
 
 const slowChunkReadThreshold = 2 * time.Second
 const defaultHybridCloudHedgeDelay = 20 * time.Millisecond
 const defaultHybridMaxSecondaryInflight = 16
+const defaultHybridAlwaysMinSize = 512 * 1024 * 1024 // 512MiB
 const chunkFetchWaitTimeout = 15 * time.Second
 const defaultHybridMetadataLookupTimeout = 500 * time.Millisecond
 
@@ -250,6 +257,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 	if config.HybridMaxSecondaryInflight <= 0 {
 		config.HybridMaxSecondaryInflight = defaultHybridMaxSecondaryInflight
+	}
+	if config.HybridAlwaysMinSize <= 0 {
+		config.HybridAlwaysMinSize = defaultHybridAlwaysMinSize
 	}
 
 	cm := &DefaultCacheManager{
@@ -501,20 +511,18 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 		effectiveReplicas = 1
 	}
 	peerCapacity := int64(effectiveReplicas) * cm.config.PeerReadThroughputBytesPerSec
+	enabled := false
 
-	// When estimated peer capacity already covers the file size, skip cloud probes.
-	// This avoids expensive cloud HEAD calls on read paths that will stay peer-first.
-	if fileSize <= peerCapacity {
-		cm.mu.Lock()
-		cm.hybridHints[filePath] = hybridReadHint{
-			enabled:   false,
-			expiresAt: now.Add(cm.config.MetadataRefreshTTL),
-		}
-		cm.mu.Unlock()
-		return false
+	// For large objects, always enable peer+cloud hedging when at least one peer
+	// has data. This prevents optimistic peer-throughput assumptions from
+	// suppressing cloud acceleration.
+	if peerReplicas > 0 && fileSize >= cm.config.HybridAlwaysMinSize {
+		enabled = true
+	} else if fileSize > peerCapacity && hasCloud && peerReplicas > 0 {
+		// Smaller files keep prior behavior: enable hybrid only when peer
+		// throughput estimate is insufficient and cloud is known present.
+		enabled = true
 	}
-
-	enabled := hasCloud && peerReplicas > 0
 
 	cm.mu.Lock()
 	cm.hybridHints[filePath] = hybridReadHint{
@@ -1438,6 +1446,8 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		out := make([]byte, end-offset)
 		copy(out, got.Data[offset:end])
 		dur := time.Since(started)
+		nvmeWallBytes, peerWallBytes, cloudWallBytes := readWallTierBytes(got.Tier, int64(len(out)))
+		cm.metrics.RecordReadWall(int64(len(out)), dur, nvmeWallBytes, peerWallBytes, cloudWallBytes)
 		if dur >= slowChunkReadThreshold {
 			cm.logger.Printf("ReadRange slow non-chunked path=%s offset=%d size=%d dur=%v", filePath, offset, size, dur)
 		}
@@ -1460,6 +1470,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	endChunk := (end - 1) / chunkSize
 	chunkCount := int(endChunk-startChunk) + 1
 	chunks := make([][]byte, chunkCount)
+	chunkTiers := make([]CacheTier, chunkCount)
 	remoteOrder := cm.remoteReadOrder(filePath)
 	hybridRead := cm.shouldUseHybridRead(ctx, filePath, totalSize)
 	if !hybridRead && entry.NumChunks > 0 {
@@ -1475,11 +1486,12 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 
 	if chunkCount == 1 {
-		data, err := cm.readChunkData(ctx, filePath, startChunk, remoteOrder, hybridRead)
+		data, tier, err := cm.readChunkData(ctx, filePath, startChunk, remoteOrder, hybridRead)
 		if err != nil {
 			return nil, err
 		}
 		chunks[0] = data
+		chunkTiers[0] = tier
 	} else {
 		jobs := make(chan int, chunkCount)
 		errCh := make(chan error, 1)
@@ -1491,7 +1503,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 				defer wg.Done()
 				for pos := range jobs {
 					chunkIndex := startChunk + int64(pos)
-					data, err := cm.readChunkData(ctx, filePath, chunkIndex, remoteOrder, hybridRead)
+					data, tier, err := cm.readChunkData(ctx, filePath, chunkIndex, remoteOrder, hybridRead)
 					if err != nil {
 						select {
 						case errCh <- err:
@@ -1500,6 +1512,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 						return
 					}
 					chunks[pos] = data
+					chunkTiers[pos] = tier
 				}
 			}()
 		}
@@ -1531,7 +1544,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 			go func(chunkIndex int64) {
 				prefetchCtx, cancel := context.WithTimeout(context.Background(), cm.config.PeerTimeout)
 				defer cancel()
-				_, _ = cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead)
+				_, _, _ = cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead)
 			}(prefetchChunk)
 		}
 	}
@@ -1557,7 +1570,9 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		if to > int64(len(chunkData)) {
 			to = int64(len(chunkData))
 		}
+		nvmeWallBytes, peerWallBytes, cloudWallBytes := readWallTierBytes(chunkTiers[0], to-from)
 		dur := time.Since(started)
+		cm.metrics.RecordReadWall(to-from, dur, nvmeWallBytes, peerWallBytes, cloudWallBytes)
 		if dur >= slowChunkReadThreshold {
 			cm.logger.Printf("ReadRange slow chunked path=%s offset=%d size=%d chunks=%d workers=%d hybrid=%t dur=%v",
 				filePath, offset, size, chunkCount, workerCount, hybridRead, dur)
@@ -1566,6 +1581,9 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 
 	out := make([]byte, 0, end-offset)
+	var nvmeWallBytes int64
+	var peerWallBytes int64
+	var cloudWallBytes int64
 	for pos, chunkData := range chunks {
 		chunkIndex := startChunk + int64(pos)
 		chunkOffset := chunkIndex * chunkSize
@@ -1589,10 +1607,20 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		if to > int64(len(chunkData)) {
 			to = int64(len(chunkData))
 		}
+		sliceLen := to - from
+		switch chunkTiers[pos] {
+		case TierNVMe:
+			nvmeWallBytes += sliceLen
+		case TierPeer:
+			peerWallBytes += sliceLen
+		case TierCloud:
+			cloudWallBytes += sliceLen
+		}
 		out = append(out, chunkData[from:to]...)
 	}
 
 	dur := time.Since(started)
+	cm.metrics.RecordReadWall(int64(len(out)), dur, nvmeWallBytes, peerWallBytes, cloudWallBytes)
 	if dur >= slowChunkReadThreshold {
 		cm.logger.Printf("ReadRange slow chunked path=%s offset=%d size=%d chunks=%d workers=%d hybrid=%t dur=%v",
 			filePath, offset, size, chunkCount, workerCount, hybridRead, dur)
@@ -1671,11 +1699,11 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 	return nil, false
 }
 
-func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath string, chunkIndex int64, remoteOrder []CacheTier, hybridRead bool) ([]byte, error) {
+func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath string, chunkIndex int64, remoteOrder []CacheTier, hybridRead bool) ([]byte, CacheTier, error) {
 	chunkStart := time.Now()
 	chunkData, ok := cm.getChunkFromRangeCache(filePath, chunkIndex)
 	if ok {
-		return chunkData, nil
+		return chunkData, TierUnknown, nil
 	}
 
 	chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, chunkIndex)
@@ -1694,14 +1722,14 @@ func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath strin
 					cm.clearStaleChunkFetch(chunkPath, state)
 					continue
 				}
-				return nil, waitErr
+				return nil, TierUnknown, waitErr
 			case <-state.done:
 				waitCancel()
 			}
 			if state.err != nil {
-				return nil, state.err
+				return nil, state.tier, state.err
 			}
-			return state.data, nil
+			return state.data, state.tier, nil
 		}
 		return cm.fetchChunkAsLeader(ctx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart, state)
 	}
@@ -1723,9 +1751,10 @@ func (cm *DefaultCacheManager) startChunkFetch(chunkPath string) (*chunkFetchSta
 	return state, true
 }
 
-func (cm *DefaultCacheManager) completeChunkFetch(chunkPath string, state *chunkFetchState, data []byte, err error) {
+func (cm *DefaultCacheManager) completeChunkFetch(chunkPath string, state *chunkFetchState, data []byte, tier CacheTier, err error) {
 	cm.fetchMu.Lock()
 	state.data = data
+	state.tier = tier
 	state.err = err
 	close(state.done)
 	delete(cm.chunkFetches, chunkPath)
@@ -1751,13 +1780,14 @@ func (cm *DefaultCacheManager) fetchChunkAsLeader(
 	hybridRead bool,
 	chunkStart time.Time,
 	state *chunkFetchState,
-) ([]byte, error) {
+) ([]byte, CacheTier, error) {
 	var (
 		chunkData []byte
+		chunkTier CacheTier
 		err       error
 	)
 	defer func() {
-		cm.completeChunkFetch(chunkPath, state, chunkData, err)
+		cm.completeChunkFetch(chunkPath, state, chunkData, chunkTier, err)
 	}()
 
 	fetchCtx := ctx
@@ -1767,8 +1797,8 @@ func (cm *DefaultCacheManager) fetchChunkAsLeader(
 	}
 	defer cancel()
 
-	chunkData, err = cm.readChunkDataFromTiers(fetchCtx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart)
-	return chunkData, err
+	chunkData, chunkTier, err = cm.readChunkDataFromTiers(fetchCtx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart)
+	return chunkData, chunkTier, err
 }
 
 func (cm *DefaultCacheManager) readChunkDataFromTiers(
@@ -1779,7 +1809,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	remoteOrder []CacheTier,
 	hybridRead bool,
 	chunkStart time.Time,
-) ([]byte, error) {
+) ([]byte, CacheTier, error) {
 	tierStart := time.Now()
 	if chunkEntry, err := cm.getFromTierNoVerify(ctx, chunkPath, TierNVMe); err == nil {
 		tierDur := time.Since(tierStart)
@@ -1789,7 +1819,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, TierNVMe, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-		return chunkData, nil
+		return chunkData, TierNVMe, nil
 	} else {
 		cm.traceChunkAttempt(chunkPath, chunkIndex, TierNVMe, tierStart, err)
 	}
@@ -1813,7 +1843,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
 			cm.traceChunkAttempt(chunkPath, chunkIndex, tier, hybridStart, nil)
 			cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-			return chunkData, nil
+			return chunkData, tier, nil
 		} else {
 			cm.traceChunkAttempt(chunkPath, chunkIndex, hybridPrimary, hybridStart, err)
 		}
@@ -1829,7 +1859,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-		return chunkData, nil
+		return chunkData, primary, nil
 	} else {
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, err)
 	}
@@ -1844,7 +1874,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-		return chunkData, nil
+		return chunkData, secondary, nil
 	} else {
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, err)
 	}
@@ -1852,7 +1882,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 
 	err := fmt.Errorf("failed to read chunk %d for %s from remote tiers", chunkIndex, filePath)
 	cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, err)
-	return nil, err
+	return nil, TierUnknown, err
 }
 
 func (cm *DefaultCacheManager) traceChunkAttempt(chunkPath string, chunkIndex int64, tier CacheTier, started time.Time, err error) {
@@ -2026,6 +2056,22 @@ func parentFilePathFromChunkPath(path string) (string, bool) {
 	return path[:idx], true
 }
 
+func readWallTierBytes(tier CacheTier, bytes int64) (int64, int64, int64) {
+	if bytes <= 0 {
+		return 0, 0, 0
+	}
+	switch tier {
+	case TierNVMe:
+		return bytes, 0, 0
+	case TierPeer:
+		return 0, bytes, 0
+	case TierCloud:
+		return 0, 0, bytes
+	default:
+		return 0, 0, 0
+	}
+}
+
 // Stats returns current NVMe usage and capacity
 func (cm *DefaultCacheManager) Stats() (used, capacity int64) {
 	cm.mu.RLock()
@@ -2058,6 +2104,13 @@ type CacheMetrics struct {
 	CloudReadBytes atomic.Int64
 	CloudReadNanos atomic.Int64
 	CloudReadOps   atomic.Int64
+	ReadWallBytes  atomic.Int64
+	ReadWallNanos  atomic.Int64
+	ReadWallOps    atomic.Int64
+	NVMeReadWall   atomic.Int64
+	PeerReadWall   atomic.Int64
+	CloudReadWall  atomic.Int64
+	ReadWallOther  atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics
@@ -2125,6 +2178,46 @@ func (m *CacheMetrics) RecordTierRead(tier CacheTier, bytes int64, dur time.Dura
 	}
 }
 
+// RecordReadWall records end-to-end read wall time and per-tier byte
+// contributions for a single read operation.
+func (m *CacheMetrics) RecordReadWall(totalBytes int64, dur time.Duration, nvmeBytes int64, peerBytes int64, cloudBytes int64) {
+	if totalBytes <= 0 {
+		return
+	}
+	nanos := dur.Nanoseconds()
+	if nanos < 0 {
+		nanos = 0
+	}
+	if nvmeBytes < 0 {
+		nvmeBytes = 0
+	}
+	if peerBytes < 0 {
+		peerBytes = 0
+	}
+	if cloudBytes < 0 {
+		cloudBytes = 0
+	}
+	sum := nvmeBytes + peerBytes + cloudBytes
+	if sum > totalBytes {
+		scale := float64(totalBytes) / float64(sum)
+		nvmeBytes = int64(float64(nvmeBytes) * scale)
+		peerBytes = int64(float64(peerBytes) * scale)
+		cloudBytes = int64(float64(cloudBytes) * scale)
+		sum = nvmeBytes + peerBytes + cloudBytes
+	}
+	otherBytes := totalBytes - sum
+
+	m.ReadWallBytes.Add(totalBytes)
+	m.ReadWallNanos.Add(nanos)
+	m.ReadWallOps.Add(1)
+	m.NVMeReadWall.Add(nvmeBytes)
+	m.PeerReadWall.Add(peerBytes)
+	m.CloudReadWall.Add(cloudBytes)
+	if otherBytes > 0 {
+		m.ReadWallOther.Add(otherBytes)
+	}
+}
+
 // TierReadMBps returns the observed aggregate throughput for a tier.
 func (m *CacheMetrics) TierReadMBps(tier CacheTier) float64 {
 	switch tier {
@@ -2147,29 +2240,47 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 	peerReadNanos := m.PeerReadNanos.Load()
 	cloudReadBytes := m.CloudReadBytes.Load()
 	cloudReadNanos := m.CloudReadNanos.Load()
+	readWallBytes := m.ReadWallBytes.Load()
+	readWallNanos := m.ReadWallNanos.Load()
+	nvmeReadWall := m.NVMeReadWall.Load()
+	peerReadWall := m.PeerReadWall.Load()
+	cloudReadWall := m.CloudReadWall.Load()
+	readWallOther := m.ReadWallOther.Load()
 
 	return map[string]interface{}{
-		"nvme_hits":        m.NVMeHits.Load(),
-		"nvme_misses":      m.NVMeMisses.Load(),
-		"peer_hits":        m.PeerHits.Load(),
-		"peer_misses":      m.PeerMisses.Load(),
-		"cloud_hits":       m.CloudHits.Load(),
-		"cloud_misses":     m.CloudMisses.Load(),
-		"write_count":      m.WriteCount.Load(),
-		"write_bytes":      m.WriteBytes.Load(),
-		"eviction_count":   m.EvictionCount.Load(),
-		"nvme_read_bytes":  nvmeReadBytes,
-		"nvme_read_nanos":  nvmeReadNanos,
-		"nvme_read_ops":    m.NVMeReadOps.Load(),
-		"peer_read_bytes":  peerReadBytes,
-		"peer_read_nanos":  peerReadNanos,
-		"peer_read_ops":    m.PeerReadOps.Load(),
-		"cloud_read_bytes": cloudReadBytes,
-		"cloud_read_nanos": cloudReadNanos,
-		"cloud_read_ops":   m.CloudReadOps.Load(),
-		"nvme_read_mbps":   bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
-		"peer_read_mbps":   bytesPerSecToMBps(peerReadBytes, peerReadNanos),
-		"cloud_read_mbps":  bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
+		"nvme_hits":             m.NVMeHits.Load(),
+		"nvme_misses":           m.NVMeMisses.Load(),
+		"peer_hits":             m.PeerHits.Load(),
+		"peer_misses":           m.PeerMisses.Load(),
+		"cloud_hits":            m.CloudHits.Load(),
+		"cloud_misses":          m.CloudMisses.Load(),
+		"write_count":           m.WriteCount.Load(),
+		"write_bytes":           m.WriteBytes.Load(),
+		"eviction_count":        m.EvictionCount.Load(),
+		"nvme_read_bytes":       nvmeReadBytes,
+		"nvme_read_nanos":       nvmeReadNanos,
+		"nvme_read_ops":         m.NVMeReadOps.Load(),
+		"peer_read_bytes":       peerReadBytes,
+		"peer_read_nanos":       peerReadNanos,
+		"peer_read_ops":         m.PeerReadOps.Load(),
+		"cloud_read_bytes":      cloudReadBytes,
+		"cloud_read_nanos":      cloudReadNanos,
+		"cloud_read_ops":        m.CloudReadOps.Load(),
+		"nvme_read_mbps":        bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
+		"peer_read_mbps":        bytesPerSecToMBps(peerReadBytes, peerReadNanos),
+		"cloud_read_mbps":       bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
+		"read_wall_bytes":       readWallBytes,
+		"read_wall_nanos":       readWallNanos,
+		"read_wall_ops":         m.ReadWallOps.Load(),
+		"read_wall_mbps":        bytesPerSecToMBps(readWallBytes, readWallNanos),
+		"nvme_read_wall_bytes":  nvmeReadWall,
+		"peer_read_wall_bytes":  peerReadWall,
+		"cloud_read_wall_bytes": cloudReadWall,
+		"read_wall_other_bytes": readWallOther,
+		"nvme_read_wall_mbps":   bytesPerSecToMBps(nvmeReadWall, readWallNanos),
+		"peer_read_wall_mbps":   bytesPerSecToMBps(peerReadWall, readWallNanos),
+		"cloud_read_wall_mbps":  bytesPerSecToMBps(cloudReadWall, readWallNanos),
+		"read_wall_other_mbps":  bytesPerSecToMBps(readWallOther, readWallNanos),
 	}
 }
 

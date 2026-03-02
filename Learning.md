@@ -243,3 +243,46 @@
 ### Takeaway
 - Increasing NVMe headroom removed the worst large-file chunk availability regressions and improved 5GB cold-read throughput versus prior AKS runs.
 - Cached read remains far higher than cold read due range/kernel cache effects in the current go-fuse read path.
+
+## 2026-03-02 AKS Hybrid Read Path + Wall Metrics Instrumentation
+- Cluster/namespace: `stargz-test` / `fuse-system-aztest`
+- Image tags:
+  - `hybridwall-20260301-212937`
+  - `hybridwall2-20260301-213635` (fixes wall-metric tier attribution)
+- Helm revisions:
+  - `88`: hybrid tuning rollout (low hedge delay, realistic peer MB/s assumption)
+  - `89`: wall-metric attribution fix image rollout
+  - `90`: netprobe config serialization fix (`--set-string`) and client restart
+
+### Code changes
+1. Large-file hybrid logic:
+   - Added `HybridAlwaysMinSize` (default `512MiB`) to force peer+cloud hedging for large files, independent of optimistic peer-throughput estimation.
+2. Read-path wall instrumentation:
+   - Added wall counters:
+     - `read_wall_bytes/nanos/ops`
+     - `nvme_read_wall_bytes`, `peer_read_wall_bytes`, `cloud_read_wall_bytes`, `read_wall_other_bytes`
+   - Exposed new Prometheus metrics in `/metrics`.
+3. Peer read strategy:
+   - Added 2-way parallel fan-out for chunk reads (first success wins), then fallback to remaining peers.
+4. Client/runtime knobs:
+   - Added `-hybrid-always-min-size-mb` and env override `FUSE_HYBRID_ALWAYS_MIN_SIZE_MB`.
+5. Ops fix:
+   - `FUSE_NETPROBE_BYTES` must be set as string (`--set-string`) to avoid scientific-notation serialization that breaks integer parsing.
+
+### Performance observed
+- Smart-read (A100 -> A100):
+  - 1GB: up to `550 MB/s`
+  - 5GB: observed `551-671 MB/s` across runs
+  - best in this cycle: `671 MB/s` on 5GB
+- Cached suite (A100 -> A100):
+  - 1GB: write `274`, cold `751`, cached `2133` MB/s
+  - 5GB: write `291`, cold `592`, cached `2530` MB/s
+
+### Peer + Cloud contribution
+- Profiled 5GB run (`READ_MBPS_APPROX=551`):
+  - tier deltas: `peer ~150.2 MB/s`, `cloud ~80.1 MB/s`
+  - confirms cloud contribution is active in the read path under hybrid mode.
+
+### Remaining bottleneck notes
+- End-to-end object throughput still does not saturate NIC limits.
+- A large share of read bytes moves through local/range cache layers after initial chunk fetches (`read_wall_other_bytes` dominates), so object speed is no longer directly equal to peer/cloud tier counters.

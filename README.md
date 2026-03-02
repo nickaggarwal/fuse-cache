@@ -327,6 +327,9 @@ Notes:
 | 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `275 / 518` | `17.6` | `0.0` | `518` | `0.0 / 0.0` | `633m / 1m / 1m` | `87bcb18` |
 | 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `264 / 545` | `N/A` | `N/A` | `545` | `N/A` | `N/A` | `5fa1f9c+` |
 | 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB | `270 / 648` | `N/A` | `N/A` | `648` | `N/A` | `N/A` | `5fa1f9c+` |
+| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `298 / 550` | `N/A` | `N/A` | `550` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
+| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB | `288 / 671` | `N/A` | `N/A` | `671` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
+| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB (profiled) | `276 / 551` | `150.2` | `80.1` | `551` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
 
 ### Latest Cached Read (2026-03-01, AKS `fuse-system-aztest`)
 
@@ -334,6 +337,8 @@ Notes:
 |---|---|---|---:|---:|---:|---|---|
 | 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 1GB | `282` | `436` | `2003` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
 | 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 5GB | `262` | `622` | `2389` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
+| 2026-03-02 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 1GB | `274` | `751` | `2133` | `hybrid-largefile + wall metrics image` | `hybridwall2-20260301-213635` |
+| 2026-03-02 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 5GB | `291` | `592` | `2530` | `hybrid-largefile + wall metrics image` | `hybridwall2-20260301-213635` |
 
 ### Historical Scenarios
 

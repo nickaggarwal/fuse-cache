@@ -61,3 +61,21 @@ func TestFileHintKey_NonChunkUsesOriginalPath(t *testing.T) {
 		t.Fatalf("fileHintKey(non-chunk) = %q, want %q", key, "/regular-object")
 	}
 }
+
+func TestPeerReadParallelFanout_ChunkedUsesTwoPeers(t *testing.T) {
+	if got := peerReadParallelFanout("/data.bin_chunk_12", 5); got != 2 {
+		t.Fatalf("peerReadParallelFanout(chunk,5)=%d, want 2", got)
+	}
+}
+
+func TestPeerReadParallelFanout_NonChunkUsesSinglePeer(t *testing.T) {
+	if got := peerReadParallelFanout("/data.bin", 5); got != 1 {
+		t.Fatalf("peerReadParallelFanout(non-chunk,5)=%d, want 1", got)
+	}
+}
+
+func TestPeerReadParallelFanout_BoundedByCandidates(t *testing.T) {
+	if got := peerReadParallelFanout("/data.bin_chunk_0", 1); got != 1 {
+		t.Fatalf("peerReadParallelFanout(chunk,1)=%d, want 1", got)
+	}
+}
