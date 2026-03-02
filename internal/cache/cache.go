@@ -174,8 +174,13 @@ type DefaultCacheManager struct {
 }
 
 type chunkFileCache struct {
-	chunks map[int64][]byte
+	chunks map[int64]rangeCachedChunk
 	order  []int64
+}
+
+type rangeCachedChunk struct {
+	data []byte
+	tier CacheTier
 }
 
 type hybridReadHint struct {
@@ -1533,9 +1538,18 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 
 	// Opportunistic prefetch for nearby sequential reads.
-	// Trigger once per chunk boundary to avoid spawning redundant prefetches for
-	// every 128KiB kernel read within the same 4MiB cache chunk.
-	if cm.config.RangePrefetchChunks > 0 && chunkSize > 0 && offset%chunkSize == 0 {
+	// Trigger on boundary and near-boundary reads so next chunks are already
+	// inflight before the kernel crosses into them.
+	prefetchTrigger := chunkSize / 4
+	if prefetchTrigger < 256*1024 {
+		prefetchTrigger = 256 * 1024
+	}
+	if prefetchTrigger > 2*1024*1024 {
+		prefetchTrigger = 2 * 1024 * 1024
+	}
+	chunkEndBoundary := (endChunk + 1) * chunkSize
+	nearBoundary := chunkSize > 0 && chunkEndBoundary-end <= prefetchTrigger
+	if cm.config.RangePrefetchChunks > 0 && chunkSize > 0 && (offset%chunkSize == 0 || nearBoundary) {
 		for i := 1; i <= cm.config.RangePrefetchChunks; i++ {
 			prefetchChunk := endChunk + int64(i)
 			if prefetchChunk >= entry.NumChunks {
@@ -1701,9 +1715,9 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 
 func (cm *DefaultCacheManager) readChunkData(ctx context.Context, filePath string, chunkIndex int64, remoteOrder []CacheTier, hybridRead bool) ([]byte, CacheTier, error) {
 	chunkStart := time.Now()
-	chunkData, ok := cm.getChunkFromRangeCache(filePath, chunkIndex)
+	chunkData, chunkTier, ok := cm.getChunkFromRangeCache(filePath, chunkIndex)
 	if ok {
-		return chunkData, TierUnknown, nil
+		return chunkData, chunkTier, nil
 	}
 
 	chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, chunkIndex)
@@ -1816,7 +1830,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.metrics.RecordHit(TierNVMe)
 		cm.metrics.RecordTierRead(TierNVMe, int64(len(chunkEntry.Data)), tierDur)
 		chunkData := chunkEntry.Data
-		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
+		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, TierNVMe)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, TierNVMe, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, TierNVMe, nil
@@ -1840,7 +1854,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			cm.metrics.RecordHit(tier)
 			cm.metrics.RecordTierRead(tier, int64(len(chunkEntry.Data)), tierDur)
 			chunkData := chunkEntry.Data
-			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
+			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, tier)
 			cm.traceChunkAttempt(chunkPath, chunkIndex, tier, hybridStart, nil)
 			cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 			return chunkData, tier, nil
@@ -1856,7 +1870,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.metrics.RecordHit(primary)
 		cm.metrics.RecordTierRead(primary, int64(len(chunkEntry.Data)), tierDur)
 		chunkData := chunkEntry.Data
-		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
+		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, primary)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, primary, nil
@@ -1871,7 +1885,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.metrics.RecordHit(secondary)
 		cm.metrics.RecordTierRead(secondary, int64(len(chunkEntry.Data)), tierDur)
 		chunkData := chunkEntry.Data
-		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData)
+		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, secondary)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, secondary, nil
@@ -1987,22 +2001,22 @@ func (cm *DefaultCacheManager) readChunkHybridHedged(ctx context.Context, chunkP
 	return nil, 0, errors.New("hybrid chunk read failed")
 }
 
-func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, bool) {
+func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, CacheTier, bool) {
 	cm.rangeMu.RLock()
 	defer cm.rangeMu.RUnlock()
 
 	fileCache, ok := cm.rangeChunks[filePath]
 	if !ok || fileCache == nil {
-		return nil, false
+		return nil, TierUnknown, false
 	}
-	data, ok := fileCache.chunks[chunkIndex]
+	cached, ok := fileCache.chunks[chunkIndex]
 	if !ok {
-		return nil, false
+		return nil, TierUnknown, false
 	}
-	return data, true
+	return cached.data, cached.tier, true
 }
 
-func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte) {
+func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte, tier CacheTier) {
 	if len(data) == 0 {
 		return
 	}
@@ -2011,7 +2025,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	fileCache, ok := cm.rangeChunks[filePath]
 	if !ok || fileCache == nil {
 		fileCache = &chunkFileCache{
-			chunks: make(map[int64][]byte),
+			chunks: make(map[int64]rangeCachedChunk),
 			order:  make([]int64, 0, cm.config.RangeChunkCacheSize),
 		}
 		cm.rangeChunks[filePath] = fileCache
@@ -2019,7 +2033,10 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	if _, exists := fileCache.chunks[chunkIndex]; !exists {
 		fileCache.order = append(fileCache.order, chunkIndex)
 	}
-	fileCache.chunks[chunkIndex] = data
+	fileCache.chunks[chunkIndex] = rangeCachedChunk{
+		data: data,
+		tier: tier,
+	}
 
 	for len(fileCache.order) > cm.config.RangeChunkCacheSize {
 		evictChunk := fileCache.order[0]

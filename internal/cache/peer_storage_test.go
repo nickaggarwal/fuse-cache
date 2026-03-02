@@ -79,3 +79,15 @@ func TestPeerReadParallelFanout_BoundedByCandidates(t *testing.T) {
 		t.Fatalf("peerReadParallelFanout(chunk,1)=%d, want 1", got)
 	}
 }
+
+func TestSortPeersByNetwork_PrefersHigherScore(t *testing.T) {
+	peers := []*coordinator.PeerInfo{
+		{ID: "slow", NetworkSpeedMBps: 150, NetworkLatencyMs: 3},
+		{ID: "fast", NetworkSpeedMBps: 500, NetworkLatencyMs: 1},
+		{ID: "mid", NetworkSpeedMBps: 300, NetworkLatencyMs: 2},
+	}
+	sortPeersByNetwork(peers, "/data.bin_chunk_7")
+	if peers[0].ID != "fast" {
+		t.Fatalf("first peer=%s, want fast", peers[0].ID)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,6 +198,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no active peers available")
 	}
+	sortPeersByNetwork(candidates, path)
 
 	var lastErr error
 	parallelFanout := peerReadParallelFanout(path, len(candidates))
@@ -221,6 +223,38 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("file not found on any peer")
+}
+
+func sortPeersByNetwork(peers []*coordinator.PeerInfo, key string) {
+	if len(peers) <= 1 {
+		return
+	}
+	sort.SliceStable(peers, func(i, j int) bool {
+		pi := peerSortScore(peers[i])
+		pj := peerSortScore(peers[j])
+		if pi == pj {
+			// Deterministic tie break keeps chunk distribution stable.
+			hi := peerStartIndexForKey(key+"#"+peers[i].ID, 1<<30)
+			hj := peerStartIndexForKey(key+"#"+peers[j].ID, 1<<30)
+			return hi < hj
+		}
+		return pi > pj
+	})
+}
+
+func peerSortScore(peer *coordinator.PeerInfo) float64 {
+	if peer == nil {
+		return -1
+	}
+	speed := peer.NetworkSpeedMBps
+	if speed <= 0 {
+		speed = 100 // fallback neutral score when probe data is absent
+	}
+	lat := peer.NetworkLatencyMs
+	if lat <= 0 {
+		lat = 1
+	}
+	return speed / lat
 }
 
 func peerReadParallelFanout(path string, candidateCount int) int {
