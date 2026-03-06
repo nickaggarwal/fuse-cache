@@ -59,6 +59,8 @@ temp/
 # Development environment files
 .env
 .env.local
+.env.cloud
+.env.cloud.*
 .env.development.local
 .env.test.local
 .env.production.local

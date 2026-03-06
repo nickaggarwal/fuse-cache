@@ -475,6 +475,32 @@ Reusable operational commands live under:
 scripts/ops/
 ```
 
+### Bootstrap Azure + AWS CLI cloud env
+
+This validates Azure/AWS CLI auth, optionally updates AKS/EKS kube contexts,
+and writes a reusable env file for cloud test runs.
+
+```bash
+# Ubuntu: install required CLIs/tools first (azure-cli, awscli, kubectl, helm, jq)
+./scripts/ops/bootstrap-cloud-env.sh --install-tools --skip-context-update
+
+# Then bootstrap cloud env + contexts
+./scripts/ops/bootstrap-cloud-env.sh \
+  --azure-subscription <azure-subscription-id> \
+  --aks-rg stargz-test_group \
+  --aks-name stargz-test \
+  --eks-name stargz-test \
+  --aws-region us-east-1
+```
+
+Then load and use it:
+
+```bash
+source .env.cloud
+kubectl config use-context "$CLOUD_AKS_CONTEXT"
+./scripts/ops/test-smart-read.sh "$CLOUD_AKS_NAMESPACE" 1024
+```
+
 ### Deploy client image tag
 
 ```bash

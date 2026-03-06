@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -75,6 +76,12 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
+	// Chunk-object reads dominate cold range-read traffic. Avoiding a separate
+	// GetProperties HEAD request removes one round-trip per chunk.
+	if isChunkObjectPath(path) {
+		return as.readStream(timeoutCtx, path)
+	}
+
 	props, err := as.getProperties(timeoutCtx, path)
 	if err != nil {
 		return nil, err
@@ -126,7 +133,10 @@ func (as *AzureStorage) Write(ctx context.Context, path string, data []byte) err
 	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
-	_, err := as.client.UploadBuffer(timeoutCtx, as.containerName, path, data, &azblob.UploadBufferOptions{})
+	_, err := as.client.UploadBuffer(timeoutCtx, as.containerName, path, data, &azblob.UploadBufferOptions{
+		BlockSize:   as.downloadBlockSize,
+		Concurrency: as.downloadConcurrency,
+	})
 	return err
 }
 
@@ -168,4 +178,21 @@ func (as *AzureStorage) Size(ctx context.Context, path string) (int64, error) {
 
 func (as *AzureStorage) getProperties(ctx context.Context, path string) (blob.GetPropertiesResponse, error) {
 	return as.client.ServiceClient().NewContainerClient(as.containerName).NewBlobClient(path).GetProperties(ctx, nil)
+}
+
+func isChunkObjectPath(path string) bool {
+	idx := strings.LastIndex(path, "_chunk_")
+	if idx < 0 {
+		return false
+	}
+	suffix := path[idx+len("_chunk_"):]
+	if suffix == "" {
+		return false
+	}
+	for i := 0; i < len(suffix); i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

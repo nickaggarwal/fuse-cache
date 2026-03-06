@@ -1520,6 +1520,8 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		chunks[0] = data
 		chunkTiers[0] = tier
 	} else {
+		readCtx, readCancel := context.WithCancel(ctx)
+		defer readCancel()
 		jobs := make(chan int, chunkCount)
 		errCh := make(chan error, 1)
 		var wg sync.WaitGroup
@@ -1530,12 +1532,13 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 				defer wg.Done()
 				for pos := range jobs {
 					chunkIndex := startChunk + int64(pos)
-					data, tier, err := cm.readChunkData(ctx, filePath, chunkIndex, remoteOrder, hybridRead)
+					data, tier, err := cm.readChunkData(readCtx, filePath, chunkIndex, remoteOrder, hybridRead)
 					if err != nil {
 						select {
 						case errCh <- err:
 						default:
 						}
+						readCancel()
 						return
 					}
 					chunks[pos] = data
