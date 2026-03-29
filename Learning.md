@@ -286,3 +286,65 @@
 ### Remaining bottleneck notes
 - End-to-end object throughput still does not saturate NIC limits.
 - A large share of read bytes moves through local/range cache layers after initial chunk fetches (`read_wall_other_bytes` dominates), so object speed is no longer directly equal to peer/cloud tier counters.
+
+## 2026-03-15 AKS Regression Isolation: Revision 105 vs Clean Main
+- Cluster/namespace: `stargz-test` / `fuse-system-aztest`
+- Pod pair used for both checks: A100 writer -> A100 reader
+- Goal: separate experimental-profile regressions from current `main`
+
+### Regression candidate found on deployed revision 105
+- Image:
+  - `stargzrepo.azurecr.io/fuse-client:perf-phase3c-20260308-190104`
+- Helm revision:
+  - `105`
+- Runtime profile on that revision:
+  - `FUSE_BACKEND=gofuse`
+  - `FUSE_PARALLEL_RANGE_READS=96`
+  - `FUSE_RANGE_PREFETCH_CHUNKS=48`
+  - `FUSE_PEER_READ_MBPS=300`
+  - `FUSE_AZURE_DOWNLOAD_CONCURRENCY=32`
+  - `FUSE_AZURE_DOWNLOAD_BLOCK_SIZE_MB=8`
+  - `FUSE_HYBRID_HEDGE_DELAY_MS=5`
+  - additional values present in release values but not in current `main` source:
+    - `adaptiveScheduler=true`
+    - `maxInflightBytesMB=768`
+    - `dualSourceReads=false`
+
+### Observed performance on revision 105
+- `test-smart-read.sh` A100 -> A100:
+  - 1GB: `228 / 505 MB/s` (write/read)
+  - 5GB: `74 / 264 MB/s` (write/read)
+
+### Verification rollback to clean main
+- Rebuilt and deployed clean `main` image:
+  - `stargzrepo.azurecr.io/fuse-client:main-20260310-212322-409849e`
+- Helm revision:
+  - `106`
+- Explicit runtime profile for validation:
+  - `FUSE_BACKEND=gofuse`
+  - `FUSE_GOFUSE_ENABLE_PASSTHROUGH=true`
+  - `FUSE_PARALLEL_RANGE_READS=32`
+  - `FUSE_RANGE_PREFETCH_CHUNKS=8`
+  - `FUSE_RANGE_CHUNK_CACHE_SIZE=384`
+  - `FUSE_PEER_READ_MBPS=10000`
+  - `FUSE_AZURE_DOWNLOAD_CONCURRENCY=32`
+  - `FUSE_AZURE_DOWNLOAD_BLOCK_SIZE_MB=8`
+  - `FUSE_AZURE_PARALLEL_DOWNLOAD_MIN_SIZE_MB=4`
+  - `FUSE_HYBRID_HEDGE_DELAY_MS=5`
+  - `FUSE_HYBRID_STRIPE_MIN_SIZE_MB=1024`
+
+### Observed performance on revision 106
+- `test-smart-read.sh` A100 -> A100:
+  - 1GB: `223 / 640 MB/s` (write/read)
+  - 5GB: `73 / 619 MB/s` (write/read)
+
+### Learning
+- The severe read regression was caused by the experimental deployment profile, not by `main` alone:
+  - 1GB read recovered from `505` to `640 MB/s`
+  - 5GB read recovered from `264` to `619 MB/s`
+- Large-write collapse did not recover:
+  - 5GB write stayed at `~73-74 MB/s` on both revisions
+- Conclusion:
+  - Keep revision `105` changes out of the default AKS benchmark profile.
+  - Treat the read regression and the large-write regression as separate issues.
+  - Next investigation should focus specifically on the large-write path, since reverting to clean `main` plus conservative read settings did not fix it.
