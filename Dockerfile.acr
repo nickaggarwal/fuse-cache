@@ -1,0 +1,16 @@
+FROM golang:1.20 AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+COPY third_party ./third_party
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /bin/coordinator cmd/coordinator/main.go && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /bin/client cmd/client/main.go
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends fuse3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /bin/coordinator /usr/local/bin/coordinator
+COPY --from=builder /bin/client /usr/local/bin/client
+RUN echo 'user_allow_other' >> /etc/fuse.conf
+ENTRYPOINT []
+CMD ["coordinator"]

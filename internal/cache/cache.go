@@ -410,6 +410,15 @@ func (cm *DefaultCacheManager) GetLocal(ctx context.Context, filePath string) (*
 	chunked := ok && entry != nil && entry.IsChunked
 	cm.mu.RUnlock()
 
+	if tierEntry, err := cm.getFromTierNoVerify(ctx, filePath, TierNVMe); err == nil {
+		if entry != nil {
+			tierEntry.IsChunked = entry.IsChunked
+			tierEntry.NumChunks = entry.NumChunks
+			tierEntry.Size = entry.Size
+		}
+		return tierEntry, nil
+	}
+
 	if chunked {
 		return cm.getChunkedLocal(ctx, entry)
 	}
@@ -647,6 +656,13 @@ func (cm *DefaultCacheManager) tryAcquireHedgeSlot() (func(), bool) {
 
 // getChunked reassembles a chunked file from its chunks
 func (cm *DefaultCacheManager) getChunked(ctx context.Context, entry *CacheEntry) (*CacheEntry, error) {
+	if localEntry, err := cm.getFromTierNoVerify(ctx, entry.FilePath, TierNVMe); err == nil {
+		localEntry.IsChunked = true
+		localEntry.NumChunks = entry.NumChunks
+		localEntry.Size = entry.Size
+		return localEntry, nil
+	}
+
 	var allData []byte
 	for i := int64(0); i < entry.NumChunks; i++ {
 		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
@@ -670,6 +686,13 @@ func (cm *DefaultCacheManager) getChunked(ctx context.Context, entry *CacheEntry
 }
 
 func (cm *DefaultCacheManager) getChunkedLocal(ctx context.Context, entry *CacheEntry) (*CacheEntry, error) {
+	if localEntry, err := cm.getFromTierNoVerify(ctx, entry.FilePath, TierNVMe); err == nil {
+		localEntry.IsChunked = true
+		localEntry.NumChunks = entry.NumChunks
+		localEntry.Size = entry.Size
+		return localEntry, nil
+	}
+
 	var allData []byte
 	for i := int64(0); i < entry.NumChunks; i++ {
 		chunkPath := fmt.Sprintf("%s_chunk_%d", entry.FilePath, i)
@@ -918,6 +941,85 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	cm.mu.Unlock()
 	go cm.publishFileLocation(context.Background(), meta, TierNVMe)
 	go cm.persistChunkedFileToCloud(filePath, numChunks)
+	return nil
+}
+
+// CreateWriteFile creates a staged local file on the NVMe volume so final
+// commit can use a local rename instead of a full reread/copy.
+func (cm *DefaultCacheManager) CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error) {
+	_ = ctx
+	finalPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/"))
+	dir := filepath.Dir(finalPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, "", err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(finalPath)+".stage-*")
+	if err != nil {
+		return nil, "", err
+	}
+	return tmp, tmp.Name(), nil
+}
+
+// PutFromFile commits a staged local file into NVMe-backed cache metadata
+// without rereading the full payload into memory. Large files are exposed as
+// chunked metadata, but chunk bytes are served from the whole local file when
+// requested and are persisted to cloud asynchronously.
+func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error {
+	if strings.TrimSpace(filePath) == "" {
+		return errors.New("empty file path")
+	}
+	if strings.TrimSpace(stagedPath) == "" {
+		return errors.New("empty staged path")
+	}
+	if lastAccessed.IsZero() {
+		lastAccessed = time.Now()
+	}
+
+	finalPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/"))
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(stagedPath, finalPath); err != nil {
+		return err
+	}
+	info, err := os.Stat(finalPath)
+	if err != nil {
+		return err
+	}
+	if size <= 0 {
+		size = info.Size()
+	}
+
+	cm.invalidateRangeCache(filePath)
+
+	numChunks := int64(0)
+	isChunked := false
+	if size > cm.config.ChunkSize {
+		isChunked = true
+		numChunks = (size + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+	}
+
+	entry := &CacheEntry{
+		FilePath:     filePath,
+		StoragePath:  filePath,
+		Size:         size,
+		LastAccessed: lastAccessed,
+		Tier:         TierNVMe,
+		IsChunked:    isChunked,
+		NumChunks:    numChunks,
+	}
+
+	cm.mu.Lock()
+	cm.removeChunkEntriesLocked(filePath)
+	cm.entries[filePath] = entry
+	cm.nvmeUsed += size
+	cm.mu.Unlock()
+	cm.metrics.RecordWrite(size)
+
+	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
+	if isChunked {
+		go cm.persistWholeFileAsChunksToCloud(filePath, finalPath, numChunks)
+	}
 	return nil
 }
 
@@ -1271,6 +1373,11 @@ func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath
 
 	data, err := storage.Read(ctx, filePath)
 	if err != nil {
+		if tier == TierNVMe {
+			if chunkEntry, chunkErr := cm.readChunkFromWholeLocalFile(ctx, filePath); chunkErr == nil {
+				return chunkEntry, nil
+			}
+		}
 		return nil, err
 	}
 
@@ -1314,6 +1421,90 @@ func (cm *DefaultCacheManager) putToTier(ctx context.Context, entry *CacheEntry,
 	}
 
 	return nil
+}
+
+func (cm *DefaultCacheManager) removeChunkEntriesLocked(filePath string) {
+	prefix := filePath + "_chunk_"
+	for key := range cm.entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(cm.entries, key)
+		}
+	}
+}
+
+func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, chunkPath string) (*CacheEntry, error) {
+	parentPath, ok := parentFilePathFromChunkPath(chunkPath)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	cm.mu.RLock()
+	parentMeta, hasParent := cm.entries[parentPath]
+	cm.mu.RUnlock()
+	if !hasParent || parentMeta == nil {
+		return nil, os.ErrNotExist
+	}
+	fullPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(parentPath, "/"))
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	_, chunkIndexStr, _ := strings.Cut(chunkPath, parentPath+"_chunk_")
+	chunkIndex, err := strconv.ParseInt(chunkIndexStr, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	offset := chunkIndex * cm.config.ChunkSize
+	if offset >= parentMeta.Size {
+		return nil, io.EOF
+	}
+	chunkSize := cm.config.ChunkSize
+	if remaining := parentMeta.Size - offset; remaining < chunkSize {
+		chunkSize = remaining
+	}
+	buf := make([]byte, chunkSize)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	buf = buf[:n]
+	return &CacheEntry{
+		FilePath:     chunkPath,
+		StoragePath:  chunkPath,
+		Size:         int64(len(buf)),
+		LastAccessed: time.Now(),
+		Tier:         TierNVMe,
+		Data:         buf,
+	}, nil
+}
+
+func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(filePath string, localPath string, numChunks int64) {
+	f, err := os.Open(localPath)
+	if err != nil {
+		cm.logger.Printf("Chunk cloud persist open failed for %s: %v", filePath, err)
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, cm.config.ChunkSize)
+	for i := int64(0); i < numChunks; i++ {
+		n, readErr := io.ReadFull(f, buf)
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+			cm.logger.Printf("Chunk cloud persist read failed for %s chunk=%d: %v", filePath, i, readErr)
+			return
+		}
+		if n <= 0 {
+			return
+		}
+		chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
+		chunkData := make([]byte, n)
+		copy(chunkData, buf[:n])
+		cm.persistToCloud(chunkPath, chunkData)
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return
+		}
+	}
 }
 
 func (cm *DefaultCacheManager) getStorageForTier(tier CacheTier) TierStorage {

@@ -23,3 +23,5 @@ require (
 	golang.org/x/text v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20231002182017-d307bd883b97 // indirect
 )
+
+replace github.com/hanwen/go-fuse/v2 => ./third_party/go-fuse-local

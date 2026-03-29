@@ -78,6 +78,8 @@ config:
   netProbeEveryHeartbeats: "2"
   fuseBackend: "bazil"
   goFuseEnablePassthrough: "false"
+  goFuseWriteAppendBufferMB: "8"
+  goFuseWritebackCache: "false"
 
 secrets:
   aws:

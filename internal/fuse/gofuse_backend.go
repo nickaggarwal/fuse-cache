@@ -23,13 +23,14 @@ import (
 )
 
 const (
-	goFuseDirMode            = uint32(syscall.S_IFDIR | 0o755)
-	goFuseFileMode           = uint32(syscall.S_IFREG | 0o644)
-	goFuseDefaultTraceStepMB = 8
-	goFuseSlowReadThreshold  = 2 * time.Second
-	goFuseDefaultReadTimeout = 0
-	goFuseDefaultMaxWriteKB  = 1024
-	goFuseReadWindowBytes    = 0
+	goFuseDirMode              = uint32(syscall.S_IFDIR | 0o755)
+	goFuseFileMode             = uint32(syscall.S_IFREG | 0o644)
+	goFuseDefaultTraceStepMB   = 8
+	goFuseSlowReadThreshold    = 2 * time.Second
+	goFuseDefaultReadTimeout   = 0
+	goFuseDefaultMaxWriteKB    = 1024
+	goFuseDefaultWriteBufferMB = 8
+	goFuseReadWindowBytes      = 0
 )
 
 type goFuseNodeKind int
@@ -50,6 +51,8 @@ type GoFuseFileSystem struct {
 	readTraceStep     int64
 	readTimeout       time.Duration
 	maxWrite          int
+	writeAppendBytes  int
+	writebackCache    bool
 	readReqSeq        atomic.Uint64
 	readInflight      atomic.Int64
 
@@ -71,6 +74,10 @@ func NewGoFuseFileSystem(cacheManager cache.CacheManager) *GoFuseFileSystem {
 	if maxWriteKB <= 0 {
 		maxWriteKB = goFuseDefaultMaxWriteKB
 	}
+	writeBufferMB := intFromEnv("FUSE_GOFUSE_WRITE_APPEND_BUFFER_MB", goFuseDefaultWriteBufferMB)
+	if writeBufferMB < 0 {
+		writeBufferMB = 0
+	}
 	return &GoFuseFileSystem{
 		cacheManager:      cacheManager,
 		logger:            log.New(log.Writer(), "[GOFUSE] ", log.LstdFlags),
@@ -80,6 +87,8 @@ func NewGoFuseFileSystem(cacheManager cache.CacheManager) *GoFuseFileSystem {
 		readTraceStep:     int64(traceStepMB) * 1024 * 1024,
 		readTimeout:       time.Duration(readTimeoutMS) * time.Millisecond,
 		maxWrite:          maxWriteKB * 1024,
+		writeAppendBytes:  writeBufferMB * 1024 * 1024,
+		writebackCache:    boolFromEnv("FUSE_GOFUSE_WRITEBACK_CACHE", false),
 	}
 }
 
@@ -97,11 +106,12 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 	attrTTL := attrCacheTTL
 	opts := &gfs.Options{
 		MountOptions: gfuse.MountOptions{
-			FsName:        "fuse-client",
-			Name:          "fuse-client",
-			MaxWrite:      g.maxWrite,
-			MaxReadAhead:  maxReadaheadBytes,
-			MaxBackground: maxBackgroundReqs,
+			FsName:               "fuse-client",
+			Name:                 "fuse-client",
+			MaxWrite:             g.maxWrite,
+			MaxReadAhead:         maxReadaheadBytes,
+			MaxBackground:        maxBackgroundReqs,
+			EnableWritebackCache: g.writebackCache,
 		},
 		EntryTimeout: &entryTTL,
 		AttrTimeout:  &attrTTL,
@@ -121,7 +131,14 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 	g.mountPoint = mountPoint
 	g.mu.Unlock()
 
-	g.logger.Printf("Mounted go-fuse filesystem at: %s (passthrough=%t)", mountPoint, g.enablePassthrough)
+	g.logger.Printf(
+		"Mounted go-fuse filesystem at: %s (passthrough=%t writeback_cache=%t max_write_bytes=%d write_append_buffer_bytes=%d)",
+		mountPoint,
+		g.enablePassthrough,
+		g.writebackCache,
+		g.maxWrite,
+		g.writeAppendBytes,
+	)
 	if g.readTraceEnabled || g.readTimeout > 0 {
 		g.logger.Printf("Read tracing config trace=%t step_bytes=%d path_filter=%q timeout_ms=%d max_write_bytes=%d",
 			g.readTraceEnabled, g.readTraceStep, g.readTracePath, g.readTimeout.Milliseconds(), g.maxWrite)
@@ -168,12 +185,20 @@ type goFuseNode struct {
 	path string
 	kind goFuseNodeKind
 
-	mu        sync.RWMutex
-	entry     *cache.CacheEntry
-	isNew     bool
-	dirty     bool
-	writeFile *os.File
-	writePath string
+	mu                sync.RWMutex
+	entry             *cache.CacheEntry
+	isNew             bool
+	dirty             bool
+	writeFile         *os.File
+	writePath         string
+	writeStartedAt    time.Time
+	writeBytes        int64
+	writeCalls        int64
+	stageWriteBytes   int64
+	stageWriteCalls   int64
+	bufferFlushCalls  int64
+	writeBufferOffset int64
+	writeBuffer       []byte
 
 	readCacheMu   sync.RWMutex
 	readCacheOff  int64
@@ -479,25 +504,35 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 
 	n.mu.RLock()
 	if n.isNew && n.dirty && n.writeFile != nil {
-		size := n.entry.Size
-		if off >= size {
-			n.mu.RUnlock()
-			return gfuse.ReadResultData(nil), 0
-		}
-		limit := int64(len(dest))
-		end := off + limit
-		if end > size {
-			end = size
-		}
-		buf := make([]byte, end-off)
-		readN, err := n.writeFile.ReadAt(buf, off)
 		n.mu.RUnlock()
-		if err != nil && err != io.EOF {
-			return nil, syscall.EIO
+		n.mu.Lock()
+		if n.isNew && n.dirty && n.writeFile != nil {
+			if err := n.flushWriteBufferLocked(); err != nil {
+				n.mu.Unlock()
+				return nil, syscall.EIO
+			}
+			size := n.entry.Size
+			if off >= size {
+				n.mu.Unlock()
+				return gfuse.ReadResultData(nil), 0
+			}
+			limit := int64(len(dest))
+			end := off + limit
+			if end > size {
+				end = size
+			}
+			buf := make([]byte, end-off)
+			readN, err := n.writeFile.ReadAt(buf, off)
+			n.mu.Unlock()
+			if err != nil && err != io.EOF {
+				return nil, syscall.EIO
+			}
+			return gfuse.ReadResultData(buf[:readN]), 0
 		}
-		return gfuse.ReadResultData(buf[:readN]), 0
+		n.mu.Unlock()
+	} else {
+		n.mu.RUnlock()
 	}
-	n.mu.RUnlock()
 
 	if rr, ok := n.gfs.cacheManager.(rangeReader); ok {
 		windowSize := goFuseReadWindowBytes
@@ -619,9 +654,14 @@ func (n *goFuseNode) Write(ctx context.Context, f gfs.FileHandle, data []byte, o
 	if err := n.ensureWriteFileLocked(); err != nil {
 		return 0, syscall.EIO
 	}
-	if _, err := n.writeFile.WriteAt(data, off); err != nil {
+	if n.writeStartedAt.IsZero() {
+		n.writeStartedAt = time.Now()
+	}
+	if err := n.writeDataLocked(data, off); err != nil {
 		return 0, syscall.EIO
 	}
+	n.writeBytes += int64(len(data))
+	n.writeCalls++
 
 	prevSize := n.entry.Size
 	needed := off + int64(len(data))
@@ -651,6 +691,9 @@ func (n *goFuseNode) Setattr(ctx context.Context, f gfs.FileHandle, in *gfuse.Se
 		if err := n.ensureWriteFileLocked(); err != nil {
 			return syscall.EIO
 		}
+		if err := n.flushWriteBufferLocked(); err != nil {
+			return syscall.EIO
+		}
 		if err := n.writeFile.Truncate(int64(size)); err != nil {
 			return syscall.EIO
 		}
@@ -673,21 +716,46 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 	if !n.dirty {
 		return 0
 	}
+	flushStarted := time.Now()
+	var syncDur time.Duration
+	var putDur time.Duration
+	var stageFlushDur time.Duration
 	if n.writeFile != nil {
-		reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
-		if putter, ok := n.gfs.cacheManager.(streamingPutter); ok {
+		stageFlushStarted := time.Now()
+		if err := n.flushWriteBufferLocked(); err != nil {
+			return syscall.EIO
+		}
+		stageFlushDur = time.Since(stageFlushStarted)
+		if putter, ok := n.gfs.cacheManager.(stagedFilePutter); ok {
+			syncStarted := time.Now()
+			if err := n.writeFile.Sync(); err != nil {
+				return syscall.EIO
+			}
+			syncDur = time.Since(syncStarted)
+			putStarted := time.Now()
+			if err := putter.PutFromFile(ctx, n.path, n.writePath, n.entry.Size, time.Now()); err != nil {
+				return syscall.EIO
+			}
+			putDur = time.Since(putStarted)
+		} else if putter, ok := n.gfs.cacheManager.(streamingPutter); ok {
+			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
+			putStarted := time.Now()
 			if err := putter.PutFromReader(ctx, n.path, reader, n.entry.Size, time.Now()); err != nil {
 				return syscall.EIO
 			}
+			putDur = time.Since(putStarted)
 		} else {
+			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
 			data := make([]byte, int(n.entry.Size))
 			if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
 				return syscall.EIO
 			}
 			n.entry.Data = data
+			putStarted := time.Now()
 			if err := n.gfs.cacheManager.Put(ctx, n.entry); err != nil {
 				return syscall.EIO
 			}
+			putDur = time.Since(putStarted)
 		}
 		n.entry.Data = nil
 		n.cleanupWriteFileLocked()
@@ -695,6 +763,19 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 		return syscall.EIO
 	}
 	n.dirty = false
+	totalDur := time.Since(flushStarted)
+	writeDur := time.Duration(0)
+	if !n.writeStartedAt.IsZero() {
+		writeDur = flushStarted.Sub(n.writeStartedAt)
+	}
+	n.gfs.logger.Printf("Write summary path=%s size=%d write_calls=%d write_bytes=%d stage_write_calls=%d stage_write_bytes=%d buffer_flush_calls=%d write_phase_ms=%d buffer_flush_ms=%d sync_ms=%d put_ms=%d flush_total_ms=%d",
+		n.path, n.entry.Size, n.writeCalls, n.writeBytes, n.stageWriteCalls, n.stageWriteBytes, n.bufferFlushCalls, writeDur.Milliseconds(), stageFlushDur.Milliseconds(), syncDur.Milliseconds(), putDur.Milliseconds(), totalDur.Milliseconds())
+	n.writeStartedAt = time.Time{}
+	n.writeBytes = 0
+	n.writeCalls = 0
+	n.stageWriteBytes = 0
+	n.stageWriteCalls = 0
+	n.bufferFlushCalls = 0
 	return 0
 }
 
@@ -712,6 +793,15 @@ func (n *goFuseNode) Release(ctx context.Context, f gfs.FileHandle) syscall.Errn
 
 func (n *goFuseNode) ensureWriteFileLocked() error {
 	if n.writeFile != nil {
+		return nil
+	}
+	if creator, ok := n.gfs.cacheManager.(stagedWriteFileCreator); ok {
+		tmp, path, err := creator.CreateWriteFile(context.Background(), n.path)
+		if err != nil {
+			return err
+		}
+		n.writeFile = tmp
+		n.writePath = path
 		return nil
 	}
 	tmp, err := os.CreateTemp("", "fuse-client-write-*")
@@ -732,6 +822,75 @@ func (n *goFuseNode) cleanupWriteFileLocked() {
 		_ = os.Remove(n.writePath)
 		n.writePath = ""
 	}
+	if n.writeBuffer != nil {
+		n.writeBuffer = n.writeBuffer[:0]
+	}
+	n.writeBufferOffset = 0
+}
+
+func (n *goFuseNode) writeDataLocked(data []byte, off int64) error {
+	limit := n.gfs.writeAppendBytes
+	if limit <= 0 || len(data) >= limit {
+		if err := n.flushWriteBufferLocked(); err != nil {
+			return err
+		}
+		return n.writeStageLocked(data, off)
+	}
+	if len(n.writeBuffer) == 0 {
+		n.writeBufferOffset = off
+	}
+	expectedOff := n.writeBufferOffset + int64(len(n.writeBuffer))
+	if off != expectedOff || len(n.writeBuffer)+len(data) > limit {
+		if err := n.flushWriteBufferLocked(); err != nil {
+			return err
+		}
+		if len(data) >= limit {
+			return n.writeStageLocked(data, off)
+		}
+		n.writeBufferOffset = off
+	}
+	n.writeBuffer = append(n.writeBuffer, data...)
+	if len(n.writeBuffer) >= limit {
+		return n.flushWriteBufferLocked()
+	}
+	return nil
+}
+
+func (n *goFuseNode) flushWriteBufferLocked() error {
+	if len(n.writeBuffer) == 0 {
+		return nil
+	}
+	if err := n.writeStageLocked(n.writeBuffer, n.writeBufferOffset); err != nil {
+		return err
+	}
+	n.bufferFlushCalls++
+	n.writeBuffer = n.writeBuffer[:0]
+	n.writeBufferOffset = 0
+	return nil
+}
+
+func (n *goFuseNode) writeStageLocked(data []byte, off int64) error {
+	if err := writeAllAt(n.writeFile, data, off); err != nil {
+		return err
+	}
+	n.stageWriteCalls++
+	n.stageWriteBytes += int64(len(data))
+	return nil
+}
+
+func writeAllAt(f *os.File, data []byte, off int64) error {
+	for len(data) > 0 {
+		n, err := f.WriteAt(data, off)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		off += int64(n)
+		data = data[n:]
+	}
+	return nil
 }
 
 func (n *goFuseNode) resolveEntry(ctx context.Context) *cache.CacheEntry {

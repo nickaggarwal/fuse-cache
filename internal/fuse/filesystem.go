@@ -87,6 +87,14 @@ type streamingPutter interface {
 	PutFromReader(ctx context.Context, filePath string, r io.Reader, size int64, lastAccessed time.Time) error
 }
 
+type stagedWriteFileCreator interface {
+	CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error)
+}
+
+type stagedFilePutter interface {
+	PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error
+}
+
 // NewFileSystem creates a new FUSE filesystem
 func NewFileSystem(cacheManager cache.CacheManager) *FileSystem {
 	return &FileSystem{
@@ -382,6 +390,15 @@ func (f *File) ensureWriteFileLocked() error {
 	if f.writeFile != nil {
 		return nil
 	}
+	if creator, ok := f.fs.cacheManager.(stagedWriteFileCreator); ok {
+		tmp, path, err := creator.CreateWriteFile(context.Background(), f.path)
+		if err != nil {
+			return err
+		}
+		f.writeFile = tmp
+		f.writePath = path
+		return nil
+	}
 	tmp, err := os.CreateTemp("", "fuse-client-write-*")
 	if err != nil {
 		return err
@@ -558,20 +575,29 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 
 	if f.dirty {
 		if f.writeFile != nil {
-			reader := io.NewSectionReader(f.writeFile, 0, f.entry.Size)
-			if putter, ok := f.fs.cacheManager.(streamingPutter); ok {
-				if err := putter.PutFromReader(ctx, f.path, reader, f.entry.Size, time.Now()); err != nil {
+			if putter, ok := f.fs.cacheManager.(stagedFilePutter); ok {
+				if err := f.writeFile.Sync(); err != nil {
+					return fuse.EIO
+				}
+				if err := putter.PutFromFile(ctx, f.path, f.writePath, f.entry.Size, time.Now()); err != nil {
 					return fuse.EIO
 				}
 			} else {
-				// Fallback path for non-default cache managers.
-				data := make([]byte, int(f.entry.Size))
-				if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
-					return fuse.EIO
-				}
-				f.entry.Data = data
-				if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
-					return fuse.EIO
+				reader := io.NewSectionReader(f.writeFile, 0, f.entry.Size)
+				if putter, ok := f.fs.cacheManager.(streamingPutter); ok {
+					if err := putter.PutFromReader(ctx, f.path, reader, f.entry.Size, time.Now()); err != nil {
+						return fuse.EIO
+					}
+				} else {
+					// Fallback path for non-default cache managers.
+					data := make([]byte, int(f.entry.Size))
+					if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
+						return fuse.EIO
+					}
+					f.entry.Data = data
+					if err := f.fs.cacheManager.Put(ctx, f.entry); err != nil {
+						return fuse.EIO
+					}
 				}
 			}
 			f.entry.Data = nil
