@@ -71,6 +71,8 @@ func main() {
 		parallelReads   = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
 		prefetchChunks  = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
 		rangeChunkCache = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
+		peerSortNet     = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
+		peerFanout      = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
 		hybridAlwaysMB  = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
 		hybridStripeMB  = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
 		hybridHedgeMS   = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
@@ -163,6 +165,8 @@ func main() {
 		ParallelRangeReads:         *parallelReads,
 		RangePrefetchChunks:        *prefetchChunks,
 		RangeChunkCacheSize:        *rangeChunkCache,
+		PeerReadSortByNetwork:      *peerSortNet,
+		PeerReadParallelFanout:     *peerFanout,
 		HybridAlwaysMinSize:        int64(*hybridAlwaysMB) * 1024 * 1024,
 		HybridStripeMinSize:        int64(*hybridStripeMB) * 1024 * 1024,
 		HybridCloudHedgeDelay:      time.Duration(*hybridHedgeMS) * time.Millisecond,
@@ -223,6 +227,22 @@ func main() {
 			*rangeChunkCache = n
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_RANGE_CHUNK_CACHE_SIZE value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_PEER_READ_SORT_BY_NETWORK"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.PeerReadSortByNetwork = parsed
+			*peerSortNet = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_PEER_READ_SORT_BY_NETWORK value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_PEER_READ_PARALLEL_FANOUT"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.PeerReadParallelFanout = parsed
+			*peerFanout = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_PEER_READ_PARALLEL_FANOUT value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_HYBRID_ALWAYS_MIN_SIZE_MB"); v != "" {
@@ -433,6 +453,8 @@ func main() {
 	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
 	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
 	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
+	logger.Printf("- Peer read sort by network: %t", cacheConfig.PeerReadSortByNetwork)
+	logger.Printf("- Peer read parallel fanout: %t", cacheConfig.PeerReadParallelFanout)
 	logger.Printf("- Hybrid always min size MB: %d", cacheConfig.HybridAlwaysMinSize/(1024*1024))
 	logger.Printf("- Hybrid stripe min size MB: %d", cacheConfig.HybridStripeMinSize/(1024*1024))
 	logger.Printf("- Azure download concurrency: %d", cacheConfig.AzureDownloadConcurrency)

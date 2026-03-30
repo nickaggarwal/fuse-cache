@@ -63,20 +63,26 @@ func TestFileHintKey_NonChunkUsesOriginalPath(t *testing.T) {
 }
 
 func TestPeerReadParallelFanout_ChunkedUsesTwoPeers(t *testing.T) {
-	if got := peerReadParallelFanout("/data.bin_chunk_12", 5); got != 2 {
+	if got := peerReadParallelFanout("/data.bin_chunk_12", 5, true); got != 2 {
 		t.Fatalf("peerReadParallelFanout(chunk,5)=%d, want 2", got)
 	}
 }
 
 func TestPeerReadParallelFanout_NonChunkUsesSinglePeer(t *testing.T) {
-	if got := peerReadParallelFanout("/data.bin", 5); got != 1 {
+	if got := peerReadParallelFanout("/data.bin", 5, true); got != 1 {
 		t.Fatalf("peerReadParallelFanout(non-chunk,5)=%d, want 1", got)
 	}
 }
 
 func TestPeerReadParallelFanout_BoundedByCandidates(t *testing.T) {
-	if got := peerReadParallelFanout("/data.bin_chunk_0", 1); got != 1 {
+	if got := peerReadParallelFanout("/data.bin_chunk_0", 1, true); got != 1 {
 		t.Fatalf("peerReadParallelFanout(chunk,1)=%d, want 1", got)
+	}
+}
+
+func TestPeerReadParallelFanout_DisabledUsesSinglePeer(t *testing.T) {
+	if got := peerReadParallelFanout("/data.bin_chunk_0", 5, false); got != 1 {
+		t.Fatalf("peerReadParallelFanout(chunk,5,false)=%d, want 1", got)
 	}
 }
 

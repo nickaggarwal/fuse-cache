@@ -17,6 +17,8 @@ data:
   FUSE_PARALLEL_RANGE_READS: {{ .Values.config.parallelRangeReads | quote }}
   FUSE_RANGE_PREFETCH_CHUNKS: {{ .Values.config.rangePrefetchChunks | quote }}
   FUSE_RANGE_CHUNK_CACHE_SIZE: {{ .Values.config.rangeChunkCacheSize | quote }}
+  FUSE_PEER_READ_SORT_BY_NETWORK: {{ .Values.config.peerReadSortByNetwork | quote }}
+  FUSE_PEER_READ_PARALLEL_FANOUT: {{ .Values.config.peerReadParallelFanout | quote }}
   FUSE_S3_DOWNLOAD_CONCURRENCY: {{ .Values.config.s3DownloadConcurrency | quote }}
   FUSE_S3_DOWNLOAD_PART_SIZE_MB: {{ .Values.config.s3DownloadPartSizeMB | quote }}
   FUSE_S3_UPLOAD_CONCURRENCY: {{ .Values.config.s3UploadConcurrency | quote }}

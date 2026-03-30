@@ -54,6 +54,8 @@ config:
   parallelRangeReads: "96"
   rangePrefetchChunks: "48"
   rangeChunkCacheSize: "384"
+  peerReadSortByNetwork: "true"
+  peerReadParallelFanout: "true"
   peerReadMBps: "10000"
   s3Bucket: "fuse-client-cache"
   s3Region: "us-east-1"

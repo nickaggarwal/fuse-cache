@@ -34,6 +34,8 @@ type PeerStorage struct {
 	timeout             time.Duration
 	minReplicationCount int
 	localPeerID         string
+	sortByNetwork       bool
+	parallelFanout      bool
 	connMu              sync.RWMutex
 	connPool            map[string]*grpc.ClientConn
 	readConnMu          sync.RWMutex
@@ -53,12 +55,14 @@ type fileHintCacheEntry struct {
 }
 
 // NewPeerStorage creates a new peer storage instance.
-func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localPeerID string) (*PeerStorage, error) {
+func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localPeerID string, sortByNetwork bool, parallelFanout bool) (*PeerStorage, error) {
 	return &PeerStorage{
 		coordinator:         coord,
 		timeout:             timeout,
 		minReplicationCount: 3,
 		localPeerID:         localPeerID,
+		sortByNetwork:       sortByNetwork,
+		parallelFanout:      parallelFanout,
 		connPool:            make(map[string]*grpc.ClientConn),
 		readConnPool:        make(map[string][]*grpc.ClientConn),
 		readConnPerPeer:     peerDefaultReadConnPerPeer,
@@ -198,10 +202,12 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no active peers available")
 	}
-	sortPeersByNetwork(candidates, path)
+	if ps.sortByNetwork {
+		sortPeersByNetwork(candidates, path)
+	}
 
 	var lastErr error
-	parallelFanout := peerReadParallelFanout(path, len(candidates))
+	parallelFanout := peerReadParallelFanout(path, len(candidates), ps.parallelFanout)
 	if parallelFanout > 1 {
 		if data, err := ps.readFromPeersParallel(ctx, path, candidates[:parallelFanout]); err == nil {
 			return data, nil
@@ -257,7 +263,10 @@ func peerSortScore(peer *coordinator.PeerInfo) float64 {
 	return speed / lat
 }
 
-func peerReadParallelFanout(path string, candidateCount int) int {
+func peerReadParallelFanout(path string, candidateCount int, enabled bool) int {
+	if !enabled {
+		return 1
+	}
 	if candidateCount <= 1 {
 		return candidateCount
 	}
