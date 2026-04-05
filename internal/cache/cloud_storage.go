@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -112,6 +113,18 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	buf := aws.NewWriteAtBuffer([]byte{})
 	var firstErr error
 	for _, key := range keyCandidates(path) {
+		if shouldUseDirectS3Read(path) {
+			data, err := cs.readDirect(timeoutCtx, key)
+			if err == nil {
+				return data, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			if timeoutCtx.Err() != nil {
+				return nil, err
+			}
+		}
 		buf = aws.NewWriteAtBuffer([]byte{})
 		_, err := cs.downloader.DownloadWithContext(timeoutCtx, buf, &s3.GetObjectInput{
 			Bucket: aws.String(cs.bucket),
@@ -131,6 +144,18 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		firstErr = errors.New("s3 read failed")
 	}
 	return nil, firstErr
+}
+
+func (cs *CloudStorage) readDirect(ctx context.Context, key string) ([]byte, error) {
+	resp, err := cs.s3Client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(cs.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) error {
@@ -249,6 +274,10 @@ func keyCandidates(path string) []string {
 		return []string{norm}
 	}
 	return []string{norm, path}
+}
+
+func shouldUseDirectS3Read(path string) bool {
+	return strings.Contains(path, "_chunk_")
 }
 
 func supportsPutObjectFallback(err error) bool {

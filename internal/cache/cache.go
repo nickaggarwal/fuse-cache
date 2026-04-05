@@ -2069,13 +2069,39 @@ func (cm *DefaultCacheManager) fetchChunkAsLeader(
 
 	fetchCtx := ctx
 	cancel := func() {}
-	if _, ok := ctx.Deadline(); !ok && cm.config.PeerTimeout > 0 {
-		fetchCtx, cancel = context.WithTimeout(ctx, cm.config.PeerTimeout)
+	if _, ok := ctx.Deadline(); !ok {
+		timeout := cm.chunkReadTimeout(remoteOrder, hybridRead)
+		if timeout > 0 {
+			fetchCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
 	}
 	defer cancel()
 
 	chunkData, chunkTier, err = cm.readChunkDataFromTiers(fetchCtx, filePath, chunkPath, chunkIndex, remoteOrder, hybridRead, chunkStart)
 	return chunkData, chunkTier, err
+}
+
+func (cm *DefaultCacheManager) chunkReadTimeout(remoteOrder []CacheTier, hybridRead bool) time.Duration {
+	timeout := cm.config.PeerTimeout
+	if hybridRead {
+		if cm.config.CloudTimeout > timeout {
+			timeout = cm.config.CloudTimeout
+		}
+		return timeout
+	}
+	for _, tier := range remoteOrder {
+		switch tier {
+		case TierCloud:
+			if cm.config.CloudTimeout > timeout {
+				timeout = cm.config.CloudTimeout
+			}
+		case TierPeer:
+			if cm.config.PeerTimeout > timeout {
+				timeout = cm.config.PeerTimeout
+			}
+		}
+	}
+	return timeout
 }
 
 func (cm *DefaultCacheManager) readChunkDataFromTiers(

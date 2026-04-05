@@ -348,3 +348,51 @@
   - Keep revision `105` changes out of the default AKS benchmark profile.
   - Treat the read regression and the large-write regression as separate issues.
   - Next investigation should focus specifically on the large-write path, since reverting to clean `main` plus conservative read settings did not fix it.
+
+## 2026-04-05 EKS Cold-Read Fix: Cloud Timeout + Direct S3 Chunk Reads
+- Cluster/namespace: `stargz-test` / `fuse-system-awstest`
+- Node/pod used: single `i3en.6xlarge` node `i-000b88db0649d305c`, client pod `client-ndhlq`
+- Patched image:
+  - `679004966033.dkr.ecr.us-east-1.amazonaws.com/fuse-client:main-amd64-777585e-awsreadfix-20260405-094431`
+
+### Problem observed before the fix
+- `5GB` AWS cold reads stalled even after write completion.
+- Initial reruns with a fixed `20s` settle were invalid because S3 chunk persistence was still in progress.
+- After waiting for all `320/320` chunk objects to exist in S3 and clearing local NVMe cache, the cold read still stalled.
+- Reader logs showed:
+  - chunk reads failing at about `30s`
+  - `RequestCanceled: request context canceled caused by: context deadline exceeded`
+  - repeated failures on early cloud chunks like `1,2,3,4,5,6,7,8`
+
+### Root cause
+- `fetchChunkAsLeader()` wrapped all remote chunk reads in `PeerTimeout` when the caller did not already provide a deadline.
+- In this deployment:
+  - `PeerTimeout = 30s`
+  - `CloudTimeout = 60s`
+- That meant cloud chunk reads were being canceled at `30s`, even though the configured cloud tier budget was `60s`.
+- At the same time, S3 chunk objects were being read through the multipart downloader path, which is heavier than necessary for `16MiB` chunk objects.
+
+### Code changes that fixed it
+- In `internal/cache/cache.go`:
+  - choose chunk-read timeout based on the remote tiers involved
+  - use the larger cloud timeout when cloud is in play
+- In `internal/cache/cloud_storage.go`:
+  - use direct `GetObject` + `io.ReadAll` for chunk objects (`*_chunk_*`)
+  - keep the downloader path available for non-chunk object reads
+
+### Result after the fix
+- Controlled AWS rerun:
+  - wrote `5GB`
+  - waited for `320/320` S3 chunk objects
+  - cleared local NVMe cache
+  - reran cold read from the mounted path
+- Observed result:
+  - `5GB`: write `124 MB/s`, cold read `473 MB/s`
+
+### Additional notes
+- S3 chunk persistence rate on this node was about `~90s` total for `320` chunk objects, so a fixed `20s` post-write settle is not enough for `5GB` AWS validation.
+- After the fix, reader logs showed healthy cloud-backed range-cache population rather than repeated timeout failures.
+- Read-path snapshots on the fixed run:
+  - range cache stayed capped at `512 MiB`
+  - chunk source was consistently `cloud`
+  - goroutines stayed modest (`~36-67` in the tail of the run)
