@@ -1,0 +1,133 @@
+{
+  "id": null,
+  "uid": "fuse-cache-overview",
+  "title": "FUSE Cache Overview",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 2,
+  "refresh": "10s",
+  "tags": ["fuse", "cache"],
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Coordinator Availability",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "max(fuse_coordinator_available)", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Writeback Cache",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "max(fuse_gofuse_writeback_cache_enabled)", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Passthrough",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "max(fuse_gofuse_passthrough_enabled)", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "NVMe Usage (%)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "100 * sum(fuse_nvme_used_bytes) / clamp_min(sum(fuse_nvme_capacity_bytes), 1)", "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Hot Local Read Throughput (MiB/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "sum(rate(fuse_cache_nvme_read_bytes_total[5m])) / 1024 / 1024", "legendFormat": "nvme", "refId": "A"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Write Throughput (MiB/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "sum(rate(fuse_cache_write_bytes_total[5m])) / 1024 / 1024", "legendFormat": "cache writes", "refId": "A"},
+        {"expr": "sum(rate(fuse_gofuse_write_bytes_total[5m])) / 1024 / 1024", "legendFormat": "fuse writes", "refId": "B"}
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Read Source Contribution (MiB/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {"expr": "sum(rate(fuse_cache_nvme_read_wall_bytes_total[5m])) / 1024 / 1024", "legendFormat": "nvme", "refId": "A"},
+        {"expr": "sum(rate(fuse_cache_peer_read_wall_bytes_total[5m])) / 1024 / 1024", "legendFormat": "peer", "refId": "B"},
+        {"expr": "sum(rate(fuse_cache_cloud_read_wall_bytes_total[5m])) / 1024 / 1024", "legendFormat": "cloud", "refId": "C"}
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Read Source Share (%)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {"expr": "100 * sum(rate(fuse_cache_nvme_read_wall_bytes_total[5m])) / clamp_min(sum(rate(fuse_cache_read_wall_bytes_total[5m])), 1)", "legendFormat": "nvme", "refId": "A"},
+        {"expr": "100 * sum(rate(fuse_cache_peer_read_wall_bytes_total[5m])) / clamp_min(sum(rate(fuse_cache_read_wall_bytes_total[5m])), 1)", "legendFormat": "peer", "refId": "B"},
+        {"expr": "100 * sum(rate(fuse_cache_cloud_read_wall_bytes_total[5m])) / clamp_min(sum(rate(fuse_cache_read_wall_bytes_total[5m])), 1)", "legendFormat": "cloud", "refId": "C"}
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Chunk Fetch Latency (ms/op)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {"expr": "1000 * sum(rate(fuse_cache_nvme_read_seconds_total[5m])) / clamp_min(sum(rate(fuse_cache_nvme_read_ops_total[5m])), 1)", "legendFormat": "nvme", "refId": "A"},
+        {"expr": "1000 * sum(rate(fuse_cache_peer_read_seconds_total[5m])) / clamp_min(sum(rate(fuse_cache_peer_read_ops_total[5m])), 1)", "legendFormat": "peer", "refId": "B"},
+        {"expr": "1000 * sum(rate(fuse_cache_cloud_read_seconds_total[5m])) / clamp_min(sum(rate(fuse_cache_cloud_read_ops_total[5m])), 1)", "legendFormat": "cloud", "refId": "C"}
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "FUSE Write Phase vs Sync (ms/flush)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [
+        {"expr": "1000 * sum(rate(fuse_gofuse_write_phase_seconds_total[5m])) / clamp_min(sum(rate(fuse_gofuse_write_summaries_total[5m])), 1)", "legendFormat": "write phase", "refId": "A"},
+        {"expr": "1000 * sum(rate(fuse_gofuse_sync_seconds_total[5m])) / clamp_min(sum(rate(fuse_gofuse_write_summaries_total[5m])), 1)", "legendFormat": "sync", "refId": "B"},
+        {"expr": "1000 * sum(rate(fuse_gofuse_put_seconds_total[5m])) / clamp_min(sum(rate(fuse_gofuse_write_summaries_total[5m])), 1)", "legendFormat": "put", "refId": "C"},
+        {"expr": "1000 * sum(rate(fuse_gofuse_flush_seconds_total[5m])) / clamp_min(sum(rate(fuse_gofuse_write_summaries_total[5m])), 1)", "legendFormat": "flush total", "refId": "D"}
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Memory and Range Cache (MiB)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "targets": [
+        {"expr": "sum(fuse_runtime_alloc_bytes) / 1024 / 1024", "legendFormat": "alloc", "refId": "A"},
+        {"expr": "sum(fuse_runtime_heap_inuse_bytes) / 1024 / 1024", "legendFormat": "heap inuse", "refId": "B"},
+        {"expr": "sum(fuse_range_cache_bytes) / 1024 / 1024", "legendFormat": "range cache", "refId": "C"},
+        {"expr": "sum(fuse_range_prefetch_bytes) / 1024 / 1024", "legendFormat": "prefetch reserved", "refId": "D"}
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Goroutines and In-Flight Prefetch",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "targets": [
+        {"expr": "sum(fuse_runtime_goroutines)", "legendFormat": "goroutines", "refId": "A"},
+        {"expr": "sum(fuse_range_prefetch_inflight)", "legendFormat": "prefetch inflight", "refId": "B"},
+        {"expr": "sum(fuse_range_cache_chunks)", "legendFormat": "range cache chunks", "refId": "C"}
+      ]
+    }
+  ]
+}

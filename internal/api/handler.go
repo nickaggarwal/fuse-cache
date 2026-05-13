@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
+	fusemetrics "fuse-client/internal/fusemetrics"
 
 	"github.com/gorilla/mux"
 )
@@ -714,6 +716,38 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	used, capacity := dcm.Stats()
 	fmt.Fprintf(w, "fuse_nvme_used_bytes %d\n", used)
 	fmt.Fprintf(w, "fuse_nvme_capacity_bytes %d\n", capacity)
+
+	rangeSnap := dcm.RangeCacheSnapshot()
+	fmt.Fprintf(w, "fuse_range_cache_files %d\n", rangeSnap.Files)
+	fmt.Fprintf(w, "fuse_range_cache_chunks %d\n", rangeSnap.Chunks)
+	fmt.Fprintf(w, "fuse_range_cache_bytes %d\n", rangeSnap.Bytes)
+	fmt.Fprintf(w, "fuse_range_prefetch_inflight %d\n", rangeSnap.PrefetchInFlight)
+	fmt.Fprintf(w, "fuse_range_prefetch_bytes %d\n", rangeSnap.PrefetchBytes)
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(w, "fuse_runtime_alloc_bytes %d\n", ms.Alloc)
+	fmt.Fprintf(w, "fuse_runtime_heap_inuse_bytes %d\n", ms.HeapInuse)
+	fmt.Fprintf(w, "fuse_runtime_heap_idle_bytes %d\n", ms.HeapIdle)
+	fmt.Fprintf(w, "fuse_runtime_heap_objects %d\n", ms.HeapObjects)
+	fmt.Fprintf(w, "fuse_runtime_goroutines %d\n", runtime.NumGoroutine())
+
+	gf := fusemetrics.Snapshot()
+	fmt.Fprintf(w, "fuse_gofuse_passthrough_enabled %d\n", gf.PassthroughEnabled)
+	fmt.Fprintf(w, "fuse_gofuse_writeback_cache_enabled %d\n", gf.WritebackCacheEnabled)
+	fmt.Fprintf(w, "fuse_gofuse_max_write_bytes %d\n", gf.MaxWriteBytes)
+	fmt.Fprintf(w, "fuse_gofuse_write_append_buffer_bytes %d\n", gf.WriteAppendBufferBytes)
+	fmt.Fprintf(w, "fuse_gofuse_write_summaries_total %d\n", gf.WriteSummaries)
+	fmt.Fprintf(w, "fuse_gofuse_write_bytes_total %d\n", gf.WriteBytes)
+	fmt.Fprintf(w, "fuse_gofuse_write_calls_total %d\n", gf.WriteCalls)
+	fmt.Fprintf(w, "fuse_gofuse_stage_write_calls_total %d\n", gf.StageWriteCalls)
+	fmt.Fprintf(w, "fuse_gofuse_stage_write_bytes_total %d\n", gf.StageWriteBytes)
+	fmt.Fprintf(w, "fuse_gofuse_buffer_flush_calls_total %d\n", gf.BufferFlushCalls)
+	fmt.Fprintf(w, "fuse_gofuse_write_phase_seconds_total %.6f\n", float64(gf.WritePhaseNanos)/float64(time.Second))
+	fmt.Fprintf(w, "fuse_gofuse_buffer_flush_seconds_total %.6f\n", float64(gf.BufferFlushNanos)/float64(time.Second))
+	fmt.Fprintf(w, "fuse_gofuse_sync_seconds_total %.6f\n", float64(gf.SyncNanos)/float64(time.Second))
+	fmt.Fprintf(w, "fuse_gofuse_put_seconds_total %.6f\n", float64(gf.PutNanos)/float64(time.Second))
+	fmt.Fprintf(w, "fuse_gofuse_flush_seconds_total %.6f\n", float64(gf.FlushTotalNanos)/float64(time.Second))
 
 	metrics := dcm.GetMetrics()
 	writeMetricLine(w, "fuse_cache_nvme_hits_total", metrics["nvme_hits"])

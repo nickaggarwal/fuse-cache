@@ -22,6 +22,7 @@ The system consists of:
 - **Prometheus metrics endpoint**:
   - Client now exposes `GET /metrics` (Prometheus text format)
   - Includes cache hits/misses, write bytes/count, eviction counters, NVMe capacity/usage, coordinator availability
+  - Also includes read source contribution, range-cache memory, Go runtime memory, goroutines, and go-fuse write-phase vs sync totals
 - **Large file stability improvements**:
   - Write path uses buffered growth to avoid O(n^2) realloc/copy behavior
   - Chunked uploads avoid unbounded goroutine fanout
@@ -29,6 +30,7 @@ The system consists of:
 - **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and read benchmarking
   - `test-smart-read.sh` supports cross-pod read/write benchmarks for arbitrary sizes (e.g. 100MB/1GB/5GB)
   - `test-smart-read-5gb.sh` remains as a compatibility wrapper
+  - `benchmark-fuse-scenario.sh` records benchmark throughput together with node class, source contribution, cache state, CPU snapshots, network telemetry, and git commit
   - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
   - `test-smart-read-s3-profile.sh` labels `standard` vs `s3express` runs and checks zone alignment for S3 Express endpoints
 
@@ -175,6 +177,51 @@ Options:
 - `GET /api/health` - Health check
 - `GET /metrics` - Prometheus metrics
 
+## Known Best Configs
+
+The most stable high-performance profile we have validated so far is:
+
+- `gofuse` backend
+- passthrough enabled
+- writeback cache enabled through go-fuse capability negotiation
+- simple `8MiB` append buffer
+- byte-bounded range cache (`512MiB`)
+- byte-bounded prefetch budget (`128MiB`)
+- reduced repeated prefetch near chunk boundaries
+- avoid the segmented write-window / segmented coalescing path
+
+Recommended chart defaults for this profile are now:
+
+- `config.fuseBackend: "gofuse"`
+- `config.goFuseEnablePassthrough: "true"`
+- `config.goFuseWritebackCache: "true"`
+- `config.goFuseWriteAppendBufferMB: "8"`
+- `config.parallelRangeReads: "32"`
+- `config.rangePrefetchChunks: "8"`
+- `config.rangeChunkCacheMaxBytesMB: "512"`
+- `config.rangePrefetchMaxBytesMB: "128"`
+
+## Placement And Policy Defaults
+
+Operationally, the best results have come from treating node classes differently:
+
+- `L64s_v3` as the write-preferred / ingest node class
+- `A100` as the read-preferred node class when you need high remote-read throughput
+- local NVMe as the primary fast path
+- peer first for remote reads, with cloud added to accelerate large reads
+- file-size based hybrid behavior using `hybridAlwaysMinSizeMB` and `hybridStripeMinSizeMB`
+
+In practice, that means:
+
+- keep hot local IO on NVMe
+- publish cloud/chunk copies asynchronously where semantics allow
+- benchmark with explicit writer/reader node classes instead of whichever pods happen to be selected
+
+Azure sizing note from 2026-05-12:
+
+- minimum Azure topology that worked well on the current build: `1x D4as_v5 system + 1x D8ads_v5 user + 1x L64s_v3 writer`
+- adding `1x A100` reader did not improve the important `5GB` read path enough to justify its cost on the current build
+
 ## Cache Behavior
 
 1. **File Read**: 
@@ -200,6 +247,59 @@ Options:
    - Automatic promotion of frequently accessed files
    - Background cleanup of inactive entries
    - Chunked persistence uses bounded memory behavior
+
+## Benchmark Mode
+
+Use the benchmark wrapper when you want a reproducible artifact rather than an ad hoc terminal capture:
+
+```bash
+./scripts/ops/benchmark-fuse-scenario.sh <namespace> <size-mb> [writer-class-substr] [reader-class-substr]
+```
+
+Example:
+
+```bash
+./scripts/ops/benchmark-fuse-scenario.sh fuse-system-aztest 5120 Standard_L64s_v3 Standard_NC24ads_A100_v4
+```
+
+The script appends a CSV row to `/tmp/fuse-benchmark-results.csv` with:
+
+- file size
+- writer node class and reader node class
+- write and read throughput
+- peer/cloud/NVMe read contribution
+- peer and cloud object-path throughput
+- go-fuse write phase, sync phase, and flush timing
+- range-cache / prefetch state after the read
+- Go heap / goroutine snapshots
+- node and pod CPU snapshots from `kubectl top`
+- coordinator-reported peer network telemetry
+- git commit and image tags
+
+## Dashboard
+
+Enable the chart dashboard support when Grafana watches dashboard ConfigMaps:
+
+```yaml
+monitoring:
+  serviceMonitor:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
+```
+
+The `FUSE Cache Overview` dashboard now includes:
+
+- hot local read throughput
+- overall write throughput
+- peer/cloud/NVMe read contribution
+- read source share
+- chunk fetch latency by tier
+- go-fuse write phase vs sync vs flush time
+- runtime memory, range cache bytes, and prefetch reservation
+- goroutines and in-flight prefetch
 
 ## Configuration
 
@@ -237,6 +337,8 @@ export FUSE_PEER_READ_MBPS=10000   # force peer-first for cold-read performance 
 export FUSE_PARALLEL_RANGE_READS=8
 export FUSE_RANGE_PREFETCH_CHUNKS=2
 export FUSE_RANGE_CHUNK_CACHE_SIZE=16
+export FUSE_RANGE_CHUNK_CACHE_MAX_BYTES_MB=512
+export FUSE_RANGE_PREFETCH_MAX_BYTES_MB=128
 export FUSE_PEER_TIMEOUT=30s
 export FUSE_CLOUD_TIMEOUT=60s
 export FUSE_IO_PROGRESS_MB=512   # set 0 to disable read/write progress logs
@@ -250,6 +352,8 @@ export FUSE_NETPROBE_EVERY_HEARTBEATS=2
 `FUSE_PEER_READ_MBPS` controls the hybrid-read throughput model.
 `FUSE_PARALLEL_RANGE_READS`, `FUSE_RANGE_PREFETCH_CHUNKS`, and
 `FUSE_RANGE_CHUNK_CACHE_SIZE` tune range-read throughput behavior.
+`FUSE_RANGE_CHUNK_CACHE_MAX_BYTES_MB` and `FUSE_RANGE_PREFETCH_MAX_BYTES_MB`
+turn those controls into explicit byte budgets so large reads stay stable.
 `FUSE_S3_DOWNLOAD_*` and `FUSE_S3_UPLOAD_*` tune multipart transfer throughput for S3.
 `FUSE_IO_PROGRESS_MB` controls periodic FUSE read/write progress logging cadence.
 `FUSE_NETPROBE_*` controls optional peer-to-peer network probing and telemetry

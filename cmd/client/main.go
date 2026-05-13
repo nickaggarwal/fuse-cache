@@ -65,20 +65,22 @@ func main() {
 		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
 
 		// NVMe capacity
-		nvmeMaxGB       = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
-		peerMaxGB       = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
-		peerReadMBps    = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
-		parallelReads   = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
-		prefetchChunks  = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
-		rangeChunkCache = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
-		peerSortNet     = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
-		peerFanout      = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
-		hybridAlwaysMB  = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
-		hybridStripeMB  = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
-		hybridHedgeMS   = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
-		hybridHedgeMax  = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
-		mountRetries    = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
-		mountDelayS     = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
+		nvmeMaxGB            = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+		peerMaxGB            = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
+		peerReadMBps         = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
+		parallelReads        = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
+		prefetchChunks       = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
+		rangeChunkCache      = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
+		rangeChunkCacheMaxMB = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
+		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
+		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
+		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
+		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
+		hybridStripeMB       = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
+		hybridHedgeMS        = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
+		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
+		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
+		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
 		help = flag.Bool("help", false, "Show help")
 	)
@@ -165,6 +167,8 @@ func main() {
 		ParallelRangeReads:         *parallelReads,
 		RangePrefetchChunks:        *prefetchChunks,
 		RangeChunkCacheSize:        *rangeChunkCache,
+		RangeChunkCacheMaxBytes:    int64(*rangeChunkCacheMaxMB) * 1024 * 1024,
+		RangePrefetchMaxBytes:      int64(*rangePrefetchMaxMB) * 1024 * 1024,
 		PeerReadSortByNetwork:      *peerSortNet,
 		PeerReadParallelFanout:     *peerFanout,
 		HybridAlwaysMinSize:        int64(*hybridAlwaysMB) * 1024 * 1024,
@@ -227,6 +231,22 @@ func main() {
 			*rangeChunkCache = n
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_RANGE_CHUNK_CACHE_SIZE value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_CHUNK_CACHE_MAX_BYTES_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.RangeChunkCacheMaxBytes = int64(n) * 1024 * 1024
+			*rangeChunkCacheMaxMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_CHUNK_CACHE_MAX_BYTES_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_PREFETCH_MAX_BYTES_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cacheConfig.RangePrefetchMaxBytes = int64(n) * 1024 * 1024
+			*rangePrefetchMaxMB = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_MAX_BYTES_MB value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_PEER_READ_SORT_BY_NETWORK"); v != "" {
@@ -453,6 +473,8 @@ func main() {
 	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
 	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
 	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
+	logger.Printf("- Range chunk cache max MB: %d", cacheConfig.RangeChunkCacheMaxBytes/(1024*1024))
+	logger.Printf("- Range prefetch max MB: %d", cacheConfig.RangePrefetchMaxBytes/(1024*1024))
 	logger.Printf("- Peer read sort by network: %t", cacheConfig.PeerReadSortByNetwork)
 	logger.Printf("- Peer read parallel fanout: %t", cacheConfig.PeerReadParallelFanout)
 	logger.Printf("- Hybrid always min size MB: %d", cacheConfig.HybridAlwaysMinSize/(1024*1024))

@@ -203,6 +203,14 @@ type chunkFileCache struct {
 	prefetchBytes       int64
 }
 
+type RangeCacheSnapshot struct {
+	Files            int
+	Chunks           int
+	Bytes            int64
+	PrefetchBytes    int64
+	PrefetchInFlight int
+}
+
 type rangeCachedChunk struct {
 	data []byte
 	tier CacheTier
@@ -2386,6 +2394,25 @@ func (cm *DefaultCacheManager) rangeCacheStats(filePath string) (int, int64) {
 		return 0, 0
 	}
 	return len(fileCache.order), fileCache.bytes
+}
+
+func (cm *DefaultCacheManager) RangeCacheSnapshot() RangeCacheSnapshot {
+	cm.rangeMu.RLock()
+	defer cm.rangeMu.RUnlock()
+
+	snap := RangeCacheSnapshot{
+		Files: len(cm.rangeChunks),
+	}
+	for _, fileCache := range cm.rangeChunks {
+		if fileCache == nil {
+			continue
+		}
+		snap.Chunks += len(fileCache.order)
+		snap.Bytes += fileCache.bytes
+		snap.PrefetchBytes += fileCache.prefetchBytes
+		snap.PrefetchInFlight += len(fileCache.prefetchInFlight)
+	}
+	return snap
 }
 
 func (cm *DefaultCacheManager) reservePrefetchChunks(filePath string, endChunk int64, numChunks int64, chunkSize int64, want int) ([]int64, int64, int64) {

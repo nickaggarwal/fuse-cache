@@ -51,9 +51,11 @@ config:
   nvmeMaxGB: "10"
   fuseMountPath: /host/mnt/fuse
   chunkSizeMB: "16"
-  parallelRangeReads: "96"
-  rangePrefetchChunks: "48"
-  rangeChunkCacheSize: "384"
+  parallelRangeReads: "32"
+  rangePrefetchChunks: "8"
+  rangeChunkCacheSize: "128"
+  rangeChunkCacheMaxBytesMB: "512"
+  rangePrefetchMaxBytesMB: "128"
   peerReadSortByNetwork: "true"
   peerReadParallelFanout: "true"
   peerReadMBps: "10000"
@@ -78,10 +80,10 @@ config:
   netProbeBytes: "1048576"
   netProbeTimeoutMs: "2000"
   netProbeEveryHeartbeats: "2"
-  fuseBackend: "bazil"
-  goFuseEnablePassthrough: "false"
+  fuseBackend: "gofuse"
+  goFuseEnablePassthrough: "true"
   goFuseWriteAppendBufferMB: "8"
-  goFuseWritebackCache: "false"
+  goFuseWritebackCache: "true"
 
 secrets:
   aws:

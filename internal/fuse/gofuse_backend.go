@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"fuse-client/internal/cache"
+	"fuse-client/internal/fusemetrics"
 
 	gfs "github.com/hanwen/go-fuse/v2/fs"
 	gfuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -139,6 +140,7 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 		g.maxWrite,
 		g.writeAppendBytes,
 	)
+	fusemetrics.RecordGoFuseMountConfig(g.enablePassthrough, g.writebackCache, g.maxWrite, g.writeAppendBytes)
 	if g.readTraceEnabled || g.readTimeout > 0 {
 		g.logger.Printf("Read tracing config trace=%t step_bytes=%d path_filter=%q timeout_ms=%d max_write_bytes=%d",
 			g.readTraceEnabled, g.readTraceStep, g.readTracePath, g.readTimeout.Milliseconds(), g.maxWrite)
@@ -770,6 +772,7 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 	}
 	n.gfs.logger.Printf("Write summary path=%s size=%d write_calls=%d write_bytes=%d stage_write_calls=%d stage_write_bytes=%d buffer_flush_calls=%d write_phase_ms=%d buffer_flush_ms=%d sync_ms=%d put_ms=%d flush_total_ms=%d",
 		n.path, n.entry.Size, n.writeCalls, n.writeBytes, n.stageWriteCalls, n.stageWriteBytes, n.bufferFlushCalls, writeDur.Milliseconds(), stageFlushDur.Milliseconds(), syncDur.Milliseconds(), putDur.Milliseconds(), totalDur.Milliseconds())
+	fusemetrics.RecordGoFuseWriteSummary(n.writeBytes, n.writeCalls, n.stageWriteCalls, n.stageWriteBytes, n.bufferFlushCalls, writeDur.Nanoseconds(), stageFlushDur.Nanoseconds(), syncDur.Nanoseconds(), putDur.Nanoseconds(), totalDur.Nanoseconds())
 	n.writeStartedAt = time.Time{}
 	n.writeBytes = 0
 	n.writeCalls = 0

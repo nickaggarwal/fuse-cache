@@ -396,3 +396,59 @@
   - range cache stayed capped at `512 MiB`
   - chunk source was consistently `cloud`
   - goroutines stayed modest (`~36-67` in the tail of the run)
+
+## 2026-05-12 Azure minimum-node sizing
+
+Goal: find the smallest Azure topology that still works well for the current go-fuse writeback build, then leave that topology deployed.
+
+Tested release:
+- namespace: `fuse-system-azsize`
+- image: `stargzrepo.azurecr.io/fuse-client:sizing-20260512-142132`
+- commit base in image build context: working tree from `116072e` plus local instrumentation/config changes
+- cloud backend: existing Azure Blob config from `fuse-system`
+
+Node classes compared:
+- writer: `Standard_L64s_v3`
+- reader option A: `Standard_D8ads_v5`
+- reader option B: `Standard_NC24ads_A100_v4`
+
+Results:
+- `1GB` `L64s_v3 -> D8ads_v5`
+  - write: `401 MB/s`
+  - read: `551 MB/s`
+  - source mix: `100% peer`, `0% cloud`
+- `1GB` `L64s_v3 -> NC24ads_A100_v4`
+  - write: `397 MB/s`
+  - read: `573 MB/s`
+  - source mix: `100% peer`, `0% cloud`
+- `5GB` `L64s_v3 -> D8ads_v5`
+  - write: `524 MB/s`
+  - read: `546 MB/s`
+  - source mix: `90.0% peer`, `10.0% cloud`
+  - peer object speed: `129.8 MiB/s`
+  - cloud object speed: `73.1 MiB/s`
+- `5GB` `L64s_v3 -> NC24ads_A100_v4`
+  - write: `558 MB/s`
+  - read: `391 MB/s`
+  - source mix: `30.9% peer`, `69.1% cloud`
+  - peer object speed: `32.0 MiB/s`
+  - cloud object speed: `119.9 MiB/s`
+
+Conclusion:
+- The extra A100 reader node is not justified for the current build if the goal is minimum cost with good throughput.
+- A100 was only slightly better at `1GB` read and materially worse at `5GB` read.
+- The best minimum practical Azure topology for this build is:
+  - `1x` system node (`D4as_v5`) for AKS/system services
+  - `1x` general user node (`D8ads_v5`) as the default remote reader / control-plane workload node
+  - `1x` writer-optimized node (`L64s_v3`) for ingest and hot local write path
+- This gives a 3-node cluster footprint total and avoids paying for A100 capacity that does not improve the current read path.
+
+Operational recommendation:
+- Keep `L64s_v3` as the write-preferred node class.
+- Keep a general-purpose user node for the second client / reader role.
+- Do not include A100 in the minimum Azure footprint unless a future build demonstrates a clear read win at large-file sizes.
+- Revisit A100 only after improving the `5GB` cloud-heavy read path.
+
+Artifacts:
+- benchmark CSV: `/tmp/fuse-azure-sizing.csv`
+- release: `fuse-cache-azsize`
