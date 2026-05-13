@@ -34,6 +34,111 @@ The system consists of:
   - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
   - `test-smart-read-s3-profile.sh` labels `standard` vs `s3express` runs and checks zone alignment for S3 Express endpoints
 
+## Best Usage Modes
+
+If you want the project in its current best-known operating shape, start here.
+
+### Mode 1: Stable General-Purpose Deployment
+
+Use this as the default mode for most Azure and AWS testing:
+
+- `gofuse` backend
+- passthrough enabled
+- writeback cache enabled
+- simple `8MiB` append buffer
+- byte-bounded range cache (`512MiB`)
+- byte-bounded prefetch budget (`128MiB`)
+- reduced repeated prefetch near chunk boundaries
+
+Why this is the default:
+
+- it gave the most stable large-file behavior
+- it avoided the earlier range-cache memory blow-up
+- it kept the best writeback-based write path without the segmented coalescing regressions
+
+Avoid:
+
+- segmented write-window / segmented coalescing experiments
+- unbounded chunk-count-based read caching on large files
+
+### Mode 2: Write-Optimized Ingest
+
+Use this when the main goal is to write large files quickly and persist them locally first:
+
+- prefer `L64s_v3` as the writer node class
+- keep local NVMe as the primary fast path
+- let peer/cloud publication happen asynchronously where semantics allow
+
+Current operating guidance:
+
+- `L64s_v3` is the best Azure writer node class we validated
+- A100 nodes are not cost-effective as the primary writer path
+
+### Mode 3: Read-Optimized Remote Serving
+
+Use this when the main goal is large-file read throughput:
+
+- keep peer-first remote reads
+- add cloud in parallel for larger files when hybrid mode is enabled
+- use explicit writer and reader node classes in tests so results are comparable
+
+Current operating guidance:
+
+- treat local NVMe as the hot path
+- use peer plus cloud to accelerate larger remote reads
+- do not rely on whichever pod pairing happens to be scheduled
+
+### Mode 4: Cost-Efficient Azure Baseline
+
+Use this when you want the smallest Azure topology that still worked well on the current build:
+
+- `1x Standard_D4as_v5` system node
+- `1x Standard_D8ads_v5` general user/reader node
+- `1x Standard_L64s_v3` writer node
+- `0x Standard_NC24ads_A100_v4` unless you are explicitly validating an A100-specific read scenario
+
+This is the current best minimum-footprint recommendation because:
+
+- `L64s_v3` materially improved write throughput
+- adding A100 did not improve the important `5GB` path enough to justify the cost on the current build
+
+### Mode 5: Benchmark And Tuning
+
+Use this when you want a result you can compare later, not just a one-off terminal number:
+
+```bash
+./scripts/ops/benchmark-fuse-scenario.sh <namespace> <size-mb> [writer-class-substr] [reader-class-substr]
+```
+
+This is the recommended benchmark path because it records:
+
+- file size
+- writer and reader node class
+- write and read throughput
+- peer, cloud, and NVMe contribution
+- cache state
+- CPU snapshots
+- network telemetry
+- git commit and image tags
+
+### Mode 6: Observability And Regression Hunting
+
+Use this when performance moves unexpectedly and you need to see where the time went:
+
+- enable the Prometheus endpoint
+- enable the Grafana dashboard ConfigMap
+- watch go-fuse write phase vs sync phase
+- watch peer/cloud/NVMe source contribution
+- watch range-cache bytes, prefetch reservation, heap, and goroutines
+
+This is the fastest way to distinguish:
+
+- local disk limits
+- FUSE write-path limits
+- peer-read bottlenecks
+- cloud-read bottlenecks
+- cache-budget regressions
+
 ## Components
 
 ### Master Coordinator
