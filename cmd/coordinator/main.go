@@ -19,14 +19,19 @@ import (
 	"fuse-client/internal/coordinator"
 	pb "fuse-client/internal/pb"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 )
 
 func main() {
 	var (
-		port     = flag.Int("port", 8080, "Port for the coordinator HTTP server")
-		grpcPort = flag.Int("grpc-port", 9080, "Port for the coordinator gRPC server")
-		help     = flag.Bool("help", false, "Show help")
+		port             = flag.Int("port", 8080, "Port for the coordinator HTTP server")
+		grpcPort         = flag.Int("grpc-port", 9080, "Port for the coordinator gRPC server")
+		etcdEndpoints    = flag.String("etcd-endpoints", "", "Comma-separated etcd endpoints (e.g. http://etcd-0:2379,http://etcd-1:2379). If empty, uses in-memory state.")
+		etcdPrefix       = flag.String("etcd-prefix", "/fuse", "etcd key prefix for coordinator state")
+		etcdLeaseTTL     = flag.Int("etcd-peer-lease-ttl", 30, "Peer liveness lease TTL in seconds (etcd-backed only)")
+		etcdDialTimeout  = flag.Duration("etcd-dial-timeout", 5*time.Second, "etcd dial timeout")
+		help             = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
 
@@ -42,9 +47,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create coordinator service
-	coordinatorService := coordinator.NewCoordinatorService()
+	// Build the coordinator service, optionally backed by etcd.
+	store, err := buildStore(ctx, *etcdEndpoints, *etcdPrefix, int64(*etcdLeaseTTL), *etcdDialTimeout, logger)
+	if err != nil {
+		logger.Fatalf("Failed to build coordinator store: %v", err)
+	}
+	coordinatorService := coordinator.NewCoordinatorServiceWithStore(store)
 	coordinatorService.Start(ctx)
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Printf("Store close: %v", err)
+		}
+	}()
 
 	// Start gRPC server
 	grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", *grpcPort))
@@ -108,6 +122,38 @@ func main() {
 type snapshotCloudStore interface {
 	Read(ctx context.Context, path string) ([]byte, error)
 	Write(ctx context.Context, path string, data []byte) error
+}
+
+// buildStore returns an etcd-backed store if endpoints are configured, otherwise
+// the legacy in-memory store. Endpoints may be comma-separated.
+func buildStore(ctx context.Context, endpoints, prefix string, leaseTTL int64, dialTimeout time.Duration, logger *log.Logger) (coordinator.Store, error) {
+	endpoints = strings.TrimSpace(endpoints)
+	if endpoints == "" {
+		logger.Printf("Coordinator store: in-memory (set -etcd-endpoints for HA)")
+		return coordinator.NewInMemoryStore(), nil
+	}
+	eps := make([]string, 0)
+	for _, ep := range strings.Split(endpoints, ",") {
+		if e := strings.TrimSpace(ep); e != "" {
+			eps = append(eps, e)
+		}
+	}
+	if len(eps) == 0 {
+		return nil, fmt.Errorf("etcd endpoints flag set but no valid endpoints parsed: %q", endpoints)
+	}
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   eps,
+		DialTimeout: dialTimeout,
+		Context:     ctx,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("etcd client: %w", err)
+	}
+	logger.Printf("Coordinator store: etcd endpoints=%v prefix=%s peer-lease-ttl=%ds", eps, prefix, leaseTTL)
+	return coordinator.NewEtcdStore(cli, coordinator.EtcdStoreConfig{
+		Prefix:          prefix,
+		PeerLeaseTTLSec: leaseTTL,
+	}), nil
 }
 
 func envInt(name string, fallback int) int {
@@ -371,7 +417,9 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		writeJSONResponse(w, result)
 	})
 
-	// Snapshot coordinator metadata state to disk.
+	// Snapshot: write a manifest of the file paths the coordinator currently
+	// tracks (path + size + chunking info) to local disk and/or cloud. This is
+	// a portable cache-restore plan, not a full state dump.
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -390,10 +438,27 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		}
 		path := req.Path
 		if path == "" {
-			path = "coordinator_state.json"
+			path = "coordinator_manifest.json"
 		}
-		if err := coordinatorService.SaveStateToPath(path); err != nil {
-			http.Error(w, "Failed to create snapshot", http.StatusInternalServerError)
+
+		manifest, err := coordinatorService.BuildManifest(r.Context())
+		if err != nil {
+			http.Error(w, "Failed to build manifest", http.StatusInternalServerError)
+			return
+		}
+		data, err := json.MarshalIndent(manifest, "", "  ")
+		if err != nil {
+			http.Error(w, "Failed to serialize manifest", http.StatusInternalServerError)
+			return
+		}
+
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, data, 0644); err != nil {
+			http.Error(w, "Failed to write manifest", http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			http.Error(w, "Failed to publish manifest", http.StatusInternalServerError)
 			return
 		}
 
@@ -401,26 +466,22 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		cloudPath := strings.TrimSpace(req.CloudPath)
 		if persistCloud {
 			if snapshotStore == nil {
-				http.Error(w, "Cloud snapshot store is not configured", http.StatusNotImplemented)
+				http.Error(w, "Cloud store is not configured", http.StatusNotImplemented)
 				return
 			}
 			if cloudPath == "" {
-				cloudPath = fmt.Sprintf("snapshots/coordinator/%d.json", time.Now().Unix())
-			}
-			data, err := coordinatorService.SnapshotState()
-			if err != nil {
-				http.Error(w, "Failed to serialize snapshot", http.StatusInternalServerError)
-				return
+				cloudPath = fmt.Sprintf("manifests/coordinator/%d.json", time.Now().Unix())
 			}
 			if err := snapshotStore.Write(r.Context(), cloudPath, data); err != nil {
-				http.Error(w, "Failed to persist snapshot to cloud", http.StatusInternalServerError)
+				http.Error(w, "Failed to persist manifest to cloud", http.StatusInternalServerError)
 				return
 			}
 		}
 
 		resp := map[string]interface{}{
-			"success": true,
-			"path":    path,
+			"success":     true,
+			"path":        path,
+			"total_files": len(manifest.Files),
 		}
 		if persistCloud {
 			resp["persisted_to_cloud"] = true
@@ -429,58 +490,73 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		writeJSONResponse(w, resp)
 	})
 
-	// Restore coordinator metadata state from disk.
+	// Restore: read a manifest from disk or cloud, then for each file fetch the
+	// bytes from cloud (durable tier) and seed them onto a percentage of active
+	// peers, matching SeedPathToPeers semantics. Chunked files are fetched and
+	// seeded chunk-by-chunk using the <path>_chunk_<i> key convention.
 	mux.HandleFunc("/api/restore", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
-			Path      string `json:"path"`
-			CloudPath string `json:"cloud_path,omitempty"`
+			Path           string `json:"path"`
+			CloudPath      string `json:"cloud_path,omitempty"`
+			SeedPercentage int    `json:"seed_percentage,omitempty"`
+			TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+			Concurrency    int    `json:"concurrency,omitempty"`
 		}
 		if err := parseJSONRequest(r, &req); err != nil {
 			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
 
+		var manifestBytes []byte
 		cloudPath := strings.TrimSpace(req.CloudPath)
-		if cloudPath != "" {
+		switch {
+		case cloudPath != "":
 			if snapshotStore == nil {
-				http.Error(w, "Cloud snapshot store is not configured", http.StatusNotImplemented)
+				http.Error(w, "Cloud store is not configured", http.StatusNotImplemented)
 				return
 			}
-			data, err := snapshotStore.Read(r.Context(), cloudPath)
+			b, err := snapshotStore.Read(r.Context(), cloudPath)
 			if err != nil {
-				http.Error(w, "Failed to read cloud snapshot", http.StatusInternalServerError)
+				http.Error(w, "Failed to read cloud manifest", http.StatusInternalServerError)
 				return
 			}
-			if err := coordinatorService.RestoreState(data); err != nil {
-				http.Error(w, "Failed to restore cloud snapshot", http.StatusInternalServerError)
+			manifestBytes = b
+		case strings.TrimSpace(req.Path) != "":
+			b, err := os.ReadFile(req.Path)
+			if err != nil {
+				http.Error(w, "Failed to read local manifest", http.StatusInternalServerError)
 				return
 			}
-			if strings.TrimSpace(req.Path) != "" {
-				_ = os.WriteFile(req.Path, data, 0644)
-			}
-			writeJSONResponse(w, map[string]interface{}{
-				"success":    true,
-				"cloud_path": cloudPath,
-				"path":       strings.TrimSpace(req.Path),
-			})
+			manifestBytes = b
+		default:
+			http.Error(w, "path or cloud_path is required", http.StatusBadRequest)
 			return
 		}
-		if req.Path == "" {
-			http.Error(w, "path is required", http.StatusBadRequest)
+
+		var manifest coordinator.FileManifest
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+			http.Error(w, "Invalid manifest JSON", http.StatusBadRequest)
 			return
 		}
-		if err := coordinatorService.LoadStateFromPath(req.Path); err != nil {
-			http.Error(w, "Failed to restore snapshot", http.StatusInternalServerError)
+
+		if snapshotStore == nil {
+			http.Error(w, "Cloud store is not configured (required to fetch file bytes)", http.StatusNotImplemented)
 			return
 		}
-		writeJSONResponse(w, map[string]interface{}{
-			"success": true,
-			"path":    req.Path,
+		result, err := coordinatorService.RestoreFromManifest(r.Context(), &manifest, snapshotStore, coordinator.RestoreOptions{
+			SeedPercentage: req.SeedPercentage,
+			TimeoutSeconds: req.TimeoutSeconds,
+			Concurrency:    req.Concurrency,
 		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Restore failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, result)
 	})
 
 	// Get statistics endpoint

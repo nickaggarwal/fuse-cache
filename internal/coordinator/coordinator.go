@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -62,12 +61,11 @@ type FileLocation struct {
 // Ensure CoordinatorService implements the Coordinator interface
 var _ Coordinator = (*CoordinatorService)(nil)
 
-// CoordinatorService manages peer registration and file metadata
+// CoordinatorService manages peer registration and file metadata. All state
+// lives in the underlying Store, which may be process-local or distributed.
 type CoordinatorService struct {
-	peers         map[string]*PeerInfo
-	fileLocations map[string][]*FileLocation
-	mu            sync.RWMutex
-	logger        *log.Logger
+	store  Store
+	logger *log.Logger
 }
 
 // WorldView captures global metadata state across peers and files.
@@ -111,41 +109,43 @@ type SeedCacheResult struct {
 	Failed         []string `json:"failed"`
 }
 
-// NewCoordinatorService creates a new coordinator service
+// NewCoordinatorService creates a coordinator backed by an in-memory store.
+// For HA deployments, use NewCoordinatorServiceWithStore with an EtcdStore.
 func NewCoordinatorService() *CoordinatorService {
+	return NewCoordinatorServiceWithStore(NewInMemoryStore())
+}
+
+// NewCoordinatorServiceWithStore creates a coordinator with the given store.
+func NewCoordinatorServiceWithStore(store Store) *CoordinatorService {
 	return &CoordinatorService{
-		peers:         make(map[string]*PeerInfo),
-		fileLocations: make(map[string][]*FileLocation),
-		logger:        log.New(log.Writer(), "[COORDINATOR] ", log.LstdFlags),
+		store:  store,
+		logger: log.New(log.Writer(), "[COORDINATOR] ", log.LstdFlags),
 	}
 }
 
 // RegisterPeer registers a new peer in the system
 func (cs *CoordinatorService) RegisterPeer(ctx context.Context, peer *PeerInfo) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
 	peer.LastHeartbeat = time.Now()
 	peer.Status = "active"
-
-	cs.peers[peer.ID] = peer
+	if err := cs.store.PutPeer(ctx, peer); err != nil {
+		return err
+	}
 	cs.logger.Printf("Registered peer: %s at %s", peer.ID, peer.Address)
-
 	return nil
 }
 
 // GetPeers returns all active peers
 func (cs *CoordinatorService) GetPeers(ctx context.Context, requesterID string) ([]*PeerInfo, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	peers := make([]*PeerInfo, 0, len(cs.peers))
-	for _, peer := range cs.peers {
+	all, err := cs.store.ListPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	peers := make([]*PeerInfo, 0, len(all))
+	for _, peer := range all {
 		if peer.ID != requesterID && peer.Status == "active" {
 			peers = append(peers, peer)
 		}
 	}
-
 	return peers, nil
 }
 
@@ -156,11 +156,11 @@ func (cs *CoordinatorService) UpdatePeerStatus(ctx context.Context, peerID strin
 
 // UpdatePeerStatusWithNetwork updates peer status and optional network telemetry.
 func (cs *CoordinatorService) UpdatePeerStatusWithNetwork(ctx context.Context, peerID string, status string, availableSpace, usedSpace int64, metrics *PeerNetworkMetrics) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	peer, exists := cs.peers[peerID]
-	if !exists {
+	peer, err := cs.store.GetPeer(ctx, peerID)
+	if err != nil {
+		return err
+	}
+	if peer == nil {
 		cs.logger.Printf("Peer not found: %s", peerID)
 		return nil
 	}
@@ -189,87 +189,53 @@ func (cs *CoordinatorService) UpdatePeerStatusWithNetwork(ctx context.Context, p
 		}
 	}
 
+	if err := cs.store.PutPeer(ctx, peer); err != nil {
+		return err
+	}
 	cs.logger.Printf("Updated peer status: %s -> %s", peerID, status)
 	return nil
 }
 
 // GetFileLocation returns the locations of a file
 func (cs *CoordinatorService) GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	locations := cs.fileLocations[filePath]
-	if locations == nil {
-		return []*FileLocation{}, nil
-	}
-
-	result := make([]*FileLocation, len(locations))
-	copy(result, locations)
-	return result, nil
+	return cs.store.GetFileLocations(ctx, filePath)
 }
 
 // ListFileLocations returns one metadata location per file path, filtered by prefix.
 func (cs *CoordinatorService) ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	result := make([]*FileLocation, 0, len(cs.fileLocations))
-	for path, locations := range cs.fileLocations {
-		if prefix != "" && !strings.HasPrefix(path, prefix) {
-			continue
-		}
-		if len(locations) == 0 {
-			continue
-		}
-		locCopy := *locations[0]
-		result = append(result, &locCopy)
-	}
-	return result, nil
+	return cs.store.ListFileLocations(ctx, prefix)
 }
 
 // UpdateFileLocation updates the location of a file
 func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *FileLocation) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	locations := cs.fileLocations[location.FilePath]
-	if locations == nil {
-		locations = make([]*FileLocation, 0)
+	if err := cs.store.PutFileLocation(ctx, location); err != nil {
+		return err
 	}
-
-	for i, loc := range locations {
-		if loc.PeerID == location.PeerID && loc.StorageTier == location.StorageTier {
-			locations[i] = location
-			cs.fileLocations[location.FilePath] = locations
-			return nil
-		}
-	}
-
-	locations = append(locations, location)
-	cs.fileLocations[location.FilePath] = locations
-
 	cs.logger.Printf("Updated file location: %s on peer %s", location.FilePath, location.PeerID)
 	return nil
 }
 
-// CleanupInactivePeers removes peers that haven't sent heartbeats
+// CleanupInactivePeers marks peers whose heartbeats are older than timeout as
+// inactive. With an etcd-backed store this is a no-op because lease expiry
+// removes stale peers automatically.
 func (cs *CoordinatorService) CleanupInactivePeers(timeout time.Duration) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	now := time.Now()
-	for peerID, peer := range cs.peers {
-		if now.Sub(peer.LastHeartbeat) > timeout {
-			peer.Status = "inactive"
-			cs.logger.Printf("Peer %s marked as inactive", peerID)
-		}
+	cutoff := time.Now().Add(-timeout)
+	if err := cs.store.MarkInactivePeersBefore(context.Background(), cutoff); err != nil {
+		cs.logger.Printf("CleanupInactivePeers: %v", err)
 	}
 }
 
 // GetPeerStats returns statistics about registered peers
 func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+	ctx := context.Background()
+	peers, err := cs.store.ListPeers(ctx)
+	if err != nil {
+		return map[string]interface{}{"error": err.Error()}
+	}
+	files, err := cs.store.ListFileLocations(ctx, "")
+	if err != nil {
+		return map[string]interface{}{"error": err.Error()}
+	}
 
 	activePeers := 0
 	totalSpace := int64(0)
@@ -278,7 +244,7 @@ func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
 	networkSpeedSum := 0.0
 	networkLatencySum := 0.0
 
-	for _, peer := range cs.peers {
+	for _, peer := range peers {
 		if peer.Status == "active" {
 			activePeers++
 			totalSpace += peer.AvailableSpace
@@ -302,11 +268,11 @@ func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
 
 	return map[string]interface{}{
 		"active_peers":           activePeers,
-		"total_peers":            len(cs.peers),
+		"total_peers":            len(peers),
 		"total_space":            totalSpace,
 		"used_space":             usedSpace,
 		"available_space":        totalSpace - usedSpace,
-		"file_count":             len(cs.fileLocations),
+		"file_count":             len(files),
 		"network_sampled_peers":  networkSampleCount,
 		"avg_network_speed_mbps": avgNetworkSpeed,
 		"avg_network_latency_ms": avgNetworkLatency,
@@ -315,37 +281,41 @@ func (cs *CoordinatorService) GetPeerStats() map[string]interface{} {
 
 // GetWorldView returns a global metadata view including peers, files, and chunk replica counts.
 func (cs *CoordinatorService) GetWorldView(ctx context.Context, prefix string) (*WorldView, error) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	peers := make([]*PeerInfo, 0, len(cs.peers))
-	activePeers := 0
-	peerIDs := make([]string, 0, len(cs.peers))
-	for id := range cs.peers {
-		peerIDs = append(peerIDs, id)
+	allPeers, err := cs.store.ListPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	peerByID := make(map[string]*PeerInfo, len(allPeers))
+	peerIDs := make([]string, 0, len(allPeers))
+	for _, p := range allPeers {
+		peerByID[p.ID] = p
+		peerIDs = append(peerIDs, p.ID)
 	}
 	sort.Strings(peerIDs)
+
+	peers := make([]*PeerInfo, 0, len(peerIDs))
+	activePeers := 0
 	for _, id := range peerIDs {
-		p := cs.peers[id]
-		pCopy := *p
-		peers = append(peers, &pCopy)
+		p := peerByID[id]
+		peers = append(peers, p)
 		if p.Status == "active" {
 			activePeers++
 		}
 	}
 
-	filePaths := make([]string, 0, len(cs.fileLocations))
-	for path := range cs.fileLocations {
-		if prefix != "" && !strings.HasPrefix(path, prefix) {
-			continue
-		}
+	fileMap, err := cs.store.RangeFileLocations(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	filePaths := make([]string, 0, len(fileMap))
+	for path := range fileMap {
 		filePaths = append(filePaths, path)
 	}
 	sort.Strings(filePaths)
 
 	files := make([]*WorldFileView, 0, len(filePaths))
 	for _, path := range filePaths {
-		locations := cs.fileLocations[path]
+		locations := fileMap[path]
 		if len(locations) == 0 {
 			continue
 		}
@@ -412,29 +382,25 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cs.mu.RLock()
-	activePeers := make(map[string]*PeerInfo, len(cs.peers))
-	activeIDs := make([]string, 0, len(cs.peers))
-	for id, peer := range cs.peers {
+	allPeers, err := cs.store.ListPeers(callCtx)
+	if err != nil {
+		return nil, fmt.Errorf("list peers: %w", err)
+	}
+	activePeers := make(map[string]*PeerInfo, len(allPeers))
+	activeIDs := make([]string, 0, len(allPeers))
+	for _, peer := range allPeers {
 		if peer == nil || peer.Status != "active" {
 			continue
 		}
-		pCopy := *peer
-		activePeers[id] = &pCopy
-		activeIDs = append(activeIDs, id)
+		activePeers[peer.ID] = peer
+		activeIDs = append(activeIDs, peer.ID)
 	}
 	sort.Strings(activeIDs)
 
-	locations := cs.fileLocations[filePath]
-	locCopies := make([]*FileLocation, 0, len(locations))
-	for _, loc := range locations {
-		if loc == nil {
-			continue
-		}
-		lc := *loc
-		locCopies = append(locCopies, &lc)
+	locCopies, err := cs.store.GetFileLocations(callCtx, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("get file locations: %w", err)
 	}
-	cs.mu.RUnlock()
 
 	if len(locCopies) == 0 {
 		return nil, fmt.Errorf("file not found in coordinator metadata: %s", filePath)
@@ -522,8 +488,16 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 	return result, nil
 }
 
-// Start starts the coordinator service with periodic cleanup and persistence
+// Start starts the coordinator service. For the in-memory store it loads any
+// existing JSON snapshot from disk and runs periodic cleanup + save loops. For
+// distributed stores (etcd) those are no-ops: etcd is the source of truth and
+// loading a stale local JSON would clobber live cluster state.
 func (cs *CoordinatorService) Start(ctx context.Context) {
+	if _, inMemory := cs.store.(*InMemoryStore); !inMemory {
+		cs.logger.Printf("Coordinator service started (distributed store; skipping disk persistence)")
+		return
+	}
+
 	if err := cs.LoadState(); err != nil {
 		cs.logger.Printf("Failed to load state: %v", err)
 	} else {
@@ -560,26 +534,6 @@ type State struct {
 	FileLocations map[string][]*FileLocation `json:"file_locations"`
 }
 
-func (cs *CoordinatorService) buildStateSnapshot() State {
-	state := State{
-		Peers:         make(map[string]*PeerInfo, len(cs.peers)),
-		FileLocations: make(map[string][]*FileLocation, len(cs.fileLocations)),
-	}
-	for k, v := range cs.peers {
-		peerCopy := *v
-		state.Peers[k] = &peerCopy
-	}
-	for k, v := range cs.fileLocations {
-		locsCopy := make([]*FileLocation, len(v))
-		for i, loc := range v {
-			locCopy := *loc
-			locsCopy[i] = &locCopy
-		}
-		state.FileLocations[k] = locsCopy
-	}
-	return state
-}
-
 // SaveState saves the coordinator state to disk atomically
 func (cs *CoordinatorService) SaveState() error {
 	return cs.SaveStateToPath(defaultStateFilePath)
@@ -587,9 +541,10 @@ func (cs *CoordinatorService) SaveState() error {
 
 // SnapshotState marshals coordinator state into JSON.
 func (cs *CoordinatorService) SnapshotState() ([]byte, error) {
-	cs.mu.RLock()
-	state := cs.buildStateSnapshot()
-	cs.mu.RUnlock()
+	state, err := cs.store.Snapshot(context.Background())
+	if err != nil {
+		return nil, err
+	}
 	return json.MarshalIndent(state, "", "  ")
 }
 
@@ -602,18 +557,7 @@ func (cs *CoordinatorService) RestoreState(data []byte) error {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return err
 	}
-	if state.Peers == nil {
-		state.Peers = make(map[string]*PeerInfo)
-	}
-	if state.FileLocations == nil {
-		state.FileLocations = make(map[string][]*FileLocation)
-	}
-
-	cs.mu.Lock()
-	cs.peers = state.Peers
-	cs.fileLocations = state.FileLocations
-	cs.mu.Unlock()
-	return nil
+	return cs.store.Restore(context.Background(), state)
 }
 
 // SaveStateToPath saves coordinator state to a specific file path atomically.

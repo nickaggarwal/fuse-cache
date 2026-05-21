@@ -201,15 +201,18 @@ func TestListFileLocations(t *testing.T) {
 }
 
 func TestCleanupInactivePeers(t *testing.T) {
-	cs := NewCoordinatorService()
+	store := NewInMemoryStore()
+	cs := NewCoordinatorServiceWithStore(store)
 	ctx := context.Background()
 
 	cs.RegisterPeer(ctx, &PeerInfo{ID: "old-peer", Address: "10.0.0.1:8081"})
 
-	// Manually set heartbeat to the past
-	cs.mu.Lock()
-	cs.peers["old-peer"].LastHeartbeat = time.Now().Add(-2 * time.Minute)
-	cs.mu.Unlock()
+	// Backdate the heartbeat directly via the store so cleanup has work to do.
+	peer, _ := store.GetPeer(ctx, "old-peer")
+	peer.LastHeartbeat = time.Now().Add(-2 * time.Minute)
+	if err := store.PutPeer(ctx, peer); err != nil {
+		t.Fatalf("PutPeer: %v", err)
+	}
 
 	cs.CleanupInactivePeers(60 * time.Second)
 

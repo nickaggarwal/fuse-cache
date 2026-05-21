@@ -1,15 +1,13 @@
-apiVersion: v1
-kind: PersistentVolumeClaim
+apiVersion: policy/v1
+kind: PodDisruptionBudget
 metadata:
-  name: coordinator-state
+  name: coordinator
   namespace: fuse-system
 spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: managed-csi
-  resources:
-    requests:
-      storage: 1Gi
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: coordinator
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -19,7 +17,12 @@ metadata:
   labels:
     app: coordinator
 spec:
-  replicas: 1
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: coordinator
@@ -28,20 +31,38 @@ spec:
       labels:
         app: coordinator
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: coordinator
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: coordinator
           image: stargzrepo.azurecr.io/fuse-client:latest
           command: ["coordinator"]
-          args: ["-port", "8080", "-grpc-port", "9080"]
+          args:
+            - "-port"
+            - "8080"
+            - "-grpc-port"
+            - "9080"
+            - "-etcd-endpoints"
+            - "$(ETCD_ENDPOINTS)"
+            - "-etcd-prefix"
+            - "/fuse"
+            - "-etcd-peer-lease-ttl"
+            - "30"
+          env:
+            - name: ETCD_ENDPOINTS
+              value: "http://etcd-0.etcd.fuse-system.svc.cluster.local:2379,http://etcd-1.etcd.fuse-system.svc.cluster.local:2379,http://etcd-2.etcd.fuse-system.svc.cluster.local:2379"
           ports:
             - containerPort: 8080
               name: http
             - containerPort: 9080
               name: grpc
-          volumeMounts:
-            - name: state
-              mountPath: /data
-          workingDir: /data
           livenessProbe:
             httpGet:
               path: /api/health
@@ -61,10 +82,6 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
-      volumes:
-        - name: state
-          persistentVolumeClaim:
-            claimName: coordinator-state
 ---
 apiVersion: v1
 kind: Service
@@ -82,6 +99,25 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: http
+    - port: 9080
+      targetPort: 9080
+      protocol: TCP
+      name: grpc
+---
+# Headless service for gRPC client-side load balancing (dns:///).
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-headless
+  namespace: fuse-system
+  labels:
+    app: coordinator
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: coordinator
+  ports:
     - port: 9080
       targetPort: 9080
       protocol: TCP

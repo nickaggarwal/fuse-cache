@@ -69,15 +69,23 @@ The end goal: any node can read any file at NVMe speed, with the guarantee that 
          │
          │ Register, heartbeat, file locations (HTTP)
          ▼
+┌────────────────────────────────────────────────────────────┐
+│  Coordinator (:8080, 3 replicas behind ClusterIP Service)  │
+│  - Stateless service; all state in etcd                    │
+│  - Peer registry with TTL leases (auto-expire on crash)    │
+│  - File location metadata, RMW via etcd CAS                │
+│  - Coordinator interface: server (CoordinatorService) +    │
+│    client (CoordinatorClient via HTTP) impls               │
+│  - Falls back to in-memory store when -etcd-endpoints      │
+│    is empty (single-node / local-dev mode)                 │
+└────────────────────────────────────────────────────────────┘
+         │
+         ▼
 ┌──────────────────────────────────────────┐
-│  Coordinator (:8080)                     │
-│  - In-memory peer registry               │
-│  - File location metadata                │
-│  - Periodic cleanup of stale peers (60s) │
-│  - State persisted to disk (JSON)        │
-│  - Coordinator interface: both server    │
-│    (CoordinatorService) and client       │
-│    (CoordinatorClient via HTTP) impls    │
+│  etcd cluster (StatefulSet, 3 replicas)  │
+│  - Source of truth for coordinator state │
+│  - /fuse/peers/<id>  (with TTL lease)    │
+│  - /fuse/files/<path> (JSON []FileLoc.)  │
 └──────────────────────────────────────────┘
 ```
 
@@ -169,7 +177,9 @@ NVMe has a configurable capacity (default 10GB). When a write would exceed capac
 | | `cloud_storage.go` | Tier 3 (S3): AWS SDK, configurable bucket/region |
 | | `azure_storage.go` | Tier 3 (Azure): Azure Blob SDK, configurable account/container |
 | | `gcp_storage.go` | Tier 3 (GCP): GCS via S3 interoperability endpoint, configurable bucket + HMAC keys |
-| `internal/coordinator/` | `coordinator.go` | Server-side: in-memory peer registry, file location map, state persistence |
+| `internal/coordinator/` | `coordinator.go` | `CoordinatorService` orchestration: peer ops, file metadata, world view, seed-to-peers. Delegates state to `Store`. |
+| | `store.go` | `Store` interface + `InMemoryStore` (single-process fallback) |
+| | `etcd_store.go` | `EtcdStore`: peer keys with TTL lease, file-location keys with CAS via etcd Txn |
 | | `client.go` | `Coordinator` interface + `CoordinatorClient` (HTTP). Used by client binary to talk to remote coordinator |
 | `internal/api/` | `handler.go` | Client HTTP API: file CRUD, peer ops, cache stats, health. Auth middleware, upload limits, path validation |
 | `internal/fuse/` | `filesystem.go` | FUSE filesystem: Dir/File nodes backed by CacheManager |
@@ -203,7 +213,8 @@ kubectl apply -f k8s/
 
 Manifests in `k8s/`:
 - `namespace.yaml` — `fuse-system`
-- `coordinator-deployment.yaml` — single replica, PVC for state, ClusterIP service
+- `etcd-statefulset.yaml` — 3-replica etcd cluster (headless service `etcd`, ClusterIP `etcd-client`), PodDisruptionBudget minAvailable=2
+- `coordinator-deployment.yaml` — 3-replica stateless Deployment, ClusterIP service `coordinator` + headless `coordinator-headless` for gRPC LB, PodDisruptionBudget minAvailable=2
 - `client-daemonset.yaml` — privileged, `/dev/fuse`, NVMe hostPath, bidirectional FUSE mount propagation
 - `configmap.yaml` — coordinator DNS, paths, chunk size
 - `secrets.yaml` — AWS credentials + Azure storage credentials
@@ -267,3 +278,4 @@ All non-health endpoints require `X-API-Key` header when `-api-key` is set.
 - `github.com/aws/aws-sdk-go` — S3 client
 - `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob` v1.0.0 — Azure Blob client
 - `github.com/gorilla/mux` — HTTP router
+- `go.etcd.io/etcd/client/v3` v3.5.13 — distributed coordinator state (optional; in-memory fallback when `-etcd-endpoints` is empty)
