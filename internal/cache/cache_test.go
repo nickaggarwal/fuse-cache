@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -371,6 +372,308 @@ func TestCacheManager_Evict(t *testing.T) {
 	// Should evict down to 90 bytes (90% of 100)
 	if cm.nvmeUsed > 90 {
 		t.Errorf("After eviction nvmeUsed = %d, want <= 90", cm.nvmeUsed)
+	}
+}
+
+func TestCacheManager_GetTouchesLastAccessed(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+	old := time.Now().Add(-1 * time.Hour)
+
+	entry := &CacheEntry{
+		FilePath:     "/touch.txt",
+		Size:         5,
+		LastAccessed: old,
+		Data:         []byte("hello"),
+	}
+	if err := cm.Put(ctx, entry); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	cm.mu.Lock()
+	cm.entries[entry.FilePath].LastAccessed = old
+	cm.mu.Unlock()
+
+	if _, err := cm.Get(ctx, entry.FilePath); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	cm.mu.RLock()
+	got := cm.entries[entry.FilePath].LastAccessed
+	cm.mu.RUnlock()
+	if !got.After(old) {
+		t.Fatalf("LastAccessed = %v, want after %v", got, old)
+	}
+}
+
+func TestCacheManager_ReadRangeTouchesParentAndChunk(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 4
+	ctx := context.Background()
+	old := time.Now().Add(-1 * time.Hour)
+
+	for i, payload := range [][]byte{[]byte("abcd"), []byte("efgh")} {
+		chunkPath := fmt.Sprintf("/range.bin_chunk_%d", i)
+		chunkEntry := &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(payload)),
+			LastAccessed: old,
+			Tier:         TierNVMe,
+			Data:         payload,
+		}
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
+			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
+		}
+		chunkMeta := *chunkEntry
+		chunkMeta.Data = nil
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &chunkMeta
+		cm.mu.Unlock()
+	}
+
+	cm.mu.Lock()
+	cm.entries["/range.bin"] = &CacheEntry{
+		FilePath:     "/range.bin",
+		StoragePath:  "/range.bin",
+		Size:         8,
+		LastAccessed: old,
+		Tier:         TierNVMe,
+		IsChunked:    true,
+		NumChunks:    2,
+	}
+	cm.mu.Unlock()
+
+	if _, err := cm.ReadRange(ctx, "/range.bin", 0, 4); err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+
+	cm.mu.RLock()
+	parentTouched := cm.entries["/range.bin"].LastAccessed
+	chunkTouched := cm.entries["/range.bin_chunk_0"].LastAccessed
+	cm.mu.RUnlock()
+	if !parentTouched.After(old) {
+		t.Fatalf("parent LastAccessed = %v, want after %v", parentTouched, old)
+	}
+	if !chunkTouched.After(old) {
+		t.Fatalf("chunk LastAccessed = %v, want after %v", chunkTouched, old)
+	}
+}
+
+func TestCacheManager_PutOverwriteUpdatesNVMeUsed(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	if err := cm.Put(ctx, &CacheEntry{
+		FilePath:     "/overwrite.txt",
+		LastAccessed: time.Now(),
+		Data:         []byte("0123456789"),
+	}); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	if err := cm.Put(ctx, &CacheEntry{
+		FilePath:     "/overwrite.txt",
+		LastAccessed: time.Now(),
+		Data:         []byte("new!"),
+	}); err != nil {
+		t.Fatalf("second Put: %v", err)
+	}
+
+	cm.mu.RLock()
+	used := cm.nvmeUsed
+	cm.mu.RUnlock()
+	if used != 4 {
+		t.Fatalf("nvmeUsed = %d, want 4", used)
+	}
+
+	got, err := cm.nvmeStorage.Read(ctx, "/overwrite.txt")
+	if err != nil {
+		t.Fatalf("Read overwrite.txt: %v", err)
+	}
+	if string(got) != "new!" {
+		t.Fatalf("stored data = %q, want %q", got, "new!")
+	}
+}
+
+func TestCacheManager_PromoteToNVMeReplacesExistingSize(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+
+	if err := cm.nvmeStorage.Write(ctx, "/promote.txt", []byte("0123456789")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	cm.mu.Lock()
+	cm.entries["/promote.txt"] = &CacheEntry{
+		FilePath:     "/promote.txt",
+		StoragePath:  "/promote.txt",
+		Size:         10,
+		LastAccessed: time.Now().Add(-1 * time.Hour),
+		Tier:         TierNVMe,
+	}
+	cm.nvmeUsed = 10
+	cm.mu.Unlock()
+
+	cm.promoteToNVMe(ctx, &CacheEntry{
+		FilePath:     "/promote.txt",
+		StoragePath:  "/promote.txt",
+		Size:         4,
+		LastAccessed: time.Now(),
+		Data:         []byte("new!"),
+	})
+
+	cm.mu.RLock()
+	used := cm.nvmeUsed
+	cm.mu.RUnlock()
+	if used != 4 {
+		t.Fatalf("nvmeUsed = %d, want 4", used)
+	}
+
+	got, err := cm.nvmeStorage.Read(ctx, "/promote.txt")
+	if err != nil {
+		t.Fatalf("Read promote.txt: %v", err)
+	}
+	if string(got) != "new!" {
+		t.Fatalf("stored data = %q, want %q", got, "new!")
+	}
+}
+
+func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
+	cm := newTestCacheManager()
+	dir := t.TempDir()
+	nvme, err := NewNVMeStorage(dir)
+	if err != nil {
+		t.Fatalf("NewNVMeStorage: %v", err)
+	}
+	cm.nvmeStorage = nvme
+	cm.config.NVMePath = dir
+	cm.config.ChunkSize = 4
+	ctx := context.Background()
+
+	for i, payload := range [][]byte{[]byte("abcd"), []byte("efgh")} {
+		chunkPath := fmt.Sprintf("/stage.bin_chunk_%d", i)
+		if err := cm.nvmeStorage.Write(ctx, chunkPath, payload); err != nil {
+			t.Fatalf("seed chunk %d: %v", i, err)
+		}
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(payload)),
+			LastAccessed: time.Now().Add(-1 * time.Hour),
+			Tier:         TierNVMe,
+		}
+		cm.mu.Unlock()
+	}
+	cm.mu.Lock()
+	cm.entries["/stage.bin"] = &CacheEntry{
+		FilePath:     "/stage.bin",
+		StoragePath:  "/stage.bin",
+		Size:         8,
+		LastAccessed: time.Now().Add(-1 * time.Hour),
+		Tier:         TierNVMe,
+		IsChunked:    true,
+		NumChunks:    2,
+	}
+	cm.nvmeUsed = 8
+	cm.mu.Unlock()
+
+	stagedPath := dir + "/stage.bin.new"
+	if err := os.WriteFile(stagedPath, []byte("newer!"), 0o644); err != nil {
+		t.Fatalf("WriteFile staged: %v", err)
+	}
+
+	if err := cm.PutFromFile(ctx, "/stage.bin", stagedPath, 6, time.Now()); err != nil {
+		t.Fatalf("PutFromFile: %v", err)
+	}
+
+	cm.mu.RLock()
+	used := cm.nvmeUsed
+	_, chunk0Exists := cm.entries["/stage.bin_chunk_0"]
+	_, chunk1Exists := cm.entries["/stage.bin_chunk_1"]
+	parent := cm.entries["/stage.bin"]
+	cm.mu.RUnlock()
+
+	if used != 6 {
+		t.Fatalf("nvmeUsed = %d, want 6", used)
+	}
+	if chunk0Exists || chunk1Exists {
+		t.Fatalf("stale chunk entries remain after PutFromFile: chunk0=%t chunk1=%t", chunk0Exists, chunk1Exists)
+	}
+	if parent == nil || parent.Size != 6 {
+		t.Fatalf("parent entry = %+v, want size 6", parent)
+	}
+	if cm.nvmeStorage.Exists(ctx, "/stage.bin_chunk_0") || cm.nvmeStorage.Exists(ctx, "/stage.bin_chunk_1") {
+		t.Fatal("stale chunk files remain after PutFromFile")
+	}
+}
+
+func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.MaxNVMeSize = 20
+	ctx := context.Background()
+	old := time.Now().Add(-1 * time.Hour)
+
+	for i, payload := range [][]byte{[]byte("abcd"), []byte("efgh")} {
+		chunkPath := fmt.Sprintf("/evict.bin_chunk_%d", i)
+		if err := cm.nvmeStorage.Write(ctx, chunkPath, payload); err != nil {
+			t.Fatalf("seed chunk %d: %v", i, err)
+		}
+		if err := cm.nvmeStorage.Write(ctx, chunkPath+".sha256", []byte("sum")); err != nil {
+			t.Fatalf("seed chunk checksum %d: %v", i, err)
+		}
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(payload)),
+			LastAccessed: old,
+			Tier:         TierNVMe,
+		}
+		cm.mu.Unlock()
+	}
+	cm.mu.Lock()
+	cm.entries["/evict.bin"] = &CacheEntry{
+		FilePath:     "/evict.bin",
+		StoragePath:  "/evict.bin",
+		Size:         8,
+		LastAccessed: old,
+		Tier:         TierNVMe,
+		IsChunked:    true,
+		NumChunks:    2,
+	}
+	cm.nvmeUsed = 8
+	cm.mu.Unlock()
+
+	if err := cm.Put(ctx, &CacheEntry{
+		FilePath:     "/keep.txt",
+		LastAccessed: time.Now(),
+		Data:         []byte("0123456789ab"),
+	}); err != nil {
+		t.Fatalf("Put keep.txt: %v", err)
+	}
+
+	if err := cm.Evict(ctx, TierNVMe); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	cm.mu.RLock()
+	_, parentExists := cm.entries["/evict.bin"]
+	_, chunk0Exists := cm.entries["/evict.bin_chunk_0"]
+	_, chunk1Exists := cm.entries["/evict.bin_chunk_1"]
+	used := cm.nvmeUsed
+	cm.mu.RUnlock()
+
+	if parentExists || chunk0Exists || chunk1Exists {
+		t.Fatalf("eviction left chunked entries: parent=%t chunk0=%t chunk1=%t", parentExists, chunk0Exists, chunk1Exists)
+	}
+	if used > 18 {
+		t.Fatalf("nvmeUsed = %d, want <= 18", used)
+	}
+	if cm.nvmeStorage.Exists(ctx, "/evict.bin_chunk_0") || cm.nvmeStorage.Exists(ctx, "/evict.bin_chunk_1") {
+		t.Fatal("eviction left chunk files in storage")
+	}
+	if cm.nvmeStorage.Exists(ctx, "/evict.bin_chunk_0.sha256") || cm.nvmeStorage.Exists(ctx, "/evict.bin_chunk_1.sha256") {
+		t.Fatal("eviction left checksum sidecars in storage")
 	}
 }
 
