@@ -36,7 +36,27 @@ func (ns *NVMeStorage) Write(ctx context.Context, path string, data []byte) erro
 		return err
 	}
 
-	return os.WriteFile(fullPath, data, 0644)
+	// Write to a temp file in the same directory, then rename atomically so a
+	// crash mid-write never leaves a partial file at the final path.
+	tmp, err := os.CreateTemp(dir, ".nvme-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, fullPath); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (ns *NVMeStorage) Delete(ctx context.Context, path string) error {

@@ -107,6 +107,8 @@ spec:
             - name: fuse-mount
               mountPath: /host/mnt
               mountPropagation: Bidirectional
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
           lifecycle:
             preStop:
               exec:
@@ -148,6 +150,10 @@ spec:
           hostPath:
             path: /mnt
             type: Directory
+        - name: agent-socket
+          hostPath:
+            path: /var/run/fuse-client
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

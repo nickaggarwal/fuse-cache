@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +22,19 @@ import (
 const (
 	defaultStateFilePath = "coordinator_state.json"
 )
+
+// coordinatorHTTPClient is used for peer-to-peer file transfers initiated by
+// the coordinator (seeding). A dedicated client avoids sharing timeouts or
+// transport settings with the global http.DefaultClient.
+var coordinatorHTTPClient = &http.Client{
+	Timeout: 5 * time.Minute, // large files may take time
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   4,
+	},
+}
 
 // PeerInfo represents a peer in the system
 type PeerInfo struct {
@@ -460,11 +474,6 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 	}
 	targetIDs := targetCandidates[:requestedSeeds]
 
-	data, err := fetchFileFromPeer(callCtx, sourcePeer.Address, filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch source file from %s: %w", sourceID, err)
-	}
-
 	result := &SeedCacheResult{
 		FilePath:       filePath,
 		SourcePeerID:   sourceID,
@@ -473,13 +482,15 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 		Successful:     make([]string, 0, len(targetIDs)),
 		Failed:         make([]string, 0),
 	}
+	// Stream the file directly from source to each target without buffering it
+	// in the coordinator process. Each target fetches its own copy from source.
 	for _, targetID := range targetIDs {
 		target := activePeers[targetID]
 		if target == nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s:peer-not-found", targetID))
 			continue
 		}
-		if err := putFileToPeer(callCtx, target.Address, filePath, data); err != nil {
+		if err := streamFileBetweenPeers(callCtx, sourcePeer.Address, target.Address, filePath); err != nil {
 			result.Failed = append(result.Failed, fmt.Sprintf("%s:%v", targetID, err))
 			continue
 		}
@@ -610,23 +621,46 @@ func peerFileURL(peerAddr, filePath string) string {
 	return fmt.Sprintf("http://%s/api/files/%s", peerAddr, joined)
 }
 
-func fetchFileFromPeer(ctx context.Context, peerAddr, filePath string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, peerFileURL(peerAddr, filePath), nil)
+// streamFileBetweenPeers streams a file directly from sourceAddr to targetAddr
+// without buffering the full payload in the coordinator. For multiple targets,
+// each target issues its own GET from the source.
+func streamFileBetweenPeers(ctx context.Context, sourceAddr, targetAddr, filePath string) error {
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, peerFileURL(sourceAddr, filePath), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	getResp, err := coordinatorHTTPClient.Do(getReq)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GET failed status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getResp.Body)
+		return fmt.Errorf("GET from source failed status=%d body=%s", getResp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return io.ReadAll(resp.Body)
+
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, peerFileURL(targetAddr, filePath), getResp.Body)
+	if err != nil {
+		return err
+	}
+	if getResp.ContentLength > 0 {
+		putReq.ContentLength = getResp.ContentLength
+	}
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+	putResp, err := coordinatorHTTPClient.Do(putReq)
+	if err != nil {
+		return err
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("PUT to target failed status=%d body=%s", putResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
+// putFileToPeer uploads data to a peer's file endpoint.
+// Used by the manifest restore path where data is already in memory (read from cloud).
 func putFileToPeer(ctx context.Context, peerAddr, filePath string, data []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, peerFileURL(peerAddr, filePath), bytes.NewReader(data))
 	if err != nil {
@@ -634,7 +668,7 @@ func putFileToPeer(ctx context.Context, peerAddr, filePath string, data []byte) 
 	}
 	req.ContentLength = int64(len(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := coordinatorHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

@@ -472,6 +472,34 @@ func fileHintKey(path string) string {
 	return path
 }
 
+// startGC launches a background goroutine that removes expired fileHints entries.
+// Call after creating PeerStorage. The goroutine exits when ctx is cancelled.
+func (ps *PeerStorage) startGC(ctx context.Context) {
+	gcInterval := ps.fileHintsTTL * 10
+	if gcInterval < 30*time.Second {
+		gcInterval = 30 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(gcInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				ps.metaMu.Lock()
+				for k, h := range ps.fileHints {
+					if now.After(h.expiresAt) {
+						delete(ps.fileHints, k)
+					}
+				}
+				ps.metaMu.Unlock()
+			}
+		}
+	}()
+}
+
 // Write writes a file to peer storage with replication.
 func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) error {
 	peers, err := ps.getPeers(ctx)

@@ -63,6 +63,23 @@ type CacheManager interface {
 	// WriteTo streams file data to w one chunk at a time, avoiding full
 	// in-memory buffering of large chunked files. Returns total bytes written.
 	WriteTo(ctx context.Context, filePath string, w io.Writer) (int64, error)
+	// Shutdown waits for all in-flight background goroutines to complete.
+	Shutdown()
+}
+
+// ExtendedCacheManager is a superset of CacheManager that exposes streaming
+// put/read, staged writes, metrics, and range-cache snapshot. All methods are
+// implemented by DefaultCacheManager; callers that need only the basic
+// interface should use CacheManager.
+type ExtendedCacheManager interface {
+	CacheManager
+	ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error)
+	PutFromReader(ctx context.Context, filePath string, r io.Reader, size int64, lastAccessed time.Time) error
+	CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error)
+	PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error
+	GetLocal(ctx context.Context, filePath string) (*CacheEntry, error)
+	GetMetrics() map[string]interface{}
+	RangeCacheSnapshot() RangeCacheSnapshot
 }
 
 // TierStorage represents storage interface for each tier
@@ -171,27 +188,34 @@ type CacheConfig struct {
 	// HybridStripeMinSize enables deterministic peer/cloud chunk striping for
 	// large files at or above this size.
 	HybridStripeMinSize int64
+
+	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
+	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
+	PinnedPrefixesFn func() []string
 }
 
 // DefaultCacheManager implements CacheManager
 type DefaultCacheManager struct {
-	config       *CacheConfig
-	nvmeStorage  TierStorage
-	peerStorage  TierStorage
-	cloudStorage TierStorage
-	entries      map[string]*CacheEntry
-	nvmeUsed     int64
-	mu           sync.RWMutex
-	rangeMu      sync.RWMutex
-	fetchMu      sync.Mutex
-	logger       *log.Logger
-	metrics      *CacheMetrics
-	metadataAt   time.Time
-	metadataView []*CacheEntry
-	rangeChunks  map[string]*chunkFileCache
-	hybridHints  map[string]hybridReadHint
-	chunkFetches map[string]*chunkFetchState
-	hedgeLimiter chan struct{}
+	config         *CacheConfig
+	nvmeStorage    TierStorage
+	peerStorage    TierStorage
+	cloudStorage   TierStorage
+	entries        map[string]*CacheEntry
+	nvmeUsed       int64
+	mu             sync.RWMutex
+	rangeMu        sync.RWMutex
+	fetchMu        sync.Mutex
+	logger         *log.Logger
+	metrics        *CacheMetrics
+	metadataAt     time.Time
+	metadataView   []*CacheEntry
+	rangeChunks    map[string]*chunkFileCache
+	hybridHints    map[string]hybridReadHint
+	chunkFetches   map[string]*chunkFetchState
+	hedgeLimiter   chan struct{}
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	bgWg           sync.WaitGroup
 }
 
 type chunkFileCache struct {
@@ -322,15 +346,18 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		config.HybridStripeMinSize = defaultHybridStripeMinSize
 	}
 
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	cm := &DefaultCacheManager{
-		config:       config,
-		entries:      make(map[string]*CacheEntry),
-		logger:       log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
-		metrics:      NewCacheMetrics(),
-		rangeChunks:  make(map[string]*chunkFileCache),
-		hybridHints:  make(map[string]hybridReadHint),
-		chunkFetches: make(map[string]*chunkFetchState),
-		hedgeLimiter: make(chan struct{}, config.HybridMaxSecondaryInflight),
+		config:         config,
+		entries:        make(map[string]*CacheEntry),
+		logger:         log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
+		metrics:        NewCacheMetrics(),
+		rangeChunks:    make(map[string]*chunkFileCache),
+		hybridHints:    make(map[string]hybridReadHint),
+		chunkFetches:   make(map[string]*chunkFetchState),
+		hedgeLimiter:   make(chan struct{}, config.HybridMaxSecondaryInflight),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
 
 	// Initialize storage tiers
@@ -341,7 +368,12 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 
 	if config.Coordinator != nil {
-		cm.peerStorage, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout)
+		var ps *PeerStorage
+		ps, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout)
+		if err == nil {
+			ps.startGC(shutdownCtx)
+			cm.peerStorage = ps
+		}
 	} else {
 		// Fallback: create a no-op peer storage if no coordinator is configured
 		cm.peerStorage = &noopStorage{}
@@ -387,7 +419,49 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		return nil, err
 	}
 
+	// Background GC for hybridHints — prevents unbounded growth.
+	gcInterval := config.MetadataRefreshTTL * 10
+	if gcInterval < 30*time.Second {
+		gcInterval = 30 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(gcInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				cm.mu.Lock()
+				for k, h := range cm.hybridHints {
+					if now.After(h.expiresAt) {
+						delete(cm.hybridHints, k)
+					}
+				}
+				cm.mu.Unlock()
+			}
+		}
+	}()
+
 	return cm, nil
+}
+
+// Shutdown waits for all in-flight background goroutines (cloud persist, NVMe
+// promotion, file-location publish) to finish. Call once after the server stops
+// accepting requests to avoid losing writes or publishing stale metadata.
+func (cm *DefaultCacheManager) Shutdown() {
+	cm.shutdownCancel()
+	cm.bgWg.Wait()
+}
+
+// goBackground tracks fn in bgWg so Shutdown can drain it.
+func (cm *DefaultCacheManager) goBackground(fn func()) {
+	cm.bgWg.Add(1)
+	go func() {
+		defer cm.bgWg.Done()
+		fn()
+	}()
 }
 
 // Get retrieves a file from the cache hierarchy
@@ -430,7 +504,8 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 
 	if fileSize, ok := cm.lookupFileSizeHint(filePath); ok && cm.shouldUseHybridRead(ctx, filePath, fileSize) {
 		if entry, err := cm.getFromHybridRemote(ctx, filePath); err == nil {
-			go cm.promoteToNVMe(context.Background(), entry)
+			e := entry
+			cm.goBackground(func() { cm.promoteToNVMe(context.Background(), e) })
 			return entry, nil
 		}
 	}
@@ -443,7 +518,8 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 			cm.touchEntries(filePath)
 			cm.metrics.RecordHit(tier)
 			cm.metrics.RecordTierRead(tier, int64(len(entry.Data)), time.Since(tierStart))
-			go cm.promoteToNVMe(context.Background(), entry)
+			e := entry
+			cm.goBackground(func() { cm.promoteToNVMe(context.Background(), e) })
 			return entry, nil
 		}
 		cm.metrics.RecordMiss(tier)
@@ -779,17 +855,20 @@ func (cm *DefaultCacheManager) getChunkedLocal(ctx context.Context, entry *Cache
 // For chunked files, each chunk is read and written individually (max ~ChunkSize in memory).
 // For regular files, the data is written directly.
 func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w io.Writer) (int64, error) {
-	// Check if this is a chunked file
+	// Copy IsChunked and NumChunks under the lock to avoid a data race when the
+	// entry is concurrently modified after we release RLock.
 	cm.mu.RLock()
-	entry, isChunked := cm.entries[filePath]
-	if isChunked {
+	var isChunked bool
+	var numChunks int64
+	if entry, ok := cm.entries[filePath]; ok && entry != nil {
 		isChunked = entry.IsChunked
+		numChunks = entry.NumChunks
 	}
 	cm.mu.RUnlock()
 
 	if isChunked {
 		var total int64
-		for i := int64(0); i < entry.NumChunks; i++ {
+		for i := int64(0); i < numChunks; i++ {
 			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
 			chunkEntry, err := cm.Get(ctx, chunkPath)
 			if err != nil {
@@ -858,8 +937,9 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		// Deep-copy data before launching goroutine to avoid race
 		dataCopy := make([]byte, len(entry.Data))
 		copy(dataCopy, entry.Data)
-		go cm.persistToCloud(entry.FilePath, dataCopy)
-		go cm.publishFileLocation(context.Background(), entry, TierNVMe)
+		filePath := entry.FilePath
+		cm.goBackground(func() { cm.persistToCloud(cm.shutdownCtx, filePath, dataCopy) })
+		cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 
 		return nil
 	}
@@ -915,7 +995,8 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 			cm.entries[entry.FilePath] = entry
 			cm.mu.Unlock()
 			cm.metrics.RecordWrite(int64(len(entry.Data)))
-			go cm.publishFileLocation(context.Background(), entry, res.tier)
+			tier := res.tier
+			cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, tier) })
 			return nil
 		}
 	}
@@ -1006,8 +1087,9 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	cm.mu.Lock()
 	cm.entries[filePath] = meta
 	cm.mu.Unlock()
-	go cm.publishFileLocation(context.Background(), meta, TierNVMe)
-	go cm.persistChunkedFileToCloud(filePath, numChunks)
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), meta, TierNVMe) })
+	fp, nc := filePath, numChunks
+	cm.goBackground(func() { cm.persistChunkedFileToCloud(cm.shutdownCtx, fp, nc) })
 	return nil
 }
 
@@ -1086,9 +1168,10 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	cm.mu.Unlock()
 	cm.metrics.RecordWrite(size)
 
-	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 	if isChunked {
-		go cm.persistWholeFileAsChunksToCloud(filePath, finalPath, numChunks)
+		fp, fp2, nc := filePath, finalPath, numChunks
+		cm.goBackground(func() { cm.persistWholeFileAsChunksToCloud(cm.shutdownCtx, fp, fp2, nc) })
 	}
 	return nil
 }
@@ -1398,12 +1481,21 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 		return nvmeEntries[i].entry.LastAccessed.Before(nvmeEntries[j].entry.LastAccessed)
 	})
 
+	// Collect pinned prefixes once before the eviction loop.
+	var pinnedPrefixes []string
+	if cm.config.PinnedPrefixesFn != nil {
+		pinnedPrefixes = cm.config.PinnedPrefixesFn()
+	}
+
 	for _, ref := range nvmeEntries {
 		cm.mu.RLock()
 		done := cm.nvmeUsed <= target
 		cm.mu.RUnlock()
 		if done {
 			break
+		}
+		if isPathPinned(ref.key, pinnedPrefixes) {
+			continue
 		}
 		freed, err := cm.deleteLocalNVMeFootprint(ctx, ref.key, true, true)
 		if err != nil {
@@ -1417,18 +1509,39 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 	return nil
 }
 
-// persistToCloud asynchronously writes data to cloud storage for durability with retry.
-// Data must be pre-copied by the caller to avoid races.
-func (cm *DefaultCacheManager) persistToCloud(filePath string, data []byte) {
+// isPathPinned reports whether path falls under any of the given prefixes.
+func isPathPinned(path string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if p == "" {
+			continue
+		}
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// persistToCloud writes data to cloud storage with retry. It is always called
+// inside a goBackground goroutine. ctx should be the shutdownCtx so that retry
+// sleeps are interruptible during shutdown.
+func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath string, data []byte) {
 	var lastErr error
 	for attempt := 0; attempt < cm.config.CloudRetryCount; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), cm.config.CloudTimeout)
-		err := cm.cloudStorage.Write(ctx, filePath, data)
+		select {
+		case <-ctx.Done():
+			cm.logger.Printf("Cloud persist cancelled for %s (shutdown)", filePath)
+			return
+		default:
+		}
+		callCtx, cancel := context.WithTimeout(ctx, cm.config.CloudTimeout)
+		err := cm.cloudStorage.Write(callCtx, filePath, data)
 		cancel()
 
 		if err == nil {
 			cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", filePath, len(data))
-			go cm.publishFileLocation(context.Background(), &CacheEntry{
+			// Already in a background goroutine; call synchronously to stay tracked.
+			cm.publishFileLocation(context.Background(), &CacheEntry{
 				FilePath:     filePath,
 				StoragePath:  filePath,
 				Size:         int64(len(data)),
@@ -1442,16 +1555,20 @@ func (cm *DefaultCacheManager) persistToCloud(filePath string, data []byte) {
 		wait := cm.config.CloudRetryBaseWait * (1 << uint(attempt))
 		cm.logger.Printf("Cloud persist attempt %d/%d failed for %s: %v (retrying in %v)",
 			attempt+1, cm.config.CloudRetryCount, filePath, err, wait)
-		time.Sleep(wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
 	}
 
 	cm.logger.Printf("CRITICAL: All %d cloud persist attempts failed for %s: %v",
 		cm.config.CloudRetryCount, filePath, lastErr)
 }
 
-// persistChunkedFileToCloud asynchronously persists chunk objects so hybrid
-// peer+cloud range reads can use both tiers for large files.
-func (cm *DefaultCacheManager) persistChunkedFileToCloud(filePath string, numChunks int64) {
+// persistChunkedFileToCloud persists chunk objects so hybrid peer+cloud range
+// reads can use both tiers for large files. ctx should be shutdownCtx.
+func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, filePath string, numChunks int64) {
 	if numChunks <= 0 || cm.cloudStorage == nil || cm.nvmeStorage == nil {
 		return
 	}
@@ -1471,19 +1588,30 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(filePath string, numChu
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, idx)
-				data, err := cm.nvmeStorage.Read(context.Background(), chunkPath)
+				data, err := cm.nvmeStorage.Read(ctx, chunkPath)
 				if err != nil {
 					cm.logger.Printf("Chunk cloud persist skipped for %s: %v", chunkPath, err)
 					continue
 				}
-				cm.persistToCloud(chunkPath, data)
+				cm.persistToCloud(ctx, chunkPath, data)
 			}
 		}()
 	}
 
 	for idx := int64(0); idx < numChunks; idx++ {
-		jobs <- idx
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		case jobs <- idx:
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -1692,7 +1820,7 @@ func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, 
 	}, nil
 }
 
-func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(filePath string, localPath string, numChunks int64) {
+func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(ctx context.Context, filePath string, localPath string, numChunks int64) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		cm.logger.Printf("Chunk cloud persist open failed for %s: %v", filePath, err)
@@ -1702,6 +1830,11 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(filePath string, 
 
 	buf := make([]byte, cm.config.ChunkSize)
 	for i := int64(0); i < numChunks; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		n, readErr := io.ReadFull(f, buf)
 		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
 			cm.logger.Printf("Chunk cloud persist read failed for %s chunk=%d: %v", filePath, i, readErr)
@@ -1713,7 +1846,7 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(filePath string, 
 		chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
 		chunkData := make([]byte, n)
 		copy(chunkData, buf[:n])
-		cm.persistToCloud(chunkPath, chunkData)
+		cm.persistToCloud(ctx, chunkPath, chunkData)
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			return
 		}
@@ -1837,8 +1970,9 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	cm.mu.Lock()
 	cm.entries[entry.FilePath] = entry
 	cm.mu.Unlock()
-	go cm.publishFileLocation(context.Background(), entry, TierNVMe)
-	go cm.persistChunkedFileToCloud(entry.FilePath, numChunks)
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
+	fp, nc := entry.FilePath, numChunks
+	cm.goBackground(func() { cm.persistChunkedFileToCloud(cm.shutdownCtx, fp, nc) })
 
 	return nil
 }

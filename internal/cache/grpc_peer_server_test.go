@@ -35,6 +35,7 @@ func startTestPeerGRPCServer(t *testing.T) (pb.PeerServiceClient, *DefaultCacheM
 		logger:       log.New(log.Writer(), "[GRPC-TEST] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
 	}
+	cm.shutdownCtx, cm.shutdownCancel = context.WithCancel(context.Background())
 
 	srv := grpc.NewServer()
 	pb.RegisterPeerServiceServer(srv, NewPeerGRPCServer(cm))

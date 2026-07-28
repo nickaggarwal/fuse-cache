@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "fuse-client/internal/pb";
+
+// AgentService runs inside the fuse-client DaemonSet on a Unix socket.
+// The CSI node plugin calls these RPCs to manage cache mount sessions.
+service AgentService {
+  // CreateSession prepares a cache-backed host path for a CSI volume.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // DeleteSession releases a cache mount session.
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+
+  // GetSession returns the current state of a session.
+  rpc GetSession(GetSessionRequest) returns (SessionInfo);
+
+  // ListSessions returns all active sessions.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+
+message CachePolicy {
+  string cache_mode = 1;     // readonly | writeback | writethrough
+  string warmup = 2;         // none | metadata | full
+  bool pinned = 3;
+  string source_policy = 4;  // peer-first | cloud-first | hybrid
+}
+
+message CreateSessionRequest {
+  string volume_id = 1;
+  string root_path = 2;
+  bool read_only = 3;
+  CachePolicy policy = 4;
+}
+
+message CreateSessionResponse {
+  string host_path = 1;
+  string volume_id = 2;
+}
+
+message DeleteSessionRequest {
+  string volume_id = 1;
+}
+
+message DeleteSessionResponse {}
+
+message GetSessionRequest {
+  string volume_id = 1;
+}
+
+message SessionInfo {
+  string volume_id = 1;
+  string root_path = 2;
+  string host_path = 3;
+  bool read_only = 4;
+  CachePolicy policy = 5;
+  int32 ref_count = 6;
+  int64 created_at_unix = 7;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}

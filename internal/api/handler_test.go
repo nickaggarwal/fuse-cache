@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -64,6 +65,33 @@ func (m *mockCacheManager) WriteTo(ctx context.Context, filePath string, w io.Wr
 	}
 	n, err := w.Write(e.Data)
 	return int64(n), err
+}
+
+func (m *mockCacheManager) Shutdown() {}
+
+// CreateWriteFile and PutFromFile implement the streamingWriter interface used
+// by handleFilePutStreaming. Small test payloads land in a real temp file.
+func (m *mockCacheManager) CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error) {
+	f, err := os.CreateTemp("", "mock-write-*")
+	if err != nil {
+		return nil, "", err
+	}
+	return f, f.Name(), nil
+}
+
+func (m *mockCacheManager) PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error {
+	data, err := os.ReadFile(stagedPath)
+	os.Remove(stagedPath)
+	if err != nil {
+		return err
+	}
+	return m.Put(ctx, &cache.CacheEntry{
+		FilePath:     filePath,
+		StoragePath:  filePath,
+		Size:         int64(len(data)),
+		LastAccessed: lastAccessed,
+		Data:         data,
+	})
 }
 
 type mockCloudCacheManager struct {

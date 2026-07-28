@@ -17,11 +17,13 @@ import (
 	"syscall"
 	"time"
 
+	"fuse-client/internal/agentserver"
 	"fuse-client/internal/api"
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
 	fusefs "fuse-client/internal/fuse"
 	pb "fuse-client/internal/pb"
+	"fuse-client/internal/session"
 
 	fusepkg "bazil.org/fuse"
 	"google.golang.org/grpc"
@@ -81,6 +83,10 @@ func main() {
 		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
+
+		// CSI agent server
+		agentSocket       = flag.String("agent-socket", "/var/run/fuse-client/agent.sock", "Unix socket path for CSI agent gRPC server")
+		enableAgentServer = flag.Bool("enable-agent-server", true, "Enable the agent gRPC server for CSI integration")
 
 		help = flag.Bool("help", false, "Show help")
 	)
@@ -380,6 +386,20 @@ func main() {
 		}
 	}
 
+	// Wire PinnedPrefixesFn before creating the cache manager so that the
+	// eviction loop can skip paths held by active CSI sessions. sessMgr is set
+	// below when the agent server is enabled; the closure captures it by value
+	// (pointer), so the field may be nil at eviction time if agent is disabled.
+	var sessMgr *session.Manager
+	if *enableAgentServer {
+		cacheConfig.PinnedPrefixesFn = func() []string {
+			if sessMgr == nil {
+				return nil
+			}
+			return sessMgr.PinnedPrefixes()
+		}
+	}
+
 	// Initialize cache manager
 	cacheManager, err := cache.NewCacheManager(cacheConfig)
 	if err != nil {
@@ -448,6 +468,18 @@ func main() {
 		}
 	}()
 
+	// Start CSI agent gRPC server if enabled
+	if *enableAgentServer {
+		sessMgr = session.NewManager(*mountPoint)
+		agentSrv := agentserver.New(sessMgr, *agentSocket)
+		go func() {
+			if err := agentSrv.Serve(ctx); err != nil {
+				logger.Printf("Agent server error: %v", err)
+			}
+		}()
+		logger.Printf("- Agent socket: %s", *agentSocket)
+	}
+
 	logger.Printf("Client started successfully")
 	logger.Printf("- Peer ID: %s", *peerID)
 	logger.Printf("- Mount point: %s", *mountPoint)
@@ -494,9 +526,11 @@ func main() {
 
 	logger.Println("Shutting down client...")
 
-	// Graceful shutdown
+	// Graceful shutdown: cancel context, stop accepting new requests, then drain
+	// in-flight background goroutines (cloud persist, NVMe promotion, metadata publish).
 	cancel()
 	grpcSrv.GracefulStop()
+	cacheManager.Shutdown()
 
 	if grpcCoordClient != nil {
 		grpcCoordClient.Close()

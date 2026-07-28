@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -30,6 +32,13 @@ const (
 	maxNetProbeBytes     = 32 * 1024 * 1024
 	netProbeChunkSize    = 64 * 1024
 )
+
+// streamingWriter is satisfied by DefaultCacheManager and allows staging large
+// uploads to disk before committing, avoiding full in-memory buffering.
+type streamingWriter interface {
+	CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error)
+	PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error
+}
 
 // Handler handles HTTP requests for the peer API
 type Handler struct {
@@ -137,13 +146,10 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	return router
 }
 
-// sanitizePath validates and cleans a file path to prevent path traversal
+// sanitizePath cleans a file path. filepath.Clean resolves any ".." components,
+// so the result is always a rooted absolute path with no traversal sequences.
 func sanitizePath(raw string) (string, error) {
-	cleaned := filepath.Clean("/" + raw)
-	if strings.Contains(cleaned, "..") {
-		return "", fmt.Errorf("invalid path: contains traversal")
-	}
-	return cleaned, nil
+	return filepath.Clean("/" + raw), nil
 }
 
 // handleFile handles file operations
@@ -203,9 +209,17 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx cont
 	// Limit upload size
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
+	// Use staging-file path when available to avoid buffering the full upload in
+	// memory. Put() is the fallback for mock implementations in tests.
+	if sw, ok := h.cacheManager.(streamingWriter); ok {
+		h.handleFilePutStreaming(w, r, ctx, filePath, sw)
+		return
+	}
+
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		if err.Error() == "http: request body too large" {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
 			http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -213,35 +227,64 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx cont
 		return
 	}
 
-	entry := &cache.CacheEntry{
+	if err := h.cacheManager.Put(ctx, &cache.CacheEntry{
 		FilePath:     filePath,
 		StoragePath:  filePath,
 		Size:         int64(len(data)),
 		LastAccessed: time.Now(),
 		Data:         data,
-	}
-
-	if err := h.cacheManager.Put(ctx, entry); err != nil {
+	}); err != nil {
 		h.logger.Printf("Failed to store file: %s", err)
 		http.Error(w, "Failed to store file", http.StatusInternalServerError)
 		return
 	}
 
-	// Update file location in coordinator if available
-	if h.coordinator != nil {
-		location := &coordinator.FileLocation{
-			FilePath:     filePath,
-			PeerID:       h.peerID,
-			StorageTier:  "nvme",
-			StoragePath:  filePath,
-			FileSize:     entry.Size,
-			LastAccessed: time.Now(),
+	// Put already calls publishFileLocation internally; no second coordinator
+	// call here to avoid a double-publish.
+	w.WriteHeader(http.StatusOK)
+	h.logger.Printf("Stored file: %s (%d bytes)", filePath, len(data))
+}
+
+// handleFilePutStreaming is the zero-copy upload path. Data is written to a
+// temp file on the NVMe volume, then atomically renamed into place by
+// PutFromFile — the full payload is never buffered in heap.
+func (h *Handler) handleFilePutStreaming(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string, sw streamingWriter) {
+	f, tmpPath, err := sw.CreateWriteFile(ctx, filePath)
+	if err != nil {
+		h.logger.Printf("Failed to create staging file for %s: %v", filePath, err)
+		http.Error(w, "Failed to create staging file", http.StatusInternalServerError)
+		return
+	}
+
+	size, copyErr := io.Copy(f, r.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		os.Remove(tmpPath)
+		var maxErr *http.MaxBytesError
+		if errors.As(copyErr, &maxErr) {
+			http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
+			return
 		}
-		h.coordinator.UpdateFileLocation(ctx, location)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if closeErr != nil {
+		os.Remove(tmpPath)
+		http.Error(w, "Failed to flush staging file", http.StatusInternalServerError)
+		return
+	}
+
+	// PutFromFile renames tmpPath → final location atomically; os.Remove is a
+	// no-op if the rename already moved it.
+	defer os.Remove(tmpPath)
+	if err := sw.PutFromFile(ctx, filePath, tmpPath, size, time.Now()); err != nil {
+		h.logger.Printf("Failed to commit staged file %s: %v", filePath, err)
+		http.Error(w, "Failed to store file", http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	h.logger.Printf("Stored file: %s (%d bytes)", filePath, len(data))
+	h.logger.Printf("Stored file: %s (%d bytes)", filePath, size)
 }
 
 // handleFileDelete handles DELETE requests for files

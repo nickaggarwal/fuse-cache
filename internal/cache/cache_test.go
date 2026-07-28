@@ -99,7 +99,8 @@ func newTestCacheManager() *DefaultCacheManager {
 	nvme := newMockStorage()
 	peer := newMockStorage()
 	cloud := newMockStorage()
-	return &DefaultCacheManager{
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	cm := &DefaultCacheManager{
 		config: &CacheConfig{
 			NVMePath:                   "/tmp/test",
 			MaxNVMeSize:                1024 * 1024, // 1MB
@@ -111,16 +112,19 @@ func newTestCacheManager() *DefaultCacheManager {
 			HybridCloudHedgeDelay:      20 * time.Millisecond,
 			HybridMaxSecondaryInflight: 16,
 		},
-		nvmeStorage:  nvme,
-		peerStorage:  peer,
-		cloudStorage: cloud,
-		entries:      make(map[string]*CacheEntry),
-		logger:       log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
-		metrics:      NewCacheMetrics(),
-		rangeChunks:  make(map[string]*chunkFileCache),
-		hybridHints:  make(map[string]hybridReadHint),
-		hedgeLimiter: make(chan struct{}, 16),
+		nvmeStorage:    nvme,
+		peerStorage:    peer,
+		cloudStorage:   cloud,
+		entries:        make(map[string]*CacheEntry),
+		logger:         log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
+		metrics:        NewCacheMetrics(),
+		rangeChunks:    make(map[string]*chunkFileCache),
+		hybridHints:    make(map[string]hybridReadHint),
+		hedgeLimiter:   make(chan struct{}, 16),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
+	return cm
 }
 
 func TestCacheManager_PutAndGet(t *testing.T) {
@@ -1350,6 +1354,7 @@ func newLargeFileCacheManager(maxNVMe int64) *DefaultCacheManager {
 	nvme := newMockStorage()
 	peer := newMockStorage()
 	cloud := newMockStorage()
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &DefaultCacheManager{
 		config: &CacheConfig{
 			NVMePath:           "/tmp/test-large",
@@ -1366,8 +1371,10 @@ func newLargeFileCacheManager(maxNVMe int64) *DefaultCacheManager {
 		entries:      make(map[string]*CacheEntry),
 		logger:       log.New(log.Writer(), "[CACHE-LARGE] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
-		rangeChunks:  make(map[string]*chunkFileCache),
-		hybridHints:  make(map[string]hybridReadHint),
+		rangeChunks:    make(map[string]*chunkFileCache),
+		hybridHints:    make(map[string]hybridReadHint),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
 }
 
