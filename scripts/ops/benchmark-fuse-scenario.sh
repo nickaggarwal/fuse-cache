@@ -188,6 +188,11 @@ PREFETCH_BYTES_AFTER="$(metric_value "$READER_METRICS_AFTER" fuse_range_prefetch
 HEAP_INUSE_AFTER="$(metric_value "$READER_METRICS_AFTER" fuse_runtime_heap_inuse_bytes)"
 GOROUTINES_AFTER="$(metric_value "$READER_METRICS_AFTER" fuse_runtime_goroutines)"
 
+PREFETCH_ISSUED="$(metric_delta "$READER_METRICS_BEFORE" "$READER_METRICS_AFTER" fuse_range_prefetch_issued_total)"
+PREFETCH_HITS="$(metric_delta "$READER_METRICS_BEFORE" "$READER_METRICS_AFTER" fuse_range_prefetch_hits_total)"
+PREFETCH_WASTED="$(metric_delta "$READER_METRICS_BEFORE" "$READER_METRICS_AFTER" fuse_range_prefetch_wasted_total)"
+PREFETCH_HIT_PCT="$(safe_pct "$PREFETCH_HITS" "$PREFETCH_ISSUED")"
+
 WRITER_NODE_TOP="$(best_effort_top node "$WRITER_NODE" | tr -s ' ' | tr ' ' ';')"
 READER_NODE_TOP="$(best_effort_top node "$READER_NODE" | tr -s ' ' | tr ' ' ';')"
 WRITER_POD_TOP="$(best_effort_top pod -n "$NAMESPACE" "$WRITER_POD" | tr -s ' ' | tr ' ' ';')"
@@ -201,7 +206,7 @@ READER_NET_LATENCY_MS="$(printf '%s' "$PEERS_JSON" | jq -r --arg id "$READER_POD
 
 if [[ ! -f "$OUTPUT_CSV" ]]; then
   cat > "$OUTPUT_CSV" <<'CSV'
-run_ts,commit,namespace,size_mb,writer_pod,writer_node,writer_class,writer_image,reader_pod,reader_node,reader_class,reader_image,write_mbps,read_mbps,write_ms,read_ms,nvme_wall_bytes,peer_wall_bytes,cloud_wall_bytes,total_wall_bytes,nvme_share_pct,peer_share_pct,cloud_share_pct,peer_object_mbps,cloud_object_mbps,write_phase_sec,sync_sec,flush_sec,stage_write_calls,buffer_flush_calls,range_cache_bytes_before,range_cache_bytes_after,prefetch_bytes_after,heap_inuse_after,goroutines_after,writer_network_mbps,writer_network_latency_ms,reader_network_mbps,reader_network_latency_ms,writer_node_top,reader_node_top,writer_pod_top,reader_pod_top
+run_ts,commit,namespace,size_mb,writer_pod,writer_node,writer_class,writer_image,reader_pod,reader_node,reader_class,reader_image,write_mbps,read_mbps,write_ms,read_ms,nvme_wall_bytes,peer_wall_bytes,cloud_wall_bytes,total_wall_bytes,nvme_share_pct,peer_share_pct,cloud_share_pct,peer_object_mbps,cloud_object_mbps,write_phase_sec,sync_sec,flush_sec,stage_write_calls,buffer_flush_calls,range_cache_bytes_before,range_cache_bytes_after,prefetch_bytes_after,prefetch_issued,prefetch_hits,prefetch_wasted,prefetch_hit_pct,heap_inuse_after,goroutines_after,writer_network_mbps,writer_network_latency_ms,reader_network_mbps,reader_network_latency_ms,writer_node_top,reader_node_top,writer_pod_top,reader_pod_top
 CSV
 fi
 
@@ -214,7 +219,9 @@ row=(
   "$NVME_SHARE_PCT" "$PEER_SHARE_PCT" "$CLOUD_SHARE_PCT"
   "$PEER_OBJECT_MBPS" "$CLOUD_OBJECT_MBPS"
   "$WRITE_PHASE_SEC" "$SYNC_SEC" "$FLUSH_SEC" "$STAGE_WRITE_CALLS" "$BUFFER_FLUSH_CALLS"
-  "${RANGE_CACHE_BYTES_BEFORE:-0}" "${RANGE_CACHE_BYTES_AFTER:-0}" "${PREFETCH_BYTES_AFTER:-0}" "${HEAP_INUSE_AFTER:-0}" "${GOROUTINES_AFTER:-0}"
+  "${RANGE_CACHE_BYTES_BEFORE:-0}" "${RANGE_CACHE_BYTES_AFTER:-0}" "${PREFETCH_BYTES_AFTER:-0}"
+  "${PREFETCH_ISSUED:-0}" "${PREFETCH_HITS:-0}" "${PREFETCH_WASTED:-0}" "${PREFETCH_HIT_PCT:-0}"
+  "${HEAP_INUSE_AFTER:-0}" "${GOROUTINES_AFTER:-0}"
   "$WRITER_NET_MBPS" "$WRITER_NET_LATENCY_MS" "$READER_NET_MBPS" "$READER_NET_LATENCY_MS"
   "$WRITER_NODE_TOP" "$READER_NODE_TOP" "$WRITER_POD_TOP" "$READER_POD_TOP"
 )
@@ -235,3 +242,4 @@ echo "Write MB/s: ${WRITE_MBPS:-0}"
 echo "Read MB/s: ${READ_MBPS:-0}"
 echo "Source share: nvme=${NVME_SHARE_PCT}% peer=${PEER_SHARE_PCT}% cloud=${CLOUD_SHARE_PCT}%"
 echo "Object speeds: peer=${PEER_OBJECT_MBPS} MiB/s cloud=${CLOUD_OBJECT_MBPS} MiB/s"
+echo "Readahead: issued=${PREFETCH_ISSUED} hits=${PREFETCH_HITS} wasted=${PREFETCH_WASTED} hit_rate=${PREFETCH_HIT_PCT}%"
