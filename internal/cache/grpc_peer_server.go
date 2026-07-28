@@ -36,6 +36,14 @@ type localPathResolver interface {
 	LocalFilePath(ctx context.Context, filePath string) (string, bool)
 }
 
+// localChunkResolver resolves a "<parent>_chunk_N" request to a byte range in a
+// whole parent file held on this node (the FUSE-write storage model), so the
+// chunk can be streamed directly from disk with a pooled buffer instead of
+// synthesizing the whole chunk into a fresh heap allocation per request.
+type localChunkResolver interface {
+	LocalChunkFile(ctx context.Context, chunkPath string) (localPath string, offset, length int64, ok bool)
+}
+
 // NewPeerGRPCServer creates a new peer gRPC server.
 func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 	return &PeerGRPCServer{cacheManager: cm}
@@ -49,6 +57,19 @@ func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService
 				return nil
 			}
 			// Fall through to cache-entry path for robustness on transient local I/O errors.
+		}
+	}
+
+	// Chunk request served from a whole parent file: stream the byte range
+	// directly with a pooled buffer, avoiding a per-chunk full-size heap
+	// allocation (the dominant allocation on the peer serve path under high
+	// parallelism).
+	if resolver, ok := s.cacheManager.(localChunkResolver); ok {
+		if localPath, offset, length, ok := resolver.LocalChunkFile(stream.Context(), req.Path); ok {
+			if err := streamLocalFileRange(localPath, offset, length, stream); err == nil {
+				return nil
+			}
+			// Fall through to cache-entry path on transient local I/O errors.
 		}
 	}
 
@@ -95,6 +116,49 @@ func streamLocalFile(localPath string, stream pb.PeerService_ReadFileServer) err
 			return readErr
 		}
 	}
+}
+
+// streamLocalFileRange streams [offset, offset+length) of localPath using a
+// pooled buffer, so serving one chunk out of a whole parent file allocates no
+// per-request payload buffer. gRPC marshals each Send synchronously, so the
+// pooled buffer is safe to reuse across iterations.
+func streamLocalFileRange(localPath string, offset, length int64, stream pb.PeerService_ReadFileServer) error {
+	if length <= 0 {
+		return nil
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	bufPtr := grpcReadBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer grpcReadBufPool.Put(bufPtr)
+
+	pos := offset
+	remaining := length
+	for remaining > 0 {
+		n := int64(len(buf))
+		if n > remaining {
+			n = remaining
+		}
+		read, readErr := f.ReadAt(buf[:n], pos)
+		if read > 0 {
+			if err := stream.Send(&pb.FileChunk{Data: buf[:read]}); err != nil {
+				return err
+			}
+			pos += int64(read)
+			remaining -= int64(read)
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	return nil
 }
 
 // WriteFile receives metadata + data chunks via client streaming.

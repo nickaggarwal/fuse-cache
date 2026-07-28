@@ -612,6 +612,57 @@ func (cm *DefaultCacheManager) LocalFilePath(ctx context.Context, filePath strin
 	return fullPath, true
 }
 
+// LocalChunkFile resolves "<parent>_chunk_N" to a byte range within a whole
+// parent file held on this node, so a peer can stream that range directly
+// instead of synthesizing the chunk into a fresh buffer. It returns ok=false
+// when the parent is not a whole chunked file present on local NVMe, or when a
+// literal chunk file exists (that case is served by LocalFilePath/streamLocalFile).
+func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath string) (string, int64, int64, bool) {
+	_ = ctx
+	parent, ok := parentFilePathFromChunkPath(chunkPath)
+	if !ok {
+		return "", 0, 0, false
+	}
+	idxStr := chunkPath[strings.LastIndex(chunkPath, "_chunk_")+len("_chunk_"):]
+	chunkIndex, err := strconv.ParseInt(idxStr, 10, 64)
+	if err != nil || chunkIndex < 0 {
+		return "", 0, 0, false
+	}
+	chunkSize := cm.config.ChunkSize
+	if chunkSize <= 0 {
+		return "", 0, 0, false
+	}
+
+	cm.mu.RLock()
+	entry, hasParent := cm.entries[parent]
+	var size int64
+	var chunked bool
+	if hasParent && entry != nil {
+		size = entry.Size
+		chunked = entry.IsChunked
+	}
+	cm.mu.RUnlock()
+	if !hasParent || !chunked || size <= 0 {
+		return "", 0, 0, false
+	}
+
+	offset := chunkIndex * chunkSize
+	if offset >= size {
+		return "", 0, 0, false
+	}
+	length := chunkSize
+	if remaining := size - offset; remaining < length {
+		length = remaining
+	}
+
+	parentLocal := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(parent, "/"))
+	info, err := os.Stat(parentLocal)
+	if err != nil || info.IsDir() {
+		return "", 0, 0, false
+	}
+	return parentLocal, offset, length, true
+}
+
 func (cm *DefaultCacheManager) remoteReadOrder(filePath string) []CacheTier {
 	_ = filePath
 	if cm.config.AdaptiveRemoteRead && cm.tierPerf != nil {
