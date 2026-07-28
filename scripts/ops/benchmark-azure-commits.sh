@@ -12,6 +12,7 @@ IMAGE_REPO="${IMAGE_REPO:-stargzrepo.azurecr.io/fuse-client}"
 CONTEXT="${CONTEXT:-aks-stargz-test-admin}"
 RANGE_READS="${RANGE_READS:-32}"
 PREFETCH_CHUNKS="${PREFETCH_CHUNKS:-8}"
+PREFETCH_MAX_CHUNKS="${PREFETCH_MAX_CHUNKS:-32}"
 RANGE_CACHE="${RANGE_CACHE:-384}"
 PEER_MBPS="${PEER_MBPS:-10000}"
 AZ_DL_CONCURRENCY="${AZ_DL_CONCURRENCY:-32}"
@@ -41,6 +42,7 @@ Options:
   --out-log <path>                Log output path
   --range-reads <n>               FUSE_PARALLEL_RANGE_READS override
   --prefetch <n>                  FUSE_RANGE_PREFETCH_CHUNKS override
+  --prefetch-max <n>              FUSE_RANGE_PREFETCH_MAX_CHUNKS override (adaptive readahead cap)
   --peer-mbps <n>                 FUSE_PEER_READ_MBPS override
   --size-mb <n>                   Benchmark file size in MiB (default: ${SIZE_MB})
   --settle-sec <n>                Post-write settle wait before read (default: ${HYBRID_SETTLE_SEC})
@@ -72,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prefetch)
       PREFETCH_CHUNKS="${2:?missing value}"
+      shift 2
+      ;;
+    --prefetch-max)
+      PREFETCH_MAX_CHUNKS="${2:?missing value}"
       shift 2
       ;;
     --peer-mbps)
@@ -215,6 +221,7 @@ EOF
     --set "config.nvmeMaxGB=${NVME_MAX_GB}" \
     --set "config.parallelRangeReads=${RANGE_READS}" \
     --set "config.rangePrefetchChunks=${PREFETCH_CHUNKS}" \
+    --set "config.rangePrefetchMaxChunks=${PREFETCH_MAX_CHUNKS}" \
     --set "config.rangeChunkCacheSize=${RANGE_CACHE}" \
     --set "config.peerReadMBps=${PEER_MBPS}" \
     --set "config.azureDownloadConcurrency=${AZ_DL_CONCURRENCY}" \

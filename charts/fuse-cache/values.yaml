@@ -53,6 +53,7 @@ config:
   chunkSizeMB: "16"
   parallelRangeReads: "32"
   rangePrefetchChunks: "8"
+  rangePrefetchMaxChunks: "32"
   rangeChunkCacheSize: "128"
   rangeChunkCacheMaxBytesMB: "512"
   rangePrefetchMaxBytesMB: "128"

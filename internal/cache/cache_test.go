@@ -1638,3 +1638,173 @@ func TestLargeFile_1GB(t *testing.T) {
 	t.Logf("1GB test passed: %d chunks, put=%v get=%v, checksum OK",
 		expectedChunks, putDuration, getDuration)
 }
+
+func TestObserveReadPattern_SequentialGrowsWindow(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 2
+	cm.config.RangePrefetchMaxChunks = 8
+
+	path := "/seq.bin"
+	// First read has no history: base window, not sequential.
+	window, sequential := cm.observeReadPattern(path, 0, 4, 0, 4)
+	if window != 2 || sequential {
+		t.Fatalf("first read window=%d sequential=%t, want 2 false", window, sequential)
+	}
+	// Consecutive sequential reads double the window up to the max.
+	wantWindows := []int{4, 8, 8, 8}
+	for i, want := range wantWindows {
+		offset := int64(4 * (i + 1))
+		window, sequential = cm.observeReadPattern(path, offset, offset+4, offset/4, 4)
+		if !sequential {
+			t.Fatalf("read %d not detected as sequential", i+2)
+		}
+		if window != want {
+			t.Fatalf("read %d window=%d, want %d", i+2, window, want)
+		}
+	}
+}
+
+func TestObserveReadPattern_RandomResetsWindow(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 2
+	cm.config.RangePrefetchMaxChunks = 8
+
+	path := "/rand.bin"
+	cm.observeReadPattern(path, 0, 4, 0, 4)
+	cm.observeReadPattern(path, 4, 8, 1, 4)
+	window, sequential := cm.observeReadPattern(path, 8, 12, 2, 4)
+	if window != 8 || !sequential {
+		t.Fatalf("sequential ramp window=%d sequential=%t, want 8 true", window, sequential)
+	}
+	// A far seek resets the streak back to the base window.
+	window, sequential = cm.observeReadPattern(path, 100, 104, 25, 4)
+	if window != 2 || sequential {
+		t.Fatalf("random read window=%d sequential=%t, want 2 false", window, sequential)
+	}
+}
+
+func TestObserveReadPattern_RearmsPrefetchOnSecondPass(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 2
+	cm.config.RangePrefetchMaxChunks = 8
+	cm.config.RangePrefetchMaxBytes = 1024
+
+	path := "/pass.bin"
+	// Simulate a completed first pass: prefetch high-water mark far into the file.
+	cm.rangeMu.Lock()
+	fileCache := cm.fileCacheLocked(path)
+	fileCache.lastPrefetchTrigger = 50
+	cm.rangeMu.Unlock()
+
+	// A restarted stream at the beginning of the file re-arms the trigger once
+	// it is recognized as sequential.
+	cm.observeReadPattern(path, 0, 4, 0, 4)
+	_, sequential := cm.observeReadPattern(path, 4, 8, 1, 4)
+	if !sequential {
+		t.Fatal("second-pass read not detected as sequential")
+	}
+	reserved, _, _ := cm.reservePrefetchChunks(path, 1, 10, 4, 2)
+	if len(reserved) != 2 || reserved[0] != 2 || reserved[1] != 3 {
+		t.Fatalf("reserved = %v, want [2 3]", reserved)
+	}
+}
+
+func TestPrefetchMetrics_HitAndWasteAccounting(t *testing.T) {
+	cm := newTestCacheManager()
+	cm.config.RangeChunkCacheSize = 16
+	cm.config.RangeChunkCacheMaxBytes = 1 << 20
+
+	path := "/metrics.bin"
+	cm.setChunkInRangeCache(path, 0, []byte("data"), TierNVMe)
+	cm.markChunkPrefetched(path, 0)
+
+	// First foreground consumption counts one hit; repeats do not double count.
+	if _, _, ok := cm.getChunkFromRangeCache(path, 0); !ok {
+		t.Fatal("chunk 0 missing from range cache")
+	}
+	cm.getChunkFromRangeCache(path, 0)
+	if got := cm.metrics.PrefetchHits.Load(); got != 1 {
+		t.Fatalf("PrefetchHits = %d, want 1", got)
+	}
+
+	// An unconsumed prefetched chunk counts as waste when invalidated.
+	cm.setChunkInRangeCache(path, 1, []byte("data"), TierNVMe)
+	cm.markChunkPrefetched(path, 1)
+	cm.invalidateRangeCache(path)
+	if got := cm.metrics.PrefetchWasted.Load(); got != 1 {
+		t.Fatalf("PrefetchWasted = %d, want 1", got)
+	}
+	if got := cm.metrics.PrefetchHits.Load(); got != 1 {
+		t.Fatalf("PrefetchHits after invalidate = %d, want 1", got)
+	}
+}
+
+func TestCacheManager_ReadRange_AdaptivePrefetchPopulatesCache(t *testing.T) {
+	cm := newTestCacheManager()
+	ctx := context.Background()
+	cm.config.ChunkSize = 4
+	cm.config.RangePrefetchChunks = 2
+	cm.config.RangePrefetchMaxChunks = 8
+	cm.config.RangePrefetchMaxBytes = 1024
+	cm.config.RangeChunkCacheSize = 16
+	cm.config.RangeChunkCacheMaxBytes = 1 << 20
+	cm.config.PeerTimeout = 2 * time.Second
+
+	path := "/adaptive.bin"
+	const numChunks = 6
+	for i := 0; i < numChunks; i++ {
+		chunkPath := fmt.Sprintf("%s_chunk_%d", path, i)
+		if err := cm.nvmeStorage.Write(ctx, chunkPath, []byte(fmt.Sprintf("ck%02d", i))); err != nil {
+			t.Fatalf("nvme write %s: %v", chunkPath, err)
+		}
+	}
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{
+		FilePath:  path,
+		Size:      4 * numChunks,
+		IsChunked: true,
+		NumChunks: numChunks,
+	}
+	cm.mu.Unlock()
+
+	got, err := cm.ReadRange(ctx, path, 0, 4)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if string(got) != "ck00" {
+		t.Fatalf("ReadRange = %q, want %q", string(got), "ck00")
+	}
+	if issued := cm.metrics.PrefetchIssued.Load(); issued < 2 {
+		t.Fatalf("PrefetchIssued = %d, want >= 2", issued)
+	}
+
+	// Prefetch runs asynchronously; wait for chunks 1 and 2 to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		cm.rangeMu.RLock()
+		fileCache := cm.rangeChunks[path]
+		haveBoth := fileCache != nil && len(fileCache.chunks) >= 3
+		cm.rangeMu.RUnlock()
+		if haveBoth {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("prefetched chunks did not land in range cache")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Sequential follow-up reads should consume prefetched chunks as hits.
+	if _, err := cm.ReadRange(ctx, path, 4, 4); err != nil {
+		t.Fatalf("ReadRange chunk1: %v", err)
+	}
+	if _, err := cm.ReadRange(ctx, path, 8, 4); err != nil {
+		t.Fatalf("ReadRange chunk2: %v", err)
+	}
+	if hits := cm.metrics.PrefetchHits.Load(); hits < 1 {
+		t.Fatalf("PrefetchHits = %d, want >= 1", hits)
+	}
+}
