@@ -579,6 +579,21 @@ func (cm *DefaultCacheManager) GetLocal(ctx context.Context, filePath string) (*
 		}
 		return result, err
 	}
+
+	// Serve a chunk request from a whole parent file held on this node. FUSE
+	// writes store the object whole on NVMe (only the parent has an entry and
+	// no per-chunk files exist), so a cross-node peer asking for
+	// "<parent>_chunk_N" would otherwise miss here and force the reader to fall
+	// through to cloud. Synthesize the chunk from the whole parent, mirroring
+	// the local read path (readChunkFromWholeLocalFile). This is what lets the
+	// peer tier actually serve FUSE-written files.
+	if _, isChunk := parentFilePathFromChunkPath(filePath); isChunk {
+		if syn, err := cm.readChunkFromWholeLocalFile(ctx, filePath); err == nil {
+			cm.touchEntries(filePath)
+			return syn, nil
+		}
+	}
+
 	result, err := cm.getFromTierNoVerify(ctx, filePath, TierNVMe)
 	if err == nil {
 		cm.touchEntries(filePath)
