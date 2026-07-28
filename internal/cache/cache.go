@@ -170,6 +170,11 @@ type CacheConfig struct {
 	// part of the settled range cache.
 	RangePrefetchMaxBytes int64
 
+	// RangePrefetchMaxChunks caps the adaptive readahead window. Sequential
+	// streams double the window per consecutive read starting from
+	// RangePrefetchChunks up to this value; random access resets to the base.
+	RangePrefetchMaxChunks int
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
@@ -225,6 +230,9 @@ type chunkFileCache struct {
 	lastPrefetchTrigger int64
 	prefetchInFlight    map[int64]struct{}
 	prefetchBytes       int64
+	// Sequential-stream detection for adaptive readahead.
+	lastReadEnd int64
+	seqStreak   int
 }
 
 type RangeCacheSnapshot struct {
@@ -238,6 +246,9 @@ type RangeCacheSnapshot struct {
 type rangeCachedChunk struct {
 	data []byte
 	tier CacheTier
+	// prefetched marks a chunk fetched by readahead that has not yet been
+	// consumed by a foreground read; used for hit/waste accounting.
+	prefetched bool
 }
 
 type hybridReadHint struct {
@@ -261,6 +272,7 @@ const chunkFetchWaitTimeout = 15 * time.Second
 const defaultHybridMetadataLookupTimeout = 500 * time.Millisecond
 const largeReadInstrumentationThreshold = 1024 * 1024 * 1024
 const defaultRangeChunkCacheMaxBytes = 512 * 1024 * 1024
+const defaultRangePrefetchMaxChunks = 16
 const defaultRangePrefetchMaxBytes = 128 * 1024 * 1024
 
 // NewCacheManager creates a new cache manager
@@ -308,6 +320,12 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		if config.RangePrefetchMaxBytes < config.ChunkSize {
 			config.RangePrefetchMaxBytes = config.ChunkSize
 		}
+	}
+	if config.RangePrefetchMaxChunks <= 0 {
+		config.RangePrefetchMaxChunks = defaultRangePrefetchMaxChunks
+	}
+	if config.RangePrefetchMaxChunks < config.RangePrefetchChunks {
+		config.RangePrefetchMaxChunks = config.RangePrefetchChunks
 	}
 	if config.PeerReadThroughputBytesPerSec <= 0 {
 		config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
@@ -2103,9 +2121,10 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		}
 	}
 
-	// Opportunistic prefetch for nearby sequential reads.
-	// Trigger on boundary and near-boundary reads so next chunks are already
-	// inflight before the kernel crosses into them.
+	// Adaptive readahead. Sequential streams grow the prefetch window
+	// (doubling up to RangePrefetchMaxChunks); random access falls back to the
+	// base window, triggered only on boundary and near-boundary reads so next
+	// chunks are already inflight before the kernel crosses into them.
 	prefetchTrigger := chunkSize / 4
 	if prefetchTrigger < 256*1024 {
 		prefetchTrigger = 256 * 1024
@@ -2115,21 +2134,25 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 	chunkEndBoundary := (endChunk + 1) * chunkSize
 	nearBoundary := chunkSize > 0 && chunkEndBoundary-end <= prefetchTrigger
-	if cm.config.RangePrefetchChunks > 0 && chunkSize > 0 && (offset%chunkSize == 0 || nearBoundary) {
-		prefetchChunks, prefetchBudgetBytes, rangeBytes := cm.reservePrefetchChunks(filePath, endChunk, entry.NumChunks, chunkSize, cm.config.RangePrefetchChunks)
+	window, sequential := cm.observeReadPattern(filePath, offset, end, endChunk, chunkSize)
+	if window > 0 && (sequential || offset%chunkSize == 0 || nearBoundary) {
+		prefetchChunks, prefetchBudgetBytes, rangeBytes := cm.reservePrefetchChunks(filePath, endChunk, entry.NumChunks, chunkSize, window)
 		if largeRead && len(prefetchChunks) > 0 {
 			rangeChunkCount, _ := cm.rangeCacheStats(filePath)
-			cm.logger.Printf("ReadRange prefetch path=%s offset=%d size=%d endChunk=%d prefetch_chunks=%d near_boundary=%t range_cache_chunks=%d range_cache_mb=%.1f",
-				filePath, offset, size, endChunk, len(prefetchChunks), nearBoundary, rangeChunkCount, float64(rangeBytes)/(1024*1024))
+			cm.logger.Printf("ReadRange prefetch path=%s offset=%d size=%d endChunk=%d prefetch_chunks=%d window=%d sequential=%t near_boundary=%t range_cache_chunks=%d range_cache_mb=%.1f",
+				filePath, offset, size, endChunk, len(prefetchChunks), window, sequential, nearBoundary, rangeChunkCount, float64(rangeBytes)/(1024*1024))
 			cm.logger.Printf("ReadRange prefetch budget path=%s endChunk=%d reserved_chunks=%d prefetch_budget_mb=%.1f range_cache_mb=%.1f",
 				filePath, endChunk, len(prefetchChunks), float64(prefetchBudgetBytes)/(1024*1024), float64(rangeBytes)/(1024*1024))
 		}
+		cm.metrics.PrefetchIssued.Add(int64(len(prefetchChunks)))
 		for _, prefetchChunk := range prefetchChunks {
 			go func(chunkIndex int64) {
 				defer cm.releasePrefetchReservation(filePath, chunkIndex, chunkSize)
 				prefetchCtx, cancel := context.WithTimeout(context.Background(), cm.config.PeerTimeout)
 				defer cancel()
-				_, _, _ = cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead)
+				if _, _, err := cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead); err == nil {
+					cm.markChunkPrefetched(filePath, chunkIndex)
+				}
 			}(prefetchChunk)
 		}
 	}
@@ -2608,27 +2631,9 @@ func (cm *DefaultCacheManager) readChunkHybridHedged(ctx context.Context, chunkP
 	return nil, 0, errors.New("hybrid chunk read failed")
 }
 
-func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, CacheTier, bool) {
-	cm.rangeMu.RLock()
-	defer cm.rangeMu.RUnlock()
-
-	fileCache, ok := cm.rangeChunks[filePath]
-	if !ok || fileCache == nil {
-		return nil, TierUnknown, false
-	}
-	cached, ok := fileCache.chunks[chunkIndex]
-	if !ok {
-		return nil, TierUnknown, false
-	}
-	return cached.data, cached.tier, true
-}
-
-func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte, tier CacheTier) {
-	if len(data) == 0 {
-		return
-	}
-
-	cm.rangeMu.Lock()
+// fileCacheLocked returns the per-file range cache, creating it if needed.
+// Callers must hold rangeMu for writing.
+func (cm *DefaultCacheManager) fileCacheLocked(filePath string) *chunkFileCache {
 	fileCache, ok := cm.rangeChunks[filePath]
 	if !ok || fileCache == nil {
 		fileCache = &chunkFileCache{
@@ -2639,6 +2644,130 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 		}
 		cm.rangeChunks[filePath] = fileCache
 	}
+	return fileCache
+}
+
+// evictOldestRangeChunkLocked drops the oldest cached chunk, counting chunks
+// that were prefetched but never consumed. Callers must hold rangeMu for
+// writing.
+func (cm *DefaultCacheManager) evictOldestRangeChunkLocked(fileCache *chunkFileCache) {
+	if len(fileCache.order) == 0 {
+		return
+	}
+	evictChunk := fileCache.order[0]
+	fileCache.order = fileCache.order[1:]
+	if cached, ok := fileCache.chunks[evictChunk]; ok {
+		fileCache.bytes -= int64(len(cached.data))
+		if cached.prefetched {
+			cm.metrics.PrefetchWasted.Add(1)
+		}
+	}
+	delete(fileCache.chunks, evictChunk)
+}
+
+// dropFileCacheLocked removes a file's range cache, counting prefetched chunks
+// that were never consumed. Callers must hold rangeMu for writing.
+func (cm *DefaultCacheManager) dropFileCacheLocked(filePath string) {
+	fileCache, ok := cm.rangeChunks[filePath]
+	if ok && fileCache != nil {
+		for _, cached := range fileCache.chunks {
+			if cached.prefetched {
+				cm.metrics.PrefetchWasted.Add(1)
+			}
+		}
+	}
+	delete(cm.rangeChunks, filePath)
+}
+
+// observeReadPattern updates per-file sequential-stream state and returns the
+// readahead window (in chunks) for this read plus whether it continued a
+// sequential stream. Consecutive sequential reads double the window from
+// RangePrefetchChunks up to RangePrefetchMaxChunks (Linux-readahead style);
+// a random access resets it to the base. A sequential stream re-reading below
+// the prefetch high-water mark (e.g. a second pass over the file) re-arms
+// lastPrefetchTrigger so prefetch works for repeat passes.
+func (cm *DefaultCacheManager) observeReadPattern(filePath string, offset, end, endChunk, chunkSize int64) (int, bool) {
+	base := cm.config.RangePrefetchChunks
+	if base <= 0 || chunkSize <= 0 {
+		return 0, false
+	}
+	maxChunks := cm.config.RangePrefetchMaxChunks
+	if maxChunks < base {
+		maxChunks = base
+	}
+
+	cm.rangeMu.Lock()
+	fileCache := cm.fileCacheLocked(filePath)
+	sequential := fileCache.lastReadEnd > 0 &&
+		offset >= fileCache.lastReadEnd-chunkSize &&
+		offset <= fileCache.lastReadEnd+chunkSize
+	if sequential {
+		fileCache.seqStreak++
+		if endChunk <= fileCache.lastPrefetchTrigger {
+			fileCache.lastPrefetchTrigger = endChunk - 1
+		}
+	} else {
+		fileCache.seqStreak = 0
+	}
+	fileCache.lastReadEnd = end
+	window := base
+	for i := 0; i < fileCache.seqStreak && window < maxChunks; i++ {
+		window *= 2
+	}
+	cm.rangeMu.Unlock()
+
+	if window > maxChunks {
+		window = maxChunks
+	}
+	return window, sequential
+}
+
+func (cm *DefaultCacheManager) getChunkFromRangeCache(filePath string, chunkIndex int64) ([]byte, CacheTier, bool) {
+	cm.rangeMu.RLock()
+	fileCache, ok := cm.rangeChunks[filePath]
+	if !ok || fileCache == nil {
+		cm.rangeMu.RUnlock()
+		return nil, TierUnknown, false
+	}
+	cached, ok := fileCache.chunks[chunkIndex]
+	cm.rangeMu.RUnlock()
+	if !ok {
+		return nil, TierUnknown, false
+	}
+	if cached.prefetched {
+		cm.rangeMu.Lock()
+		if fileCache, ok := cm.rangeChunks[filePath]; ok && fileCache != nil {
+			if cur, ok := fileCache.chunks[chunkIndex]; ok && cur.prefetched {
+				cur.prefetched = false
+				fileCache.chunks[chunkIndex] = cur
+				cm.metrics.PrefetchHits.Add(1)
+			}
+		}
+		cm.rangeMu.Unlock()
+	}
+	return cached.data, cached.tier, true
+}
+
+// markChunkPrefetched flags a range-cached chunk as populated by readahead so
+// consumption (hit) or eviction without consumption (waste) can be counted.
+func (cm *DefaultCacheManager) markChunkPrefetched(filePath string, chunkIndex int64) {
+	cm.rangeMu.Lock()
+	if fileCache, ok := cm.rangeChunks[filePath]; ok && fileCache != nil {
+		if cached, ok := fileCache.chunks[chunkIndex]; ok && !cached.prefetched {
+			cached.prefetched = true
+			fileCache.chunks[chunkIndex] = cached
+		}
+	}
+	cm.rangeMu.Unlock()
+}
+
+func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex int64, data []byte, tier CacheTier) {
+	if len(data) == 0 {
+		return
+	}
+
+	cm.rangeMu.Lock()
+	fileCache := cm.fileCacheLocked(filePath)
 	if existing, exists := fileCache.chunks[chunkIndex]; exists {
 		fileCache.bytes -= int64(len(existing.data))
 	} else {
@@ -2651,20 +2780,10 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	fileCache.bytes += int64(len(data))
 
 	for len(fileCache.order) > cm.config.RangeChunkCacheSize {
-		evictChunk := fileCache.order[0]
-		fileCache.order = fileCache.order[1:]
-		if cached, ok := fileCache.chunks[evictChunk]; ok {
-			fileCache.bytes -= int64(len(cached.data))
-		}
-		delete(fileCache.chunks, evictChunk)
+		cm.evictOldestRangeChunkLocked(fileCache)
 	}
 	for fileCache.bytes > cm.config.RangeChunkCacheMaxBytes && len(fileCache.order) > 0 {
-		evictChunk := fileCache.order[0]
-		fileCache.order = fileCache.order[1:]
-		if cached, ok := fileCache.chunks[evictChunk]; ok {
-			fileCache.bytes -= int64(len(cached.data))
-		}
-		delete(fileCache.chunks, evictChunk)
+		cm.evictOldestRangeChunkLocked(fileCache)
 	}
 	snapshotChunks := len(fileCache.order)
 	snapshotBytes := fileCache.bytes
@@ -2730,16 +2849,7 @@ func (cm *DefaultCacheManager) reservePrefetchChunks(filePath string, endChunk i
 	}
 
 	cm.rangeMu.Lock()
-	fileCache, ok := cm.rangeChunks[filePath]
-	if !ok || fileCache == nil {
-		fileCache = &chunkFileCache{
-			chunks:              make(map[int64]rangeCachedChunk),
-			order:               make([]int64, 0, cm.config.RangeChunkCacheSize),
-			lastPrefetchTrigger: -1,
-			prefetchInFlight:    make(map[int64]struct{}),
-		}
-		cm.rangeChunks[filePath] = fileCache
-	}
+	fileCache := cm.fileCacheLocked(filePath)
 	if endChunk <= fileCache.lastPrefetchTrigger {
 		rangeBytes := fileCache.bytes
 		cm.rangeMu.Unlock()
@@ -2840,9 +2950,9 @@ func (cm *DefaultCacheManager) logReadRangeSnapshot(
 
 func (cm *DefaultCacheManager) invalidateRangeCache(filePath string) {
 	cm.rangeMu.Lock()
-	delete(cm.rangeChunks, filePath)
+	cm.dropFileCacheLocked(filePath)
 	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
-		delete(cm.rangeChunks, parent)
+		cm.dropFileCacheLocked(parent)
 	}
 	cm.rangeMu.Unlock()
 
@@ -2920,6 +3030,11 @@ type CacheMetrics struct {
 	PeerReadWall   atomic.Int64
 	CloudReadWall  atomic.Int64
 	ReadWallOther  atomic.Int64
+	// Readahead effectiveness: chunks launched, consumed by a foreground read,
+	// and evicted/invalidated without ever being read.
+	PrefetchIssued atomic.Int64
+	PrefetchHits   atomic.Int64
+	PrefetchWasted atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics
@@ -3086,6 +3201,9 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"peer_read_wall_bytes":  peerReadWall,
 		"cloud_read_wall_bytes": cloudReadWall,
 		"read_wall_other_bytes": readWallOther,
+		"prefetch_issued":       m.PrefetchIssued.Load(),
+		"prefetch_hits":         m.PrefetchHits.Load(),
+		"prefetch_wasted":       m.PrefetchWasted.Load(),
 		"nvme_read_wall_mbps":   bytesPerSecToMBps(nvmeReadWall, readWallNanos),
 		"peer_read_wall_mbps":   bytesPerSecToMBps(peerReadWall, readWallNanos),
 		"cloud_read_wall_mbps":  bytesPerSecToMBps(cloudReadWall, readWallNanos),

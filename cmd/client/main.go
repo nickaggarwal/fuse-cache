@@ -72,6 +72,7 @@ func main() {
 		peerReadMBps         = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
 		parallelReads        = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
 		prefetchChunks       = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
+		prefetchMaxChunks    = flag.Int("range-prefetch-max-chunks", 16, "Max chunks the adaptive readahead window grows to on sequential reads")
 		rangeChunkCache      = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
 		rangeChunkCacheMaxMB = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
 		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
@@ -172,6 +173,7 @@ func main() {
 		ChunkSize:                  int64(*chunkSizeMB) * 1024 * 1024,
 		ParallelRangeReads:         *parallelReads,
 		RangePrefetchChunks:        *prefetchChunks,
+		RangePrefetchMaxChunks:     *prefetchMaxChunks,
 		RangeChunkCacheSize:        *rangeChunkCache,
 		RangeChunkCacheMaxBytes:    int64(*rangeChunkCacheMaxMB) * 1024 * 1024,
 		RangePrefetchMaxBytes:      int64(*rangePrefetchMaxMB) * 1024 * 1024,
@@ -229,6 +231,14 @@ func main() {
 			*prefetchChunks = n
 		} else if err != nil {
 			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_CHUNKS value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_PREFETCH_MAX_CHUNKS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cacheConfig.RangePrefetchMaxChunks = n
+			*prefetchMaxChunks = n
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_MAX_CHUNKS value %q: %v", v, err)
 		}
 	}
 	if v := os.Getenv("FUSE_RANGE_CHUNK_CACHE_SIZE"); v != "" {
@@ -504,6 +514,7 @@ func main() {
 	logger.Printf("- Assumed per-peer read throughput MB/s: %d", *peerReadMBps)
 	logger.Printf("- Parallel range reads: %d", cacheConfig.ParallelRangeReads)
 	logger.Printf("- Range prefetch chunks: %d", cacheConfig.RangePrefetchChunks)
+	logger.Printf("- Range prefetch max chunks (adaptive): %d", cacheConfig.RangePrefetchMaxChunks)
 	logger.Printf("- Range chunk cache size: %d", cacheConfig.RangeChunkCacheSize)
 	logger.Printf("- Range chunk cache max MB: %d", cacheConfig.RangeChunkCacheMaxBytes/(1024*1024))
 	logger.Printf("- Range prefetch max MB: %d", cacheConfig.RangePrefetchMaxBytes/(1024*1024))
