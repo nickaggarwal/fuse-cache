@@ -194,6 +194,11 @@ type CacheConfig struct {
 	// large files at or above this size.
 	HybridStripeMinSize int64
 
+	// AdaptiveRemoteRead enables measured peer-vs-cloud tier selection and
+	// hedging based on observed per-tier latency and success rate, instead of a
+	// static peer-first order and purely size-based hedging. Enabled by default.
+	AdaptiveRemoteRead bool
+
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
@@ -218,6 +223,7 @@ type DefaultCacheManager struct {
 	hybridHints    map[string]hybridReadHint
 	chunkFetches   map[string]*chunkFetchState
 	hedgeLimiter   chan struct{}
+	tierPerf       *tierPerfTracker
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	bgWg           sync.WaitGroup
@@ -374,6 +380,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		hybridHints:    make(map[string]hybridReadHint),
 		chunkFetches:   make(map[string]*chunkFetchState),
 		hedgeLimiter:   make(chan struct{}, config.HybridMaxSecondaryInflight),
+		tierPerf:       newTierPerfTracker(),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 	}
@@ -592,7 +599,19 @@ func (cm *DefaultCacheManager) LocalFilePath(ctx context.Context, filePath strin
 
 func (cm *DefaultCacheManager) remoteReadOrder(filePath string) []CacheTier {
 	_ = filePath
+	if cm.config.AdaptiveRemoteRead && cm.tierPerf != nil {
+		return cm.tierPerf.order()
+	}
 	return remoteReadOrderPeerFirst
+}
+
+// recordTierPerf folds a remote read outcome into the adaptive tier tracker.
+// No-op for non-remote tiers or when adaptive reads are disabled.
+func (cm *DefaultCacheManager) recordTierPerf(tier CacheTier, dur time.Duration, ok bool) {
+	if cm.tierPerf == nil {
+		return
+	}
+	cm.tierPerf.record(tier, dur, ok)
 }
 
 func (cm *DefaultCacheManager) lookupFileSizeHint(filePath string) (int64, bool) {
@@ -698,6 +717,16 @@ func (cm *DefaultCacheManager) shouldUseHybridRead(ctx context.Context, filePath
 		// Smaller files keep prior behavior: enable hybrid only when peer
 		// throughput estimate is insufficient and cloud is known present.
 		enabled = true
+	}
+
+	// Adaptive override: once both tiers have enough measured samples, let the
+	// observed reliability/latency race decide hedging instead of size alone.
+	// A close race or an unreliable primary hedges; a clear reliable winner
+	// reads alone. Only strengthens toward hedging when cloud is known present.
+	if !enabled && cm.config.AdaptiveRemoteRead && cm.tierPerf != nil && peerReplicas > 0 && hasCloud {
+		if hedge, ok := cm.tierPerf.shouldHedge(); ok && hedge {
+			enabled = true
+		}
 	}
 
 	cm.mu.Lock()
@@ -2480,6 +2509,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			tierDur := time.Since(hybridStart)
 			cm.metrics.RecordHit(tier)
 			cm.metrics.RecordTierRead(tier, int64(len(chunkEntry.Data)), tierDur)
+			cm.recordTierPerf(tier, tierDur, true)
 			chunkData := chunkEntry.Data
 			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, tier)
 			cm.touchEntries(filePath, chunkPath)
@@ -2497,6 +2527,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		tierDur := time.Since(tierStart)
 		cm.metrics.RecordHit(primary)
 		cm.metrics.RecordTierRead(primary, int64(len(chunkEntry.Data)), tierDur)
+		cm.recordTierPerf(primary, tierDur, true)
 		chunkData := chunkEntry.Data
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, primary)
 		cm.touchEntries(filePath, chunkPath)
@@ -2504,6 +2535,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, primary, nil
 	} else {
+		cm.recordTierPerf(primary, time.Since(tierStart), false)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, err)
 	}
 	cm.metrics.RecordMiss(primary)
@@ -2513,6 +2545,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		tierDur := time.Since(tierStart)
 		cm.metrics.RecordHit(secondary)
 		cm.metrics.RecordTierRead(secondary, int64(len(chunkEntry.Data)), tierDur)
+		cm.recordTierPerf(secondary, tierDur, true)
 		chunkData := chunkEntry.Data
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, secondary)
 		cm.touchEntries(filePath, chunkPath)
@@ -2520,6 +2553,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, secondary, nil
 	} else {
+		cm.recordTierPerf(secondary, time.Since(tierStart), false)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, err)
 	}
 	cm.metrics.RecordMiss(secondary)
@@ -2840,6 +2874,39 @@ func (cm *DefaultCacheManager) RangeCacheSnapshot() RangeCacheSnapshot {
 		snap.PrefetchInFlight += len(fileCache.prefetchInFlight)
 	}
 	return snap
+}
+
+// TierPerfSnapshot exposes the adaptive remote-read tracker's per-tier EWMA
+// latency (ms), success ratio (0..1), sample count, and the currently chosen
+// primary remote tier ("peer", "cloud", or "none" before enough samples).
+type TierPerfSnapshot struct {
+	PeerLatencyMs  float64
+	PeerSuccess    float64
+	PeerSamples    int64
+	CloudLatencyMs float64
+	CloudSuccess   float64
+	CloudSamples   int64
+	PrimaryTier    string
+}
+
+func (cm *DefaultCacheManager) TierPerfSnapshot() TierPerfSnapshot {
+	if cm.tierPerf == nil {
+		return TierPerfSnapshot{PrimaryTier: "none"}
+	}
+	pl, ps, pn, cl, cs, cn := cm.tierPerf.snapshot()
+	primary := "none"
+	if pn >= tierPerfMinSamples && cn >= tierPerfMinSamples {
+		primary = cacheTierToStorageTier(cm.tierPerf.order()[0])
+	}
+	return TierPerfSnapshot{
+		PeerLatencyMs:  pl,
+		PeerSuccess:    ps,
+		PeerSamples:    pn,
+		CloudLatencyMs: cl,
+		CloudSuccess:   cs,
+		CloudSamples:   cn,
+		PrimaryTier:    primary,
+	}
 }
 
 func (cm *DefaultCacheManager) reservePrefetchChunks(filePath string, endChunk int64, numChunks int64, chunkSize int64, want int) ([]int64, int64, int64) {

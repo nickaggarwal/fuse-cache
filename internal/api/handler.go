@@ -767,6 +767,19 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_range_prefetch_inflight %d\n", rangeSnap.PrefetchInFlight)
 	fmt.Fprintf(w, "fuse_range_prefetch_bytes %d\n", rangeSnap.PrefetchBytes)
 
+	tp := dcm.TierPerfSnapshot()
+	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
+	fmt.Fprintf(w, "fuse_tier_peer_success_ratio %.4f\n", tp.PeerSuccess)
+	fmt.Fprintf(w, "fuse_tier_peer_samples_total %d\n", tp.PeerSamples)
+	fmt.Fprintf(w, "fuse_tier_cloud_read_latency_ms %.3f\n", tp.CloudLatencyMs)
+	fmt.Fprintf(w, "fuse_tier_cloud_success_ratio %.4f\n", tp.CloudSuccess)
+	fmt.Fprintf(w, "fuse_tier_cloud_samples_total %d\n", tp.CloudSamples)
+	peerPrimary := 0
+	if tp.PrimaryTier == "peer" {
+		peerPrimary = 1
+	}
+	fmt.Fprintf(w, "fuse_tier_adaptive_primary_is_peer %d\n", peerPrimary)
+
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	fmt.Fprintf(w, "fuse_runtime_alloc_bytes %d\n", ms.Alloc)

@@ -76,6 +76,7 @@ config:
   hybridStripeMinSizeMB: "1024"
   hybridHedgeDelayMs: "20"
   hybridMaxSecondaryInflight: "16"
+  adaptiveRemoteRead: "true"
   fuseIOProgressMB: "512"
   netProbeEnabled: "true"
   netProbeBytes: "1048576"

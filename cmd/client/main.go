@@ -82,6 +82,7 @@ func main() {
 		hybridStripeMB       = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
 		hybridHedgeMS        = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
 		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
+		adaptiveRemoteRead   = flag.Bool("adaptive-remote-read", true, "Choose peer vs cloud read order and hedging from measured per-tier latency/success instead of a static peer-first policy")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -183,6 +184,7 @@ func main() {
 		HybridStripeMinSize:        int64(*hybridStripeMB) * 1024 * 1024,
 		HybridCloudHedgeDelay:      time.Duration(*hybridHedgeMS) * time.Millisecond,
 		HybridMaxSecondaryInflight: *hybridHedgeMax,
+		AdaptiveRemoteRead:         *adaptiveRemoteRead,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -381,6 +383,14 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_HYBRID_MAX_SECONDARY_INFLIGHT value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_ADAPTIVE_REMOTE_READ"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.AdaptiveRemoteRead = parsed
+			*adaptiveRemoteRead = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_ADAPTIVE_REMOTE_READ value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_MOUNT_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			*mountRetries = n
@@ -527,6 +537,7 @@ func main() {
 	logger.Printf("- Azure parallel download min size MB: %d", cacheConfig.AzureParallelDownloadMinBytes/(1024*1024))
 	logger.Printf("- Hybrid hedge delay ms: %d", *hybridHedgeMS)
 	logger.Printf("- Hybrid max secondary inflight: %d", *hybridHedgeMax)
+	logger.Printf("- Adaptive remote read (peer vs cloud): %t", cacheConfig.AdaptiveRemoteRead)
 	logger.Printf("- FUSE mount retries: %d", *mountRetries)
 	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
 
