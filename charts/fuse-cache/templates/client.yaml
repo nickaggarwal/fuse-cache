@@ -133,6 +133,8 @@ spec:
             - name: fuse-mount
               mountPath: {{ .Values.client.fuseRootContainerPath }}
               mountPropagation: Bidirectional
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
           lifecycle:
             preStop:
               exec:
@@ -169,6 +171,10 @@ spec:
           hostPath:
             path: {{ .Values.client.fuseHostPath }}
             type: Directory
+        - name: agent-socket
+          hostPath:
+            path: /var/run/fuse-client
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
