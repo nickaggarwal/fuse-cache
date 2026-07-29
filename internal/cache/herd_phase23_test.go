@@ -235,7 +235,7 @@ func TestPromoteChunkAndAdvertise_MakesChunkServable(t *testing.T) {
 	cm.mu.Unlock()
 
 	data := []byte("chunk-1-data")
-	cm.maybeAdvertiseFetchedChunk(parent, parent+"_chunk_1", 1, TierCloud, data)
+	cm.maybeAdvertiseFetchedChunk(parent, parent+"_chunk_1", TierCloud, data)
 	cm.bgWg.Wait()
 
 	// Chunk is now servable to peers.
@@ -262,7 +262,7 @@ func TestPromoteChunkAndAdvertise_MakesChunkServable(t *testing.T) {
 	}
 
 	// A second chunk arriving within the coalesce window must not re-publish.
-	cm.maybeAdvertiseFetchedChunk(parent, parent+"_chunk_2", 2, TierCloud, []byte("chunk-2-data"))
+	cm.maybeAdvertiseFetchedChunk(parent, parent+"_chunk_2", TierCloud, []byte("chunk-2-data"))
 	cm.bgWg.Wait()
 	if coord.publishedCount() != 1 {
 		t.Fatalf("published after coalesced chunk = %d, want still 1", coord.publishedCount())
@@ -280,7 +280,7 @@ func TestMaybeAdvertiseFetchedChunk_SkipsLocalAndDisabled(t *testing.T) {
 
 	// Disabled: nothing happens.
 	cm.config.FastChunkAdvertise = false
-	cm.maybeAdvertiseFetchedChunk("/x.bin", "/x.bin_chunk_0", 0, TierCloud, []byte("d"))
+	cm.maybeAdvertiseFetchedChunk("/x.bin", "/x.bin_chunk_0", TierCloud, []byte("d"))
 	cm.bgWg.Wait()
 	if coord.publishedCount() != 0 {
 		t.Fatal("disabled advertise must not publish")
@@ -288,7 +288,7 @@ func TestMaybeAdvertiseFetchedChunk_SkipsLocalAndDisabled(t *testing.T) {
 
 	// NVMe-tier chunks are already local: no advertisement.
 	cm.config.FastChunkAdvertise = true
-	cm.maybeAdvertiseFetchedChunk("/x.bin", "/x.bin_chunk_0", 0, TierNVMe, []byte("d"))
+	cm.maybeAdvertiseFetchedChunk("/x.bin", "/x.bin_chunk_0", TierNVMe, []byte("d"))
 	cm.bgWg.Wait()
 	if coord.publishedCount() != 0 {
 		t.Fatal("NVMe-tier chunk must not be re-advertised")

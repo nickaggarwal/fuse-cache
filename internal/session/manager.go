@@ -62,7 +62,8 @@ func (m *Manager) Create(_ context.Context, volumeID, rootPath string, readOnly 
 	if existing, ok := m.sessions[volumeID]; ok {
 		existing.RefCount++
 		m.logger.Printf("Session %s refcount incremented to %d", volumeID, existing.RefCount)
-		return existing, nil
+		cp := *existing
+		return &cp, nil
 	}
 
 	hostPath := filepath.Join(m.fuseRoot, rootPath)
@@ -84,7 +85,10 @@ func (m *Manager) Create(_ context.Context, volumeID, rootPath string, readOnly 
 	m.sessions[volumeID] = sess
 	m.logger.Printf("Session created: volume=%s root=%s host=%s readonly=%t pinned=%t",
 		volumeID, rootPath, hostPath, readOnly, policy.Pinned)
-	return sess, nil
+	// Return a copy, like Get/List, so callers never share the map-backed
+	// struct whose RefCount mutates under the manager mutex.
+	cp := *sess
+	return &cp, nil
 }
 
 // Delete removes a session. If refcount > 1, it decrements instead.

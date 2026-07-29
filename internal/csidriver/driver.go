@@ -130,6 +130,15 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	d.logger.Printf("NodePublishVolume: volume=%s target=%s root=%s readonly=%t",
 		volumeID, targetPath, rootPath, readOnly)
 
+	// Idempotency: kubelet retries NodePublishVolume when it misses our
+	// success response. If the target is already a mount point, the previous
+	// attempt fully succeeded — bumping the session refcount again would leak
+	// a reference (and its pin) that no unpublish will ever release.
+	if isMountPoint(targetPath) {
+		d.logger.Printf("NodePublishVolume: target %s already mounted, treating as success", targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
 	// 1. Ask the agent to create a session and get the host path.
 	agent, err := d.getAgent()
 	if err != nil {
@@ -153,12 +162,22 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		// Not fatal — FUSE may serve it dynamically.
 	}
 
-	// 3. Create target path and bind mount.
+	// 3. Create target path and bind mount. On failure, release the session
+	//    reference we just took — otherwise kubelet's retry stacks another
+	//    refcount and the session (and its pin) outlives the last unpublish.
+	rollbackSession := func() {
+		if delErr := agent.DeleteSession(ctx, volumeID); delErr != nil {
+			d.logger.Printf("NodePublishVolume: rollback delete session %s: %v", volumeID, delErr)
+		}
+	}
+
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
+		rollbackSession()
 		return nil, status.Errorf(codes.Internal, "mkdir target %s: %v", targetPath, err)
 	}
 
 	if err := bindMount(hostPath, targetPath, readOnly); err != nil {
+		rollbackSession()
 		return nil, status.Errorf(codes.Internal, "bind mount %s → %s: %v", hostPath, targetPath, err)
 	}
 
@@ -179,24 +198,27 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 
 	d.logger.Printf("NodeUnpublishVolume: volume=%s target=%s", volumeID, targetPath)
 
-	// 1. Unmount.
-	if err := unmount(targetPath); err != nil {
-		d.logger.Printf("NodeUnpublishVolume: unmount warning: %v", err)
-		// Continue to clean up session anyway.
+	// 1. Unmount. An unmount error is only fatal if the target is still
+	//    mounted (e.g. EBUSY) — deleting the session then would drop its pin
+	//    while the bind mount is still serving I/O. Returning an error makes
+	//    kubelet retry, which is the CSI-correct behavior.
+	if err := unmount(targetPath); err != nil && isMountPoint(targetPath) {
+		return nil, status.Errorf(codes.Internal, "unmount %s: %v", targetPath, err)
 	}
 
 	// 2. Remove target directory.
 	os.Remove(targetPath)
 
-	// 3. Delete agent session.
+	// 3. Delete agent session. If the agent is unreachable we must NOT report
+	//    success: the session refcount (and pin) would leak permanently.
+	//    Kubelet retries unpublish, and Delete is idempotent on the agent side.
 	agent, err := d.getAgent()
 	if err != nil {
-		d.logger.Printf("NodeUnpublishVolume: agent unavailable, session %s not cleaned: %v", volumeID, err)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+		return nil, status.Errorf(codes.Unavailable, "agent not available, session %s not released: %v", volumeID, err)
 	}
 	if err := agent.DeleteSession(ctx, volumeID); err != nil {
-		d.logger.Printf("NodeUnpublishVolume: delete session %s: %v", volumeID, err)
 		d.resetAgent()
+		return nil, status.Errorf(codes.Internal, "delete session %s: %v", volumeID, err)
 	}
 
 	d.logger.Printf("NodeUnpublishVolume: complete for volume=%s", volumeID)
@@ -213,9 +235,9 @@ func attrOr(attrs map[string]string, key, fallback string) string {
 }
 
 // bindMount performs a bind mount from source to target.
-// On Linux this uses mount(2) via exec. On other platforms it's a no-op for
-// testing (the CSI driver only runs on Linux nodes).
-func bindMount(source, target string, readOnly bool) error {
+// On Linux this uses mount(2) via exec. Declared as a variable so tests can
+// stub it (the CSI driver only runs as root on Linux nodes).
+var bindMount = func(source, target string, readOnly bool) error {
 	args := []string{"--bind", source, target}
 	if err := exec.Command("mount", args...).Run(); err != nil {
 		return err

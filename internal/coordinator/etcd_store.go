@@ -2,10 +2,12 @@ package coordinator
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"time"
 
@@ -14,7 +16,9 @@ import (
 
 const (
 	defaultEtcdPrefix         = "/fuse"
-	defaultPeerLeaseTTLSec    = 30
+	// defaultPeerLeaseTTLSec must comfortably exceed the client heartbeat
+	// interval (30s) so a single delayed heartbeat doesn't expire the peer.
+	defaultPeerLeaseTTLSec = 90
 	defaultEtcdRequestTimeout = 5 * time.Second
 	maxFileLocationCASRetries = 8
 )
@@ -264,8 +268,32 @@ func (s *EtcdStore) PutFileLocation(ctx context.Context, loc *FileLocation) erro
 		if txnResp.Succeeded {
 			return nil
 		}
+
+		// Lost the CAS race. Back off with jitter before re-reading so
+		// replicas contending on a hot path don't livelock in lockstep.
+		if err := sleepJitteredBackoff(ctx, attempt); err != nil {
+			return err
+		}
 	}
 	return errors.New("PutFileLocation: too many CAS retries")
+}
+
+// sleepJitteredBackoff sleeps for a crypto/rand-jittered, linearly growing
+// interval (up to ~(attempt+1)*10ms) or until ctx is done.
+func sleepJitteredBackoff(ctx context.Context, attempt int) error {
+	maxSleep := time.Duration(attempt+1) * 10 * time.Millisecond
+	sleep := maxSleep / 2
+	if n, err := crand.Int(crand.Reader, big.NewInt(int64(maxSleep/2)+1)); err == nil {
+		sleep += time.Duration(n.Int64())
+	}
+	timer := time.NewTimer(sleep)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *EtcdStore) Snapshot(ctx context.Context) (State, error) {

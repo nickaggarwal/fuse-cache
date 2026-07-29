@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"sort"
 	"time"
 )
 
@@ -62,8 +63,9 @@ func (cm *DefaultCacheManager) reconcileTarget() int {
 
 // reconcileCandidate is a hot local object the reconciler may top up.
 type reconcileCandidate struct {
-	path string
-	size int64
+	path         string
+	size         int64
+	lastAccessed time.Time
 }
 
 // hotLocalObjects snapshots local entries with recent demand, oldest-access
@@ -84,9 +86,14 @@ func (cm *DefaultCacheManager) hotLocalObjects(now time.Time) []reconcileCandida
 		if entry.Size <= 0 || entry.Size > reconcileMaxObjectBytes {
 			continue
 		}
-		out = append(out, reconcileCandidate{path: path, size: entry.Size})
+		out = append(out, reconcileCandidate{path: path, size: entry.Size, lastAccessed: entry.LastAccessed})
 	}
 	cm.mu.RUnlock()
+	// Most-recently-accessed first so the hottest objects get the pass budget
+	// (map iteration order is random).
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].lastAccessed.After(out[j].lastAccessed)
+	})
 	return out
 }
 

@@ -40,7 +40,6 @@ type peerPairStat struct {
 	ewmaLatencyMs float64
 	ewmaSuccess   float64
 	samples       int64
-	lastSampleAt  time.Time
 }
 
 // peerLatencyTracker holds this node's observed latency to each peer.
@@ -76,7 +75,6 @@ func (t *peerLatencyTracker) record(peerID string, latency time.Duration, ok boo
 		s.ewmaSuccess = peerPairAlpha*successVal + (1-peerPairAlpha)*s.ewmaSuccess
 	}
 	s.samples++
-	s.lastSampleAt = time.Now()
 }
 
 // measured returns the pair's EWMA latency/success and whether enough samples

@@ -29,7 +29,7 @@ func main() {
 		grpcPort         = flag.Int("grpc-port", 9080, "Port for the coordinator gRPC server")
 		etcdEndpoints    = flag.String("etcd-endpoints", "", "Comma-separated etcd endpoints (e.g. http://etcd-0:2379,http://etcd-1:2379). If empty, uses in-memory state.")
 		etcdPrefix       = flag.String("etcd-prefix", "/fuse", "etcd key prefix for coordinator state")
-		etcdLeaseTTL     = flag.Int("etcd-peer-lease-ttl", 30, "Peer liveness lease TTL in seconds (etcd-backed only)")
+		etcdLeaseTTL     = flag.Int("etcd-peer-lease-ttl", 90, "Peer liveness lease TTL in seconds (etcd-backed only); keep this at ~3x the client heartbeat interval (30s) so one slow heartbeat doesn't expire the peer")
 		etcdDialTimeout  = flag.Duration("etcd-dial-timeout", 5*time.Second, "etcd dial timeout")
 		help             = flag.Bool("help", false, "Show help")
 	)

@@ -77,7 +77,7 @@ func (a *chunkAdvertiser) shouldPublish(parent string, now time.Time) bool {
 // promoteChunkAndAdvertise persists a remotely-fetched chunk to local NVMe and
 // advertises this node as a holder of the parent. Runs in the background; all
 // failures are best-effort (the read already succeeded).
-func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, filePath, chunkPath string, chunkIndex int64, data []byte) {
+func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, filePath, chunkPath string, data []byte) {
 	if len(data) == 0 {
 		return
 	}
@@ -138,7 +138,7 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 // maybeAdvertiseFetchedChunk schedules background promote+advertise for a
 // chunk that arrived from a remote tier. No-op when disabled or the chunk is
 // already local.
-func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath string, chunkIndex int64, tier CacheTier, data []byte) {
+func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath string, tier CacheTier, data []byte) {
 	if !cm.config.FastChunkAdvertise || tier == TierNVMe || len(data) == 0 {
 		return
 	}
@@ -168,6 +168,6 @@ func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath st
 		if cm.chunkPromoteGate != nil {
 			defer func() { <-cm.chunkPromoteGate }()
 		}
-		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, chunkIndex, dataCopy)
+		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, dataCopy)
 	})
 }

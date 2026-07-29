@@ -110,7 +110,6 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
-	buf := aws.NewWriteAtBuffer([]byte{})
 	var firstErr error
 	for _, key := range keyCandidates(path) {
 		if shouldUseDirectS3Read(path) {
@@ -125,7 +124,10 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 				return nil, err
 			}
 		}
-		buf = aws.NewWriteAtBuffer([]byte{})
+		// GrowthCoeff 2 = amortized doubling; the default exact-fit growth
+		// re-copies the whole buffer on every concurrent part write.
+		buf := aws.NewWriteAtBuffer([]byte{})
+		buf.GrowthCoeff = 2
 		_, err := cs.downloader.DownloadWithContext(timeoutCtx, buf, &s3.GetObjectInput{
 			Bucket: aws.String(cs.bucket),
 			Key:    aws.String(key),
@@ -155,7 +157,20 @@ func (cs *CloudStorage) readDirect(ctx context.Context, key string) ([]byte, err
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return readAllSized(resp.Body, aws.Int64Value(resp.ContentLength))
+}
+
+// readAllSized reads the body into a buffer presized from Content-Length,
+// avoiding io.ReadAll's repeated grow-and-copy on multi-MB objects.
+func readAllSized(r io.Reader, contentLength int64) ([]byte, error) {
+	if contentLength <= 0 {
+		return io.ReadAll(r)
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, contentLength))
+	if _, err := buf.ReadFrom(r); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) error {

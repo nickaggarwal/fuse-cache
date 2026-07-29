@@ -60,11 +60,24 @@ func (s *EtcdStore) AcquireFetchLease(ctx context.Context, key, peerID string, t
 
 // ReleaseFetchLease deletes the in-flight key if this peer still holds it,
 // using a value-compare transaction so a later holder is never clobbered.
+// The key's etcd lease is revoked too — deleting only the key would leave
+// the lease object alive until TTL, churning etcd's lease heap on busy
+// clusters (acquire already revokes on the losing branch).
 func (s *EtcdStore) ReleaseFetchLease(ctx context.Context, key, peerID string) error {
 	etcdKey := s.inflightKey(key)
-	_, err := s.client.Txn(ctx).
+	txn, err := s.client.Txn(ctx).
 		If(clientv3.Compare(clientv3.Value(etcdKey), "=", peerID)).
-		Then(clientv3.OpDelete(etcdKey)).
+		Then(clientv3.OpGet(etcdKey), clientv3.OpDelete(etcdKey)).
 		Commit()
-	return err
+	if err != nil || !txn.Succeeded {
+		return err
+	}
+	if rr := txn.Responses[0].GetResponseRange(); rr != nil && len(rr.Kvs) > 0 {
+		if leaseID := rr.Kvs[0].Lease; leaseID != 0 {
+			revokeCtx, cancel := context.WithTimeout(context.Background(), defaultEtcdRequestTimeout)
+			defer cancel()
+			_, _ = s.client.Revoke(revokeCtx, clientv3.LeaseID(leaseID))
+		}
+	}
+	return nil
 }

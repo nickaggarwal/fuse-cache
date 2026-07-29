@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
@@ -1855,6 +1856,26 @@ func (cm *DefaultCacheManager) publishFileLocation(ctx context.Context, entry *C
 	}
 }
 
+// heapStatsMB reads heap alloc/in-use via runtime/metrics, which does not
+// stop the world — runtime.ReadMemStats does, and these are called from
+// read-path logging where a multi-ms global pause is unacceptable.
+func heapStatsMB() (allocMB, heapInuseMB float64) {
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"}, // ≈ MemStats.HeapAlloc
+		{Name: "/memory/classes/heap/unused:bytes"},
+	}
+	metrics.Read(samples)
+	if samples[0].Value.Kind() == metrics.KindUint64 {
+		allocMB = float64(samples[0].Value.Uint64()) / (1024 * 1024)
+	}
+	heapInuseMB = allocMB
+	if samples[1].Value.Kind() == metrics.KindUint64 {
+		// HeapInuse ≈ objects + unused span space.
+		heapInuseMB += float64(samples[1].Value.Uint64()) / (1024 * 1024)
+	}
+	return allocMB, heapInuseMB
+}
+
 func cacheTierToStorageTier(tier CacheTier) string {
 	switch tier {
 	case TierNVMe:
@@ -2638,7 +2659,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			cm.recordTierPerf(tier, tierDur, true)
 			chunkData := chunkEntry.Data
 			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, tier)
-			cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, tier, chunkData)
+			cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, tier, chunkData)
 			cm.touchEntries(filePath, chunkPath)
 			cm.traceChunkAttempt(chunkPath, chunkIndex, tier, hybridStart, nil)
 			cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
@@ -2662,7 +2683,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.recordTierPerf(servedTier, tierDur, true)
 		chunkData := chunkEntry.Data
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, servedTier)
-		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, servedTier, chunkData)
+		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, servedTier, chunkData)
 		cm.touchEntries(filePath, chunkPath)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, servedTier, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
@@ -2681,7 +2702,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.recordTierPerf(servedTier, tierDur, true)
 		chunkData := chunkEntry.Data
 		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, servedTier)
-		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, servedTier, chunkData)
+		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, servedTier, chunkData)
 		cm.touchEntries(filePath, chunkPath)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, servedTier, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
@@ -2962,8 +2983,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	cm.rangeMu.Unlock()
 
 	if shouldLog {
-		var ms runtime.MemStats
-		runtime.ReadMemStats(&ms)
+		allocMB, heapInuseMB := heapStatsMB()
 		cm.logger.Printf("Range cache snapshot path=%s chunks=%d bytes=%d chunk_size_mb=%.1f cache_limit_chunks=%d cache_limit_mb=%.1f alloc_mb=%.1f heap_inuse_mb=%.1f goroutines=%d last_chunk=%d tier=%s",
 			filePath,
 			snapshotChunks,
@@ -2971,8 +2991,8 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 			float64(len(data))/(1024*1024),
 			cm.config.RangeChunkCacheSize,
 			float64(cm.config.RangeChunkCacheMaxBytes)/(1024*1024),
-			float64(ms.Alloc)/(1024*1024),
-			float64(ms.HeapInuse)/(1024*1024),
+			allocMB,
+			heapInuseMB,
 			runtime.NumGoroutine(),
 			chunkIndex,
 			cacheTierToStorageTier(tier),
@@ -3111,8 +3131,7 @@ func (cm *DefaultCacheManager) logReadRangeSnapshot(
 	err error,
 ) {
 	rangeChunks, rangeBytes := cm.rangeCacheStats(filePath)
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
+	allocMB, heapInuseMB := heapStatsMB()
 	if err != nil {
 		cm.logger.Printf("ReadRange snapshot phase=%s path=%s offset=%d size=%d start_chunk=%d end_chunk=%d workers=%d hybrid=%t range_cache_chunks=%d range_cache_mb=%.1f alloc_mb=%.1f heap_inuse_mb=%.1f goroutines=%d err=%v",
 			phase,
@@ -3125,8 +3144,8 @@ func (cm *DefaultCacheManager) logReadRangeSnapshot(
 			hybridRead,
 			rangeChunks,
 			float64(rangeBytes)/(1024*1024),
-			float64(ms.Alloc)/(1024*1024),
-			float64(ms.HeapInuse)/(1024*1024),
+			allocMB,
+			heapInuseMB,
 			runtime.NumGoroutine(),
 			err,
 		)
@@ -3143,8 +3162,8 @@ func (cm *DefaultCacheManager) logReadRangeSnapshot(
 		hybridRead,
 		rangeChunks,
 		float64(rangeBytes)/(1024*1024),
-		float64(ms.Alloc)/(1024*1024),
-		float64(ms.HeapInuse)/(1024*1024),
+		allocMB,
+		heapInuseMB,
 		runtime.NumGoroutine(),
 	)
 }

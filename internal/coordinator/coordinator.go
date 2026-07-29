@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,6 +81,10 @@ var _ Coordinator = (*CoordinatorService)(nil)
 type CoordinatorService struct {
 	store  Store
 	logger *log.Logger
+	// saveMu serializes SaveStateToPath: the periodic save goroutine and the
+	// shutdown path can otherwise write the same temp file concurrently and
+	// rename a torn snapshot into place.
+	saveMu sync.Mutex
 }
 
 // WorldView captures global metadata state across peers and files.
@@ -175,8 +180,12 @@ func (cs *CoordinatorService) UpdatePeerStatusWithNetwork(ctx context.Context, p
 		return err
 	}
 	if peer == nil {
+		// The peer's record is gone (e.g. its etcd lease expired before this
+		// heartbeat landed). Returning an error is what triggers the client's
+		// re-register path — silently succeeding would leave the node
+		// invisible to the cluster until restart.
 		cs.logger.Printf("Peer not found: %s", peerID)
-		return nil
+		return fmt.Errorf("peer %s not registered", peerID)
 	}
 
 	peer.Status = status
@@ -573,6 +582,9 @@ func (cs *CoordinatorService) RestoreState(data []byte) error {
 
 // SaveStateToPath saves coordinator state to a specific file path atomically.
 func (cs *CoordinatorService) SaveStateToPath(stateFile string) error {
+	cs.saveMu.Lock()
+	defer cs.saveMu.Unlock()
+
 	data, err := cs.SnapshotState()
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ package nodeinit
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -152,8 +153,8 @@ func scoreCandidate(c *Candidate) float64 {
 
 	freeGiB := float64(c.FreeBytes) / (1 << 30)
 	// log2 keeps a 4 TiB disk from drowning out media class entirely.
-	for gib := 1.0; gib <= freeGiB && score < 1e9; gib *= 2 {
-		score += 10
+	if freeGiB >= 1 {
+		score += 10 * (math.Floor(math.Log2(freeGiB)) + 1)
 	}
 
 	// Measured throughput settles ties between same-class disks; scaled so

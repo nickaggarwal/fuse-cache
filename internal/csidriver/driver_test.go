@@ -49,6 +49,15 @@ func startTestAgent(t *testing.T, fuseRoot string) string {
 	return socketPath
 }
 
+// stubBindMount replaces bindMount for the duration of a test (tests don't
+// run as root and have no FUSE mount). Returns a restore func.
+func stubBindMount(t *testing.T, err error) func() {
+	t.Helper()
+	orig := bindMount
+	bindMount = func(source, target string, readOnly bool) error { return err }
+	return func() { bindMount = orig }
+}
+
 func TestIdentityGetPluginInfo(t *testing.T) {
 	d := New("test.csi.driver", "node-1", "/tmp/agent.sock", "/tmp/fuse", log.Default())
 
@@ -138,9 +147,11 @@ func TestNodePublishWithAgent(t *testing.T) {
 
 	targetPath := filepath.Join(t.TempDir(), "target")
 
-	// NodePublishVolume should succeed up to the bind mount step.
-	// Since we're not running as root, the bind mount will fail, but the
-	// session should be created in the agent.
+	// Stub the bind mount (not root / no FUSE on test machines). A real mount
+	// failure rolls the session back, which TestNodePublishRollsBackSessionOnMountFailure covers.
+	restore := stubBindMount(t, nil)
+	defer restore()
+
 	_, err := d.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
 		VolumeId:   "vol-1",
 		TargetPath: targetPath,
@@ -152,16 +163,8 @@ func TestNodePublishWithAgent(t *testing.T) {
 			"pinned":    "true",
 		},
 	})
-
-	// We expect the bind mount to fail (not root / no FUSE mount),
-	// but the session should have been created in the agent.
 	if err != nil {
-		// Verify the error is about bind mount, not session creation.
-		st, ok := status.FromError(err)
-		if !ok || st.Code() != codes.Internal {
-			t.Fatalf("Expected Internal error (bind mount), got %v", err)
-		}
-		t.Logf("Expected bind mount failure: %v", err)
+		t.Fatalf("NodePublishVolume: %v", err)
 	}
 
 	// Verify the session was created by connecting directly to agent.
@@ -194,6 +197,9 @@ func TestNodePublishDefaultRootPath(t *testing.T) {
 	ctx := context.Background()
 
 	targetPath := filepath.Join(t.TempDir(), "target")
+
+	restore := stubBindMount(t, nil)
+	defer restore()
 
 	// No rootPath in volume context → should default to "/".
 	d.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
@@ -250,6 +256,36 @@ func TestNodeUnpublishCleansSession(t *testing.T) {
 	_, err = agentClient.GetSession(ctx, "vol-cleanup")
 	if err == nil {
 		t.Error("Session should have been deleted")
+	}
+}
+
+func TestNodePublishRollsBackSessionOnMountFailure(t *testing.T) {
+	fuseRoot := t.TempDir()
+	socketPath := startTestAgent(t, fuseRoot)
+
+	d := New("test.csi.driver", "node-1", socketPath, fuseRoot, log.Default())
+	ctx := context.Background()
+
+	restore := stubBindMount(t, os.ErrPermission)
+	defer restore()
+
+	_, err := d.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
+		VolumeId:      "vol-rollback",
+		TargetPath:    filepath.Join(t.TempDir(), "target"),
+		VolumeContext: map[string]string{"rootPath": "/data", "pinned": "true"},
+	})
+	assertGRPCCode(t, err, codes.Internal)
+
+	// The session created before the failed mount must have been rolled back,
+	// otherwise kubelet's retry would stack refcounts and leak the pin.
+	agentClient, err := agentserver.NewClient(socketPath)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer agentClient.Close()
+
+	if _, err := agentClient.GetSession(ctx, "vol-rollback"); err == nil {
+		t.Error("session should have been rolled back after bind mount failure")
 	}
 }
 

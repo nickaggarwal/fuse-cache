@@ -53,8 +53,10 @@ spec:
             - "$(ETCD_ENDPOINTS)"
             - "-etcd-prefix"
             - "/fuse"
+            # ~3x the client heartbeat interval (30s) so one delayed
+            # heartbeat can't expire the peer's liveness lease.
             - "-etcd-peer-lease-ttl"
-            - "30"
+            - "90"
           env:
             - name: ETCD_ENDPOINTS
               value: "http://etcd-0.etcd.fuse-system.svc.cluster.local:2379,http://etcd-1.etcd.fuse-system.svc.cluster.local:2379,http://etcd-2.etcd.fuse-system.svc.cluster.local:2379"

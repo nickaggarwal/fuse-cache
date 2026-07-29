@@ -25,17 +25,29 @@ type GRPCCoordinatorClient struct {
 }
 
 // NewGRPCCoordinatorClient creates a new gRPC-based coordinator client.
+// Endpoints not yet on the gRPC surface fall back to the coordinator's HTTP
+// API on the same host, port 8080.
 func NewGRPCCoordinatorClient(addr string) (*GRPCCoordinatorClient, error) {
+	return NewGRPCCoordinatorClientWithHTTP(addr, deriveCoordinatorHTTPAddr(addr))
+}
+
+// NewGRPCCoordinatorClientWithHTTP is like NewGRPCCoordinatorClient but uses
+// an explicit HTTP fallback address (the -coordinator flag) instead of
+// assuming port 8080 on the gRPC host.
+func NewGRPCCoordinatorClientWithHTTP(addr, httpAddr string) (*GRPCCoordinatorClient, error) {
 	conn, err := grpc.Dial(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
 		return nil, err
 	}
+	if httpAddr == "" {
+		httpAddr = deriveCoordinatorHTTPAddr(addr)
+	}
 	return &GRPCCoordinatorClient{
 		conn:     conn,
 		client:   pb.NewCoordinatorServiceClient(conn),
-		httpAddr: deriveCoordinatorHTTPAddr(addr),
+		httpAddr: httpAddr,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},

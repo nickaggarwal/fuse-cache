@@ -179,7 +179,7 @@ func main() {
 	var grpcCoordClient *coordinator.GRPCCoordinatorClient
 	if *coordinatorGRPC != "" {
 		var err error
-		grpcCoordClient, err = coordinator.NewGRPCCoordinatorClient(*coordinatorGRPC)
+		grpcCoordClient, err = coordinator.NewGRPCCoordinatorClientWithHTTP(*coordinatorGRPC, *coordinatorAddr)
 		if err != nil {
 			logger.Printf("WARNING: Failed to create gRPC coordinator client: %v, falling back to HTTP", err)
 			coordClient = coordinator.NewCoordinatorClient(*coordinatorAddr, 10*time.Second)
@@ -452,18 +452,13 @@ func main() {
 		}
 	}
 
-	// Wire PinnedPrefixesFn before creating the cache manager so that the
-	// eviction loop can skip paths held by active CSI sessions. sessMgr is set
-	// below when the agent server is enabled; the closure captures it by value
-	// (pointer), so the field may be nil at eviction time if agent is disabled.
+	// Create the session manager before the cache manager: eviction can run
+	// from other goroutines as soon as the cache manager exists, so sessMgr
+	// must be fully assigned before PinnedPrefixesFn can ever be called.
 	var sessMgr *session.Manager
 	if *enableAgentServer {
-		cacheConfig.PinnedPrefixesFn = func() []string {
-			if sessMgr == nil {
-				return nil
-			}
-			return sessMgr.PinnedPrefixes()
-		}
+		sessMgr = session.NewManager(*mountPoint)
+		cacheConfig.PinnedPrefixesFn = sessMgr.PinnedPrefixes
 	}
 
 	// Initialize cache manager
@@ -534,9 +529,9 @@ func main() {
 		}
 	}()
 
-	// Start CSI agent gRPC server if enabled
+	// Start CSI agent gRPC server if enabled (sessMgr was created above,
+	// before the cache manager, so eviction never observes a nil manager)
 	if *enableAgentServer {
-		sessMgr = session.NewManager(*mountPoint)
 		agentSrv := agentserver.New(sessMgr, *agentSocket)
 		go func() {
 			if err := agentSrv.Serve(ctx); err != nil {

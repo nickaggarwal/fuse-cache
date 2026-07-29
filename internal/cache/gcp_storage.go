@@ -65,6 +65,7 @@ func (gs *GCPStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	defer cancel()
 
 	buf := aws.NewWriteAtBuffer([]byte{})
+	buf.GrowthCoeff = 2 // amortized doubling instead of exact-fit re-copies
 	_, err := gs.downloader.DownloadWithContext(timeoutCtx, buf, &s3.GetObjectInput{
 		Bucket: aws.String(gs.bucket),
 		Key:    aws.String(path),
