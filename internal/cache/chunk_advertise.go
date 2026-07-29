@@ -25,6 +25,15 @@ const (
 	// land. Keeps lease/advert churn from turning the coordinator into the
 	// new hotspot (plan risk item).
 	chunkAdvertiseCoalesceWindow = 5 * time.Second
+
+	// chunkPromoteMaxConcurrent bounds how many remotely-fetched chunks are
+	// promoted to NVMe at once. Promotion writes the chunk to disk and takes
+	// cm.mu (plus possible eviction), so an unbounded burst — 64 goroutines
+	// for a 1 GiB read — contends with the foreground read path and tanks
+	// throughput. With a small non-blocking gate, a read's chunk burst
+	// promotes only a few chunks and skips the rest (a partial holder is fine:
+	// readers try all peers), while an idle node still fills up over time.
+	chunkPromoteMaxConcurrent = 4
 )
 
 // chunkAdvertiser dedupes per-parent holder advertisements.
@@ -133,10 +142,24 @@ func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath st
 	if !cm.config.FastChunkAdvertise || tier == TierNVMe || len(data) == 0 {
 		return
 	}
+	// Non-blocking admission: under a read's parallel chunk burst the gate
+	// fills immediately, so most chunks are skipped here — before the copy —
+	// keeping promotion from competing with the foreground read. An idle node
+	// promotes freely and fills up as a holder over successive reads.
+	if cm.chunkPromoteGate != nil {
+		select {
+		case cm.chunkPromoteGate <- struct{}{}:
+		default:
+			return
+		}
+	}
 	// Copy: the caller's buffer is shared with the range cache.
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 	cm.goBackground(func() {
+		if cm.chunkPromoteGate != nil {
+			defer func() { <-cm.chunkPromoteGate }()
+		}
 		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, chunkIndex, dataCopy)
 	})
 }

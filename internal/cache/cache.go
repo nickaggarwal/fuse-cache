@@ -252,30 +252,31 @@ type CacheConfig struct {
 
 // DefaultCacheManager implements CacheManager
 type DefaultCacheManager struct {
-	config         *CacheConfig
-	nvmeStorage    TierStorage
-	peerStorage    TierStorage
-	cloudStorage   TierStorage
-	entries        map[string]*CacheEntry
-	nvmeUsed       int64
-	mu             sync.RWMutex
-	rangeMu        sync.RWMutex
-	fetchMu        sync.Mutex
-	logger         *log.Logger
-	metrics        *CacheMetrics
-	metadataAt     time.Time
-	metadataView   []*CacheEntry
-	rangeChunks    map[string]*chunkFileCache
-	hybridHints    map[string]hybridReadHint
-	chunkFetches   map[string]*chunkFetchState
-	hedgeLimiter   chan struct{}
-	peerServeGate  *peerServeGate
-	herdStats      herdControlStats
-	chunkAds       *chunkAdvertiser
-	tierPerf       *tierPerfTracker
-	shutdownCtx    context.Context
-	shutdownCancel context.CancelFunc
-	bgWg           sync.WaitGroup
+	config           *CacheConfig
+	nvmeStorage      TierStorage
+	peerStorage      TierStorage
+	cloudStorage     TierStorage
+	entries          map[string]*CacheEntry
+	nvmeUsed         int64
+	mu               sync.RWMutex
+	rangeMu          sync.RWMutex
+	fetchMu          sync.Mutex
+	logger           *log.Logger
+	metrics          *CacheMetrics
+	metadataAt       time.Time
+	metadataView     []*CacheEntry
+	rangeChunks      map[string]*chunkFileCache
+	hybridHints      map[string]hybridReadHint
+	chunkFetches     map[string]*chunkFetchState
+	hedgeLimiter     chan struct{}
+	peerServeGate    *peerServeGate
+	herdStats        herdControlStats
+	chunkAds         *chunkAdvertiser
+	chunkPromoteGate chan struct{}
+	tierPerf         *tierPerfTracker
+	shutdownCtx      context.Context
+	shutdownCancel   context.CancelFunc
+	bgWg             sync.WaitGroup
 }
 
 type chunkFileCache struct {
@@ -421,19 +422,20 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	cm := &DefaultCacheManager{
-		config:         config,
-		entries:        make(map[string]*CacheEntry),
-		logger:         log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
-		metrics:        NewCacheMetrics(),
-		rangeChunks:    make(map[string]*chunkFileCache),
-		hybridHints:    make(map[string]hybridReadHint),
-		chunkFetches:   make(map[string]*chunkFetchState),
-		hedgeLimiter:   make(chan struct{}, config.HybridMaxSecondaryInflight),
-		peerServeGate:  newPeerServeGate(config.PeerServeMaxInflight),
-		chunkAds:       newChunkAdvertiser(),
-		tierPerf:       newTierPerfTracker(),
-		shutdownCtx:    shutdownCtx,
-		shutdownCancel: shutdownCancel,
+		config:           config,
+		entries:          make(map[string]*CacheEntry),
+		logger:           log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
+		metrics:          NewCacheMetrics(),
+		rangeChunks:      make(map[string]*chunkFileCache),
+		hybridHints:      make(map[string]hybridReadHint),
+		chunkFetches:     make(map[string]*chunkFetchState),
+		hedgeLimiter:     make(chan struct{}, config.HybridMaxSecondaryInflight),
+		peerServeGate:    newPeerServeGate(config.PeerServeMaxInflight),
+		chunkAds:         newChunkAdvertiser(),
+		chunkPromoteGate: make(chan struct{}, chunkPromoteMaxConcurrent),
+		tierPerf:         newTierPerfTracker(),
+		shutdownCtx:      shutdownCtx,
+		shutdownCancel:   shutdownCancel,
 	}
 
 	// Initialize storage tiers
