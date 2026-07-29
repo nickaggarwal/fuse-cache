@@ -44,6 +44,23 @@ client:
   mountPrepareRetries: 10
   mountPrepareRetryDelaySeconds: 2
 
+# node-init discovers the best local disk on every node (NVMe > SSD >
+# ephemeral > HDD by media class, free space, and a micro-benchmark),
+# prepares <mount>/<cacheSubdir> on it, and hands the path + byte budget to
+# the client — so this chart deploys unchanged on AKS, EKS, GKE, or bare
+# metal. When disabled, the static config.nvmeCachePath/nvmeMaxGB are used.
+nodeInit:
+  enabled: true
+  hostRootContainerPath: /host
+  configPath: /var/run/fuse-client/node-init.json
+  cacheSubdir: fuse-cache
+  minFreeGB: 2
+  cacheFraction: "0.8"
+  maxCacheGB: 0        # 0 = uncapped
+  benchmark: true
+  refreshIntervalSeconds: 60
+  daemonSidecar: true  # keep refreshing capacity after init
+
 config:
   coordinatorAddr: ""
   coordinatorGrpcAddr: ""

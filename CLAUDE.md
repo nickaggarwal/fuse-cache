@@ -175,6 +175,7 @@ NVMe has a configurable capacity (default 10GB). When a write would exceed capac
 | `coordinator` | `cmd/coordinator/main.go` | Central registry. Tracks which peers are alive and where files live. HTTP :8080, gRPC :9080. |
 | `client` | `cmd/client/main.go` | Runs on every storage node. Mounts FUSE, manages 3-tier cache, serves API (:8081) + peer gRPC (:9081), and (by default) the CSI agent gRPC server on a Unix socket. |
 | `csi-driver` | `cmd/csi-driver/main.go` | Kubernetes CSI node plugin. Implements CSI Identity + Node services; delegates all cache work to the client daemon's agent over a Unix socket. |
+| `node-init` | `cmd/node-init/main.go` | Per-node disk bootstrap (`internal/nodeinit`). Init mode discovers the best local disk (media class via sysfs, free space, micro-benchmark), prepares `<mount>/fuse-cache`, and writes `node-init.json`; daemon mode keeps refreshing measured capacity. The client adopts the discovered dir/budget via `-node-init-config`/`-node-init-host-root`, making the DaemonSet cloud-agnostic. |
 
 ## CSI / Agent / Session Subsystem
 

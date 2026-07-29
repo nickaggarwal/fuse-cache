@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
 	fusefs "fuse-client/internal/fuse"
+	"fuse-client/internal/nodeinit"
 	pb "fuse-client/internal/pb"
 	"fuse-client/internal/session"
 
@@ -34,6 +36,9 @@ func main() {
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
 		fuseBackendName = flag.String("fuse-backend", "bazil", "FUSE backend: bazil or gofuse")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
+		nodeInitConfig  = flag.String("node-init-config", "", "Path to a node-init config file; when set and readable, its discovered cache dir and byte budget override -nvme/-nvme-max-gb")
+		nodeInitWaitSec = flag.Int("node-init-wait-sec", 30, "How long to wait for the node-init config file to appear before falling back to -nvme")
+		nodeInitRoot    = flag.String("node-init-host-root", "", "Prefix where the node's root filesystem is mounted in this container (e.g. /host); node-init cache dirs are host paths and get this prefix applied")
 		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator HTTP address")
 		coordinatorGRPC = flag.String("coordinator-grpc", "localhost:9080", "Coordinator gRPC address")
 		peerPort        = flag.Int("port", 8081, "Port for peer HTTP API server")
@@ -153,6 +158,22 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// node-init integration: when the init container / sidecar has discovered
+	// the best local disk, adopt its cache dir and byte budget so the same
+	// DaemonSet works on any cluster/cloud without per-node path tuning.
+	nvmeMaxBytes := int64(*nvmeMaxGB) * 1024 * 1024 * 1024
+	if *nodeInitConfig != "" {
+		if niCfg := waitForNodeInitConfig(*nodeInitConfig, time.Duration(*nodeInitWaitSec)*time.Second, logger); niCfg != nil {
+			resolved := filepath.Join(*nodeInitRoot, niCfg.CacheDir)
+			logger.Printf("node-init: using discovered cache dir %s (%s, budget %.1f GiB, score %.0f)",
+				resolved, niCfg.DiskClass, float64(niCfg.CacheBytes)/(1<<30), niCfg.Score)
+			*nvmePath = resolved
+			nvmeMaxBytes = niCfg.CacheBytes
+		} else {
+			logger.Printf("node-init: config %s not usable, falling back to -nvme=%s", *nodeInitConfig, *nvmePath)
+		}
+	}
+
 	// Create gRPC coordinator client
 	var coordClient coordinator.Coordinator
 	var grpcCoordClient *coordinator.GRPCCoordinatorClient
@@ -173,7 +194,7 @@ func main() {
 	// Create cache configuration
 	cacheConfig := &cache.CacheConfig{
 		NVMePath:                   *nvmePath,
-		MaxNVMeSize:                int64(*nvmeMaxGB) * 1024 * 1024 * 1024,
+		MaxNVMeSize:                nvmeMaxBytes,
 		MaxPeerSize:                int64(*peerMaxGB) * 1024 * 1024 * 1024,
 		PeerTimeout:                30 * time.Second,
 		CloudTimeout:               60 * time.Second,
@@ -592,6 +613,25 @@ func main() {
 	}
 
 	logger.Println("Client stopped")
+}
+
+// waitForNodeInitConfig polls for a readable, valid node-init config until
+// the deadline. The init-container ordering normally guarantees the file
+// exists before the client starts; the wait covers sidecar-only deployments
+// where node-init runs as a parallel container.
+func waitForNodeInitConfig(path string, wait time.Duration, logger *log.Logger) *nodeinit.Config {
+	deadline := time.Now().Add(wait)
+	for {
+		cfg, err := nodeinit.ReadConfig(path)
+		if err == nil {
+			return cfg
+		}
+		if time.Now().After(deadline) {
+			logger.Printf("node-init: giving up waiting for %s: %v", path, err)
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, cm cache.CacheManager, logger *log.Logger) {

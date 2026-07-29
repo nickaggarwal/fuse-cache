@@ -21,7 +21,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/coordinator cmd/coordinator/main.go && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/client cmd/client/main.go && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/csi-driver cmd/csi-driver/main.go
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/csi-driver cmd/csi-driver/main.go && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /bin/node-init cmd/node-init/main.go
 
 # Runtime stage
 FROM ubuntu:22.04
@@ -33,6 +34,7 @@ RUN apt-get update && \
 COPY --from=builder /bin/coordinator /usr/local/bin/coordinator
 COPY --from=builder /bin/client /usr/local/bin/client
 COPY --from=builder /bin/csi-driver /usr/local/bin/csi-driver
+COPY --from=builder /bin/node-init /usr/local/bin/node-init
 
 # Allow non-root FUSE mounts (used inside container)
 RUN echo "user_allow_other" >> /etc/fuse.conf

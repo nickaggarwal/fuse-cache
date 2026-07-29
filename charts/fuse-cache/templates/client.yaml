@@ -18,6 +18,42 @@ spec:
       nodeSelector:
         {{- toYaml .Values.client.nodeSelector | nindent 8 }}
       initContainers:
+        {{- if .Values.nodeInit.enabled }}
+        # Discovers the best local disk, prepares the cache dir on it, and
+        # writes the config the client adopts (cloud-agnostic deployment).
+        - name: node-init
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node-init"]
+          args:
+            - "-mode"
+            - "init"
+            - "-host-root"
+            - "{{ .Values.nodeInit.hostRootContainerPath }}"
+            - "-config"
+            - "{{ .Values.nodeInit.configPath }}"
+            - "-cache-subdir"
+            - "{{ .Values.nodeInit.cacheSubdir }}"
+            - "-min-free-gb"
+            - "{{ .Values.nodeInit.minFreeGB }}"
+            - "-cache-fraction"
+            - "{{ .Values.nodeInit.cacheFraction }}"
+            - "-max-cache-gb"
+            - "{{ .Values.nodeInit.maxCacheGB }}"
+            - "-benchmark={{ .Values.nodeInit.benchmark }}"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
+        {{- end }}
         - name: prepare-fuse-mount
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -54,6 +90,50 @@ spec:
               mountPath: {{ .Values.client.fuseRootContainerPath }}
               mountPropagation: Bidirectional
       containers:
+        {{- if and .Values.nodeInit.enabled .Values.nodeInit.daemonSidecar }}
+        # Sidecar: refreshes measured free space / cache budget in the
+        # node-init config; re-runs discovery if the cache dir vanishes.
+        - name: node-init-daemon
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node-init"]
+          args:
+            - "-mode"
+            - "daemon"
+            - "-host-root"
+            - "{{ .Values.nodeInit.hostRootContainerPath }}"
+            - "-config"
+            - "{{ .Values.nodeInit.configPath }}"
+            - "-cache-subdir"
+            - "{{ .Values.nodeInit.cacheSubdir }}"
+            - "-min-free-gb"
+            - "{{ .Values.nodeInit.minFreeGB }}"
+            - "-cache-fraction"
+            - "{{ .Values.nodeInit.cacheFraction }}"
+            - "-max-cache-gb"
+            - "{{ .Values.nodeInit.maxCacheGB }}"
+            - "-refresh-interval-sec"
+            - "{{ .Values.nodeInit.refreshIntervalSeconds }}"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+        {{- end }}
         - name: client
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -65,6 +145,12 @@ spec:
             - "$(NVME_CACHE_PATH)"
             - "-nvme-max-gb"
             - "$(FUSE_NVME_MAX_GB)"
+            {{- if .Values.nodeInit.enabled }}
+            - "-node-init-config"
+            - "{{ .Values.nodeInit.configPath }}"
+            - "-node-init-host-root"
+            - "{{ .Values.nodeInit.hostRootContainerPath }}"
+            {{- end }}
             - "-coordinator"
             - "$(COORDINATOR_ADDR)"
             - "-port"
@@ -130,6 +216,10 @@ spec:
               mountPath: /dev/fuse
             - name: nvme-storage
               mountPath: /mnt/nvme
+            {{- if .Values.nodeInit.enabled }}
+            - name: host-root
+              mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+            {{- end }}
             - name: fuse-mount
               mountPath: {{ .Values.client.fuseRootContainerPath }}
               mountPropagation: Bidirectional
@@ -163,6 +253,12 @@ spec:
         - name: fuse-device
           hostPath:
             path: {{ .Values.client.fuseDevicePath }}
+        {{- if .Values.nodeInit.enabled }}
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        {{- end }}
         - name: nvme-storage
           hostPath:
             path: {{ .Values.client.nvmeHostPath }}

@@ -5,6 +5,7 @@ BINARY_DIR := bin
 COORDINATOR_BINARY := $(BINARY_DIR)/coordinator
 CLIENT_BINARY := $(BINARY_DIR)/client
 CSI_BINARY := $(BINARY_DIR)/csi-driver
+NODE_INIT_BINARY := $(BINARY_DIR)/node-init
 PROTO_DIR := internal/proto
 GO_FILES := $(shell find . -name "*.go" -not -path "./vendor/*")
 
@@ -18,7 +19,7 @@ $(BINARY_DIR):
 
 # Build targets
 .PHONY: build
-build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY)
+build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY) $(NODE_INIT_BINARY)
 
 $(COORDINATOR_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(COORDINATOR_BINARY) cmd/coordinator/main.go
@@ -28,6 +29,9 @@ $(CLIENT_BINARY): $(BINARY_DIR) $(GO_FILES)
 
 $(CSI_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(CSI_BINARY) cmd/csi-driver/main.go
+
+$(NODE_INIT_BINARY): $(BINARY_DIR) $(GO_FILES)
+	go build -o $(NODE_INIT_BINARY) cmd/node-init/main.go
 
 # Install dependencies
 .PHONY: deps
