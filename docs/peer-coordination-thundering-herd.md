@@ -7,6 +7,19 @@ demand-driven replica reconciler, metrics). Remaining ideas: coordinator
 parent-assignment trees / Dragonfly integration. Grounded in the current
 codebase and in 3FS / Dragonfly patterns.
 
+**Defaults (perf-validated on 3×A100):** Phase 1 is **on by default** — it
+adds no measurable read-throughput cost and TH-1 validated it live
+(admission rejects under load, requesters fail over, all reads correct).
+Phase 2–3 (`-fetch-lease`, `-fast-chunk-advertise`,
+`-replica-reconcile-interval-sec`) are **opt-in / off by default**: they are
+thundering-herd optimizations that help many-reader workloads but add
+per-read cost on isolated reads (fast-advertise promotes every fetched
+chunk to NVMe, competing with the read; the fetch-lease follower-wait adds
+cold-read latency). Enable them for herd-prone deployments. Even bounded
+(promotion gate + NVMe pressure skip), fast-advertise did not reach
+single-read parity, so it ships off. The mechanisms remain fully
+implemented and unit-tested.
+
 ## Implemented (Phase 1)
 
 | Mechanism | Where |
