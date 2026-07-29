@@ -130,6 +130,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	// Peer operations
 	router.HandleFunc("/api/peer/read", h.handlePeerRead).Methods("GET")
 	router.HandleFunc("/api/peers", h.handlePeers).Methods("GET")
+	router.HandleFunc("/api/peers/latency", h.handlePeerLatency).Methods("GET")
 	router.HandleFunc("/api/peers/{peerID}", h.handlePeer).Methods("GET")
 	router.HandleFunc("/api/peers/{peerID}/heartbeat", h.handleHeartbeat).Methods("POST")
 
@@ -349,6 +350,26 @@ func (h *Handler) handlePeers(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(peers)
+}
+
+// handlePeerLatency reports this node's observed per-peer latency table
+// (EWMA from real transfers), the metadata the peer read path uses to order
+// traversal.
+func (h *Handler) handlePeerLatency(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "peer latency not supported", http.StatusNotImplemented)
+		return
+	}
+	pairs := dcm.PeerPairLatencies()
+	if pairs == nil {
+		pairs = []cache.PeerPairLatency{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"peer_id": h.peerID,
+		"pairs":   pairs,
+	})
 }
 
 // handlePeer handles requests for specific peer info
@@ -780,6 +801,25 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 		peerPrimary = 1
 	}
 	fmt.Fprintf(w, "fuse_tier_adaptive_primary_is_peer %d\n", peerPrimary)
+
+	// Peer-serve admission control / thundering-herd counters.
+	pl := dcm.PeerLoadSnapshot()
+	fmt.Fprintf(w, "fuse_peer_serve_inflight %d\n", pl.ServeInflight)
+	fmt.Fprintf(w, "fuse_peer_serve_capacity %d\n", pl.ServeCapacity)
+	fmt.Fprintf(w, "fuse_peer_serve_accepted_total %d\n", pl.ServeAcceptedTotal)
+	fmt.Fprintf(w, "fuse_peer_serve_rejected_total %d\n", pl.ServeRejectedTotal)
+	fmt.Fprintf(w, "fuse_peer_fetch_busy_skips_total %d\n", pl.FetchBusySkips)
+	fmt.Fprintf(w, "fuse_peer_fetch_jitter_retries_total %d\n", pl.FetchJitterRetries)
+	fmt.Fprintf(w, "fuse_peer_replication_busy_skips_total %d\n", pl.ReplicationBusySkips)
+	fmt.Fprintf(w, "fuse_peer_replication_staggers_total %d\n", pl.ReplicationStaggers)
+
+	// Observed pairwise latency (this node → each peer), used for traversal
+	// ordering on the peer read path.
+	for _, pair := range dcm.PeerPairLatencies() {
+		fmt.Fprintf(w, "fuse_peer_pair_latency_ms{peer=%q} %.3f\n", pair.PeerID, pair.LatencyMs)
+		fmt.Fprintf(w, "fuse_peer_pair_success_ratio{peer=%q} %.4f\n", pair.PeerID, pair.Success)
+		fmt.Fprintf(w, "fuse_peer_pair_samples_total{peer=%q} %d\n", pair.PeerID, pair.Samples)
+	}
 
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)

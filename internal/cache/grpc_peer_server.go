@@ -10,6 +10,9 @@ import (
 	"time"
 
 	pb "fuse-client/internal/pb"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const grpcChunkSize = 24 * 1024 * 1024 // 24MiB streaming chunks
@@ -49,8 +52,29 @@ func NewPeerGRPCServer(cm CacheManager) *PeerGRPCServer {
 	return &PeerGRPCServer{cacheManager: cm}
 }
 
+// errPeerServeBusy is returned when serve-side admission control rejects a
+// peer request. RESOURCE_EXHAUSTED tells the requester to fail over to another
+// holder and retry this node only after jitter (thundering-herd Phase 1).
+var errPeerServeBusy = status.Error(codes.ResourceExhausted, "peer serve capacity exhausted")
+
+// admitPeerServe consults the cache manager's serve gate, if it has one.
+// Managers without a gate admit everything (nil release func is never
+// returned; ok=true always pairs with a callable release).
+func (s *PeerGRPCServer) admitPeerServe() (release func(), ok bool) {
+	if admitter, hasGate := s.cacheManager.(PeerServeAdmitter); hasGate {
+		return admitter.TryAcquirePeerServe()
+	}
+	return func() {}, true
+}
+
 // ReadFile streams file data in fixed-size chunks.
 func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService_ReadFileServer) error {
+	release, ok := s.admitPeerServe()
+	if !ok {
+		return errPeerServeBusy
+	}
+	defer release()
+
 	if resolver, ok := s.cacheManager.(localPathResolver); ok {
 		if localPath, ok := resolver.LocalFilePath(stream.Context(), req.Path); ok {
 			if err := streamLocalFile(localPath, stream); err == nil {
@@ -163,6 +187,12 @@ func streamLocalFileRange(localPath string, offset, length int64, stream pb.Peer
 
 // WriteFile receives metadata + data chunks via client streaming.
 func (s *PeerGRPCServer) WriteFile(stream pb.PeerService_WriteFileServer) error {
+	release, ok := s.admitPeerServe()
+	if !ok {
+		return errPeerServeBusy
+	}
+	defer release()
+
 	// First message must contain metadata
 	first, err := stream.Recv()
 	if err != nil {

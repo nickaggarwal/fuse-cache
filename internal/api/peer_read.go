@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+
+	"fuse-client/internal/cache"
 )
 
 // localChunkServer is implemented by the cache manager to resolve a request
@@ -22,6 +24,19 @@ type localChunkServer interface {
 // server use sendfile(2) (zero-copy file->socket) on the plain in-cluster
 // connection. It runs under the normal auth middleware (X-API-Key when set).
 func (h *Handler) handlePeerRead(w http.ResponseWriter, r *http.Request) {
+	// Serve-side admission control: shed load with 503 when the peer-serve
+	// gate is full so requesters fail over to another holder (or retry with
+	// jitter) instead of queueing on a saturated source.
+	if admitter, ok := h.cacheManager.(cache.PeerServeAdmitter); ok {
+		release, admitted := admitter.TryAcquirePeerServe()
+		if !admitted {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "peer serve capacity exhausted", http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
+	}
+
 	rawPath := r.URL.Query().Get("path")
 	if rawPath == "" {
 		http.Error(w, "path query parameter required", http.StatusBadRequest)

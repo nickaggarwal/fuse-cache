@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -14,13 +15,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fuse-client/internal/coordinator"
 	pb "fuse-client/internal/pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -52,6 +56,45 @@ type PeerStorage struct {
 	rawTransport        bool
 	apiKey              string
 	httpClient          *http.Client
+
+	// replicationStagger is the base jittered delay between successive replica
+	// writes of one object; 0 uses the default.
+	replicationStagger time.Duration
+
+	// pairLatency tracks observed this-node→peer latency/success EWMAs from
+	// real transfers; traversal prefers measured-close peers over the
+	// coordinator's single-target probe estimates.
+	pairLatency *peerLatencyTracker
+
+	// Thundering-herd control counters (exposed via PeerLoadSnapshot).
+	busySkipsTotal     atomic.Int64
+	jitterRetriesTotal atomic.Int64
+	replBusySkipsTotal atomic.Int64
+	replStaggersTotal  atomic.Int64
+}
+
+// peerBusyError marks a "source is at capacity" rejection (gRPC
+// RESOURCE_EXHAUSTED or raw HTTP 503) as distinct from a miss or a failure:
+// the holder has the data but is shedding load, so the right reaction is to
+// fail over to another holder and retry this one only after jitter.
+type peerBusyError struct {
+	addr string
+}
+
+func (e *peerBusyError) Error() string {
+	return fmt.Sprintf("peer %s busy (serve capacity exhausted)", e.addr)
+}
+
+// isPeerBusy reports whether err is a serve-side admission rejection.
+func isPeerBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var busy *peerBusyError
+	if errors.As(err, &busy) {
+		return true
+	}
+	return status.Code(err) == codes.ResourceExhausted
 }
 
 type fileHintCacheEntry struct {
@@ -79,6 +122,7 @@ func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localP
 		fileHintsTTL:        5 * time.Second,
 		rawTransport:        rawTransport,
 		apiKey:              apiKey,
+		pairLatency:         newPeerLatencyTracker(),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConns:          256,
@@ -225,24 +269,63 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if ps.sortByNetwork {
 		sortPeersByNetwork(candidates, path)
 	}
+	// Observed pairwise latency beats the coordinator's single-target probe:
+	// once real transfer samples exist, traverse measured-closest peers first.
+	ps.sortByObservedLatency(candidates, path)
 
 	var lastErr error
+	var busyPeers []*coordinator.PeerInfo
+	// sequentialStart is the first candidate the sequential loop below should
+	// try. Only candidates already attempted by the parallel fan-out are
+	// skipped; with fanout <= 1 no one has been tried yet, so start at 0.
+	// (Starting at parallelFanout unconditionally silently skipped the best
+	// candidate for every non-fanout read, and all peers when only one
+	// candidate existed.)
+	sequentialStart := 0
 	parallelFanout := peerReadParallelFanout(path, len(candidates), ps.parallelFanout)
 	if parallelFanout > 1 {
 		if data, err := ps.readFromPeersParallel(ctx, path, candidates[:parallelFanout]); err == nil {
 			return data, nil
 		} else {
+			if isPeerBusy(err) {
+				ps.busySkipsTotal.Add(1)
+				busyPeers = append(busyPeers, candidates[:parallelFanout]...)
+			}
 			lastErr = err
 		}
+		sequentialStart = parallelFanout
 	}
 
-	for i := parallelFanout; i < len(candidates); i++ {
+	for i := sequentialStart; i < len(candidates); i++ {
 		peer := candidates[i]
 		data, err := ps.readPeerData(ctx, peer, path)
 		if err == nil {
 			return data, nil
 		}
+		// A busy holder has the data but is shedding load: move on to the next
+		// candidate immediately and remember this one for a jittered retry.
+		if isPeerBusy(err) {
+			ps.busySkipsTotal.Add(1)
+			busyPeers = append(busyPeers, peer)
+		}
 		lastErr = err
+	}
+
+	// All non-busy candidates failed. If some holders were merely busy, retry
+	// them once after randomized jitter — the spread de-synchronizes the herd
+	// so the source drains instead of absorbing synchronized retries.
+	if len(busyPeers) > 0 && ctx.Err() == nil {
+		ps.jitterRetriesTotal.Add(1)
+		if err := sleepWithJitter(ctx, peerBusyRetryMinWait, peerBusyRetryMaxWait); err != nil {
+			return nil, lastErr
+		}
+		for _, peer := range busyPeers {
+			data, err := ps.readPeerData(ctx, peer, path)
+			if err == nil {
+				return data, nil
+			}
+			lastErr = err
+		}
 	}
 
 	if lastErr != nil {
@@ -521,13 +604,22 @@ func (ps *PeerStorage) startGC(ctx context.Context) {
 }
 
 // Write writes a file to peer storage with replication.
+//
+// Thundering-herd control (Phase 1/2 of the plan): replica targets are chosen
+// by headroom (available space + network score) instead of a pure random
+// shuffle, successive replica RPCs are staggered with jitter so write-time
+// replication does not itself stampede the network, and targets that signal
+// busy (serve-side admission control) are skipped rather than retried.
 func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) error {
 	peers, err := ps.getPeers(ctx)
 	if err != nil {
 		return err
 	}
 
+	// Shuffle first so equally-scored peers get load spread across objects,
+	// then prefer targets with more headroom.
 	cryptoShuffle(peers)
+	sortPeersByReplicationScore(peers)
 
 	successCount := 0
 	var lastErr error
@@ -539,8 +631,25 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 		if peer.Status != "active" || peer.GRPCAddress == "" {
 			continue
 		}
+		// Stagger replicas after the first so one write does not burst
+		// minReplicationCount transfers onto the network at the same instant.
+		if successCount > 0 {
+			stagger := ps.replicationStagger
+			if stagger <= 0 {
+				stagger = defaultPeerReplicationStagger
+			}
+			ps.replStaggersTotal.Add(1)
+			if err := sleepWithJitter(ctx, stagger/2, stagger*3/2); err != nil {
+				break // context cancelled; keep what we have
+			}
+		}
 		if err := ps.writeToPeer(ctx, peer.GRPCAddress, path, data); err == nil {
 			successCount++
+		} else if isPeerBusy(err) {
+			// Busy target: skip it (replication is best-effort; the reconciler
+			// or read-promotion will top up replicas later).
+			ps.replBusySkipsTotal.Add(1)
+			lastErr = err
 		} else {
 			lastErr = err
 		}
@@ -638,6 +747,34 @@ func (ps *PeerStorage) Close() {
 	ps.readConnMu.Unlock()
 }
 
+// sortPeersByReplicationScore orders replica targets by headroom, best first:
+// available space weighted by network score. Peers without probe/space data
+// keep a neutral score, so with no signals the pre-existing random shuffle
+// order is preserved (sort is stable).
+func sortPeersByReplicationScore(peers []*coordinator.PeerInfo) {
+	if len(peers) <= 1 {
+		return
+	}
+	sort.SliceStable(peers, func(i, j int) bool {
+		return peerReplicationScore(peers[i]) > peerReplicationScore(peers[j])
+	})
+}
+
+// peerReplicationScore is a higher-is-better headroom score for choosing
+// write-replication targets.
+func peerReplicationScore(peer *coordinator.PeerInfo) float64 {
+	if peer == nil {
+		return -1
+	}
+	// Normalize available space to GiB so it composes with the network score
+	// on comparable magnitudes; unknown space gets a neutral 1.0.
+	spaceGiB := 1.0
+	if peer.AvailableSpace > 0 {
+		spaceGiB = float64(peer.AvailableSpace) / (1 << 30)
+	}
+	return spaceGiB * peerSortScore(peer)
+}
+
 // cryptoShuffle performs a Fisher-Yates shuffle using crypto/rand.
 func cryptoShuffle(peers []*coordinator.PeerInfo) {
 	for i := len(peers) - 1; i > 0; i-- {
@@ -697,13 +834,31 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 
 // readPeerData reads a path from one peer, preferring the raw HTTP transport
 // (with sendfile on the serving side) when enabled, and falling back to the
-// gRPC path on any raw error.
+// gRPC path on any raw error. Every completed attempt (success or failure)
+// feeds the pairwise latency tracker; busy rejections do not, since they are
+// admission control rather than network signal.
 func (ps *PeerStorage) readPeerData(ctx context.Context, peer *coordinator.PeerInfo, path string) ([]byte, error) {
+	start := time.Now()
+	data, err := ps.readPeerDataInner(ctx, peer, path)
+	if peer != nil && !isPeerBusy(err) && ctx.Err() == nil {
+		ps.pairLatency.record(peer.ID, time.Since(start), err == nil)
+	}
+	return data, err
+}
+
+func (ps *PeerStorage) readPeerDataInner(ctx context.Context, peer *coordinator.PeerInfo, path string) ([]byte, error) {
 	if ps.rawTransport && peer != nil && peer.Address != "" {
-		if data, err := ps.readFromPeerRaw(ctx, peer.Address, path); err == nil {
+		data, err := ps.readFromPeerRaw(ctx, peer.Address, path)
+		if err == nil {
 			return data, nil
 		}
-		// Fall through to gRPC on any raw-transport error.
+		// Busy means the node is shedding load via admission control; retrying
+		// the same node over gRPC would just hit the same full gate. Surface it
+		// so the caller fails over to another holder.
+		if isPeerBusy(err) {
+			return nil, err
+		}
+		// Fall through to gRPC on any other raw-transport error.
 	}
 	return ps.readFromPeer(ctx, peer.GRPCAddress, path)
 }
@@ -735,6 +890,9 @@ func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path strin
 		resp.Body.Close()
 	}()
 
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, &peerBusyError{addr: httpAddr}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("peer raw read %s: status %d", httpAddr, resp.StatusCode)
 	}
@@ -809,6 +967,12 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) 
 		return data, nil
 	}
 	if ctx.Err() != nil {
+		return nil, err
+	}
+	// Admission-control rejection: the connection is healthy, the peer is just
+	// shedding load. Do not evict/reconnect-retry — surface busy to the caller
+	// so it fails over to another holder.
+	if isPeerBusy(err) {
 		return nil, err
 	}
 

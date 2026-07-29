@@ -208,6 +208,17 @@ type CacheConfig struct {
 	// when the client API is key-protected.
 	APIKey string
 
+	// PeerServeMaxInflight bounds concurrent peer serves (gRPC + raw HTTP) on
+	// this node. Beyond the cap, requests are rejected with a "busy" signal so
+	// requesters fail over or retry with jitter instead of piling up
+	// (thundering-herd Phase 1 admission control). <=0 uses the default.
+	PeerServeMaxInflight int
+
+	// PeerReplicationStagger is the base delay inserted between successive
+	// replica writes of one object (jittered). <=0 uses the default; it can be
+	// effectively disabled by setting a tiny value like 1ns.
+	PeerReplicationStagger time.Duration
+
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
@@ -232,6 +243,7 @@ type DefaultCacheManager struct {
 	hybridHints    map[string]hybridReadHint
 	chunkFetches   map[string]*chunkFetchState
 	hedgeLimiter   chan struct{}
+	peerServeGate  *peerServeGate
 	tierPerf       *tierPerfTracker
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -389,6 +401,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		hybridHints:    make(map[string]hybridReadHint),
 		chunkFetches:   make(map[string]*chunkFetchState),
 		hedgeLimiter:   make(chan struct{}, config.HybridMaxSecondaryInflight),
+		peerServeGate:  newPeerServeGate(config.PeerServeMaxInflight),
 		tierPerf:       newTierPerfTracker(),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
@@ -405,6 +418,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		var ps *PeerStorage
 		ps, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout, config.PeerRawTransport, config.APIKey)
 		if err == nil {
+			ps.replicationStagger = config.PeerReplicationStagger
 			ps.startGC(shutdownCtx)
 			cm.peerStorage = ps
 		}

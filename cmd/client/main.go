@@ -84,6 +84,8 @@ func main() {
 		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
 		adaptiveRemoteRead   = flag.Bool("adaptive-remote-read", true, "Choose peer vs cloud read order and hedging from measured per-tier latency/success instead of a static peer-first policy")
 		peerRawTransport     = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
+		peerServeMaxIn       = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
+		peerReplStaggerMS    = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -188,6 +190,8 @@ func main() {
 		AdaptiveRemoteRead:         *adaptiveRemoteRead,
 		PeerRawTransport:           *peerRawTransport,
 		APIKey:                     *apiKey,
+		PeerServeMaxInflight:       *peerServeMaxIn,
+		PeerReplicationStagger:     time.Duration(*peerReplStaggerMS) * time.Millisecond,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
