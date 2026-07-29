@@ -33,7 +33,7 @@ const (
 	// throughput. With a small non-blocking gate, a read's chunk burst
 	// promotes only a few chunks and skips the rest (a partial holder is fine:
 	// readers try all peers), while an idle node still fills up over time.
-	chunkPromoteMaxConcurrent = 4
+	chunkPromoteMaxConcurrent = 2
 )
 
 // chunkAdvertiser dedupes per-parent holder advertisements.
@@ -150,6 +150,14 @@ func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath st
 		select {
 		case cm.chunkPromoteGate <- struct{}{}:
 		default:
+			return
+		}
+		// Pressure skip: promotion writes to NVMe under cm.mu and, above the
+		// 90% eviction watermark, triggers a full-entry eviction scan that
+		// blocks the read path's RLocks. Never let a foreground read pay that —
+		// skip promotion once NVMe is busy and let existing holders serve.
+		if used, capacity := cm.Stats(); capacity > 0 && used > capacity*8/10 {
+			<-cm.chunkPromoteGate
 			return
 		}
 	}
