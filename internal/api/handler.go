@@ -813,6 +813,19 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_peer_replication_busy_skips_total %d\n", pl.ReplicationBusySkips)
 	fmt.Fprintf(w, "fuse_peer_replication_staggers_total %d\n", pl.ReplicationStaggers)
 
+	// Cross-node single-flight (fetch leases), fast chunk advertisement, and
+	// replica reconciler counters (thundering-herd Phases 2-3).
+	hc := dcm.HerdControlSnapshot()
+	fmt.Fprintf(w, "fuse_fetch_lease_granted_total %d\n", hc.LeaseGrantedTotal)
+	fmt.Fprintf(w, "fuse_fetch_lease_denied_total %d\n", hc.LeaseDeniedTotal)
+	fmt.Fprintf(w, "fuse_fetch_lease_errors_total %d\n", hc.LeaseErrorsTotal)
+	fmt.Fprintf(w, "fuse_fetch_lease_follower_peer_hits_total %d\n", hc.FollowerPeerHitsTotal)
+	fmt.Fprintf(w, "fuse_fetch_lease_follower_cloud_fallback_total %d\n", hc.FollowerCloudFallbackTotal)
+	fmt.Fprintf(w, "fuse_chunk_advertise_published_total %d\n", hc.AdvertisePublishedTotal)
+	fmt.Fprintf(w, "fuse_replica_reconcile_runs_total %d\n", hc.ReconcileRunsTotal)
+	fmt.Fprintf(w, "fuse_replica_reconcile_replications_total %d\n", hc.ReconcileReplicationsTotal)
+	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
+
 	// Observed pairwise latency (this node → each peer), used for traversal
 	// ordering on the peer read path.
 	for _, pair := range dcm.PeerPairLatencies() {

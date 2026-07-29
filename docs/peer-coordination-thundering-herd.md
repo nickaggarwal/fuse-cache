@@ -1,9 +1,11 @@
 # Peer Coordination & Thundering-Herd Control (Write / Replication Path)
 
-Status: **Phase 1 implemented** (serve-side admission control, busy failover +
-jittered retry, staggered capacity-aware replication, pairwise latency
-metadata, metrics). Phases 2–3 remain planned. Grounded in the current codebase
-and in 3FS / Dragonfly patterns.
+Status: **Phases 1–3 implemented** (serve-side admission control, busy
+failover + jittered retry, staggered capacity-aware replication, pairwise
+latency metadata, cross-node fetch leases, fast chunk advertisement,
+demand-driven replica reconciler, metrics). Remaining ideas: coordinator
+parent-assignment trees / Dragonfly integration. Grounded in the current
+codebase and in 3FS / Dragonfly patterns.
 
 ## Implemented (Phase 1)
 
@@ -15,6 +17,28 @@ and in 3FS / Dragonfly patterns.
 | Staggered, capacity-aware replication: headroom-scored targets (space × network score) on top of the crypto shuffle, jittered stagger between replica RPCs (`-peer-replication-stagger-ms`), busy targets skipped | `PeerStorage.Write`, `sortPeersByReplicationScore` |
 | **Pairwise latency metadata**: EWMA of observed this-node→peer latency/success from real transfers, used to order traversal once ≥3 samples exist (beats the coordinator's single-target probe); exposed at `/api/peers/latency` and as `fuse_peer_pair_*` metrics | `internal/cache/peer_latency.go` |
 | Metrics: `fuse_peer_serve_inflight/capacity/accepted_total/rejected_total`, `fuse_peer_fetch_busy_skips_total`, `fuse_peer_fetch_jitter_retries_total`, `fuse_peer_replication_busy_skips_total/staggers_total`, `fuse_peer_pair_latency_ms/success_ratio/samples_total` | `internal/api/handler.go` `/metrics` |
+
+## Implemented (Phase 2)
+
+| Mechanism | Where |
+|---|---|
+| **In-flight fetch leases** (cross-node single-flight for origin pulls): `FetchLeaser` capability on the coordinator, `InMemoryStore` TTL map + `EtcdStore` `/fuse/inflight/<key>` create-if-absent Txn with etcd lease expiry; HTTP `/api/fetch-lease` (POST acquire/renew, DELETE release) on both coordinator clients | `internal/coordinator/fetch_lease*.go`, `cmd/coordinator/main.go` |
+| Lease-gated cloud reads: ordered (non-hedged) remote fallbacks call `getFromCloudLeased` — the lease winner pulls origin and releases; losers wait 100–400 ms jitter, read the **peer tier** (leader has it by then), and only fall back to cloud if that misses. Advisory: any coordinator error degrades to a plain cloud read (`-fetch-lease`, default on) | `internal/cache/origin_lease.go`, `readChunkDataFromTiers` / `Get` in `cache.go` |
+| Staggered capacity-aware write replication (originally slated Phase 2) | shipped in Phase 1 (`PeerStorage.Write`) |
+
+## Implemented (Phase 3)
+
+| Mechanism | Where |
+|---|---|
+| **Fast holder advertisement**: a chunk fetched from any remote tier is promoted to local NVMe (making it servable via `GetLocal`/`LocalChunkFile`) and this node publishes itself as a holder of the parent the moment the *first* chunk lands — not after the whole object — so later requesters pull from the growing swarm. Publications are coalesced to one per parent per 5 s to protect the coordinator (`-fast-chunk-advertise`, default on) | `internal/cache/chunk_advertise.go` |
+| **Demand-driven replica reconciler**: background loop (`-replica-reconcile-interval-sec`, default 60 s) compares `R_desired` (`-replica-reconcile-target`, default = min replicas 3) against the coordinator holder set for hot local objects (accessed within 10 min, ≤64 MiB), tops up the deficit via staggered busy-aware `ReplicateTo`, capped per pass (`-replica-reconcile-max-per-run`, default 8); a busy cluster aborts the whole pass. Cold-object decay is delegated to LRU eviction (every replica is cloud-backed) | `internal/cache/replica_reconciler.go`, `PeerStorage.ReplicateTo` |
+| Metrics: `fuse_fetch_lease_granted/denied/errors_total`, `fuse_fetch_lease_follower_peer_hits/cloud_fallback_total`, `fuse_chunk_advertise_published_total`, `fuse_replica_reconcile_runs/replications/skipped_busy_total` | `internal/api/handler.go` `/metrics` |
+
+Not built (deliberately): coordinator parent-assignment trees — the lease +
+fast-advertise + existing multi-peer striping already yields swarm-style
+spread; revisit only if origin fan-out is still observed at scale. Dragonfly
+integration remains an alternative if the in-cluster deployment should own
+bulk P2P distribution instead.
 
 ## Problem
 

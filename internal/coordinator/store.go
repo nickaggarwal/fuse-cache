@@ -44,6 +44,11 @@ type InMemoryStore struct {
 	mu            sync.RWMutex
 	peers         map[string]*PeerInfo
 	fileLocations map[string][]*FileLocation
+
+	// In-flight fetch leases (see fetch_lease.go). Separate mutex: lease churn
+	// is hot and short-TTL and must not contend with metadata reads.
+	fetchLeaseMu sync.Mutex
+	fetchLeases  map[string]memFetchLease
 }
 
 func NewInMemoryStore() *InMemoryStore {

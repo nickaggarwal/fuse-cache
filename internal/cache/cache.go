@@ -219,6 +219,32 @@ type CacheConfig struct {
 	// effectively disabled by setting a tiny value like 1ns.
 	PeerReplicationStagger time.Duration
 
+	// FetchLeaseEnabled turns on cross-node single-flight for origin (cloud)
+	// pulls: a short-TTL coordinator lease per key collapses N simultaneous
+	// cloud fetches of one hot object into ~1 (thundering-herd Phase 2).
+	// Advisory — coordinator errors degrade to plain cloud reads.
+	FetchLeaseEnabled bool
+
+	// FastChunkAdvertise publishes this node as a holder of each chunk the
+	// moment the chunk lands on local NVMe after a remote fetch, instead of
+	// only after whole-object operations. Later requesters then pull from the
+	// growing swarm rather than origin (thundering-herd Phase 3).
+	FastChunkAdvertise bool
+
+	// ReplicaReconcileInterval enables the steady-state replica reconciler
+	// when > 0: a background loop that tops up under-replicated hot objects
+	// this node holds, staggered and respecting peer busy signals
+	// (thundering-herd Phase 3). 0 disables the loop.
+	ReplicaReconcileInterval time.Duration
+
+	// ReplicaReconcileTarget is the replica count the reconciler aims for.
+	// <=0 uses MinPeerReplicas (default 3).
+	ReplicaReconcileTarget int
+
+	// ReplicaReconcileMaxPerRun caps replication operations per reconciler
+	// pass so reconciliation itself cannot stampede. <=0 uses a default.
+	ReplicaReconcileMaxPerRun int
+
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
@@ -244,6 +270,8 @@ type DefaultCacheManager struct {
 	chunkFetches   map[string]*chunkFetchState
 	hedgeLimiter   chan struct{}
 	peerServeGate  *peerServeGate
+	herdStats      herdControlStats
+	chunkAds       *chunkAdvertiser
 	tierPerf       *tierPerfTracker
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -402,6 +430,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		chunkFetches:   make(map[string]*chunkFetchState),
 		hedgeLimiter:   make(chan struct{}, config.HybridMaxSecondaryInflight),
 		peerServeGate:  newPeerServeGate(config.PeerServeMaxInflight),
+		chunkAds:       newChunkAdvertiser(),
 		tierPerf:       newTierPerfTracker(),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
@@ -465,6 +494,11 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	// Steady-state replica reconciler (thundering-herd Phase 3).
+	if config.ReplicaReconcileInterval > 0 {
+		cm.startReplicaReconciler(shutdownCtx)
 	}
 
 	// Background GC for hybridHints — prevents unbounded growth.
@@ -560,12 +594,13 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 
 	// Remote read strategy:
 	// - always peer first, then cloud fallback.
+	// Cloud reads take the cross-node single-flight lease (Phase 2).
 	for _, tier := range cm.remoteReadOrder(filePath) {
 		tierStart := time.Now()
-		if entry, err := cm.getFromTier(ctx, filePath, tier); err == nil {
+		if entry, servedTier, err := cm.getFromRemoteTier(ctx, filePath, tier); err == nil {
 			cm.touchEntries(filePath)
-			cm.metrics.RecordHit(tier)
-			cm.metrics.RecordTierRead(tier, int64(len(entry.Data)), time.Since(tierStart))
+			cm.metrics.RecordHit(servedTier)
+			cm.metrics.RecordTierRead(servedTier, int64(len(entry.Data)), time.Since(tierStart))
 			e := entry
 			cm.goBackground(func() { cm.promoteToNVMe(context.Background(), e) })
 			return entry, nil
@@ -2601,6 +2636,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 			cm.recordTierPerf(tier, tierDur, true)
 			chunkData := chunkEntry.Data
 			cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, tier)
+			cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, tier, chunkData)
 			cm.touchEntries(filePath, chunkPath)
 			cm.traceChunkAttempt(chunkPath, chunkIndex, tier, hybridStart, nil)
 			cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
@@ -2611,18 +2647,24 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		// If hybrid path fails, continue with strict ordered fallback below.
 	}
 
+	// Ordered fallback reads go through getFromRemoteTier so cloud pulls take
+	// the cross-node single-flight lease (Phase 2): a herd of nodes missing
+	// the same chunk collapses to ~one origin pull; the rest pick it up from
+	// the leader via the peer tier. servedTier is where the data actually came
+	// from (a lease follower asked for cloud but got peer).
 	tierStart = time.Now()
-	if chunkEntry, err := cm.getFromTier(ctx, chunkPath, primary); err == nil {
+	if chunkEntry, servedTier, err := cm.getFromRemoteTier(ctx, chunkPath, primary); err == nil {
 		tierDur := time.Since(tierStart)
-		cm.metrics.RecordHit(primary)
-		cm.metrics.RecordTierRead(primary, int64(len(chunkEntry.Data)), tierDur)
-		cm.recordTierPerf(primary, tierDur, true)
+		cm.metrics.RecordHit(servedTier)
+		cm.metrics.RecordTierRead(servedTier, int64(len(chunkEntry.Data)), tierDur)
+		cm.recordTierPerf(servedTier, tierDur, true)
 		chunkData := chunkEntry.Data
-		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, primary)
+		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, servedTier)
+		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, servedTier, chunkData)
 		cm.touchEntries(filePath, chunkPath)
-		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, nil)
+		cm.traceChunkAttempt(chunkPath, chunkIndex, servedTier, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-		return chunkData, primary, nil
+		return chunkData, servedTier, nil
 	} else {
 		cm.recordTierPerf(primary, time.Since(tierStart), false)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, err)
@@ -2630,17 +2672,18 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	cm.metrics.RecordMiss(primary)
 
 	tierStart = time.Now()
-	if chunkEntry, err := cm.getFromTier(ctx, chunkPath, secondary); err == nil {
+	if chunkEntry, servedTier, err := cm.getFromRemoteTier(ctx, chunkPath, secondary); err == nil {
 		tierDur := time.Since(tierStart)
-		cm.metrics.RecordHit(secondary)
-		cm.metrics.RecordTierRead(secondary, int64(len(chunkEntry.Data)), tierDur)
-		cm.recordTierPerf(secondary, tierDur, true)
+		cm.metrics.RecordHit(servedTier)
+		cm.metrics.RecordTierRead(servedTier, int64(len(chunkEntry.Data)), tierDur)
+		cm.recordTierPerf(servedTier, tierDur, true)
 		chunkData := chunkEntry.Data
-		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, secondary)
+		cm.setChunkInRangeCache(filePath, chunkIndex, chunkData, servedTier)
+		cm.maybeAdvertiseFetchedChunk(filePath, chunkPath, chunkIndex, servedTier, chunkData)
 		cm.touchEntries(filePath, chunkPath)
-		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, nil)
+		cm.traceChunkAttempt(chunkPath, chunkIndex, servedTier, tierStart, nil)
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
-		return chunkData, secondary, nil
+		return chunkData, servedTier, nil
 	} else {
 		cm.recordTierPerf(secondary, time.Since(tierStart), false)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, err)

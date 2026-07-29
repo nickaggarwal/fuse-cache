@@ -328,6 +328,44 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		w.Write([]byte(`{"success": true}`))
 	})
 
+	// In-flight fetch leases: cross-node single-flight for origin pulls
+	// (thundering-herd Phase 2). POST acquires/renews, DELETE releases.
+	mux.HandleFunc("/api/fetch-lease", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Key        string `json:"key"`
+			PeerID     string `json:"peer_id"`
+			TTLSeconds int64  `json:"ttl_seconds,omitempty"`
+		}
+		if err := parseJSONRequest(r, &request); err != nil || request.Key == "" || request.PeerID == "" {
+			http.Error(w, "key and peer_id are required", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			ttl := time.Duration(request.TTLSeconds) * time.Second
+			holder, granted, err := coordinatorService.AcquireFetchLease(r.Context(), request.Key, request.PeerID, ttl)
+			if err != nil {
+				http.Error(w, "Failed to acquire fetch lease", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"holder":  holder,
+				"granted": granted,
+			})
+		case http.MethodDelete:
+			if err := coordinatorService.ReleaseFetchLease(r.Context(), request.Key, request.PeerID); err != nil {
+				http.Error(w, "Failed to release fetch lease", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"success": true}`))
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// File location endpoint (GET and PUT)
 	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

@@ -86,6 +86,11 @@ func main() {
 		peerRawTransport     = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
 		peerServeMaxIn       = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
 		peerReplStaggerMS    = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
+		fetchLeaseEnabled    = flag.Bool("fetch-lease", true, "Take a short-TTL coordinator lease before cloud pulls so simultaneous misses of one object collapse to a single origin fetch (thundering-herd Phase 2)")
+		fastChunkAdvertise   = flag.Bool("fast-chunk-advertise", true, "Publish this node as a holder the moment the first remotely-fetched chunk lands on NVMe, so later readers pull from the growing swarm (thundering-herd Phase 3)")
+		reconcileIntervalSec = flag.Int("replica-reconcile-interval-sec", 60, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3)")
+		reconcileTarget      = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
+		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -192,6 +197,11 @@ func main() {
 		APIKey:                     *apiKey,
 		PeerServeMaxInflight:       *peerServeMaxIn,
 		PeerReplicationStagger:     time.Duration(*peerReplStaggerMS) * time.Millisecond,
+		FetchLeaseEnabled:          *fetchLeaseEnabled,
+		FastChunkAdvertise:         *fastChunkAdvertise,
+		ReplicaReconcileInterval:   time.Duration(*reconcileIntervalSec) * time.Second,
+		ReplicaReconcileTarget:     *reconcileTarget,
+		ReplicaReconcileMaxPerRun:  *reconcileMaxPerRun,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,

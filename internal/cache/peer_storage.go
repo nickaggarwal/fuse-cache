@@ -669,6 +669,64 @@ func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) erro
 	return fmt.Errorf("no active peers available")
 }
 
+// ReplicateTo writes path to up to count additional peers, excluding the IDs
+// in exclude (peers that already hold the object). Targets are chosen by
+// headroom score, RPCs are staggered with jitter, and busy targets are
+// skipped — the replica top-up used by the Phase 3 reconciler must never
+// itself stampede. Returns how many replicas were written.
+func (ps *PeerStorage) ReplicateTo(ctx context.Context, path string, data []byte, exclude map[string]struct{}, count int) (int, error) {
+	if count <= 0 {
+		return 0, nil
+	}
+	peers, err := ps.getPeers(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	candidates := make([]*coordinator.PeerInfo, 0, len(peers))
+	for _, peer := range peers {
+		if peer == nil || peer.Status != "active" || peer.GRPCAddress == "" {
+			continue
+		}
+		if _, held := exclude[peer.ID]; held {
+			continue
+		}
+		candidates = append(candidates, peer)
+	}
+	cryptoShuffle(candidates)
+	sortPeersByReplicationScore(candidates)
+
+	written := 0
+	var lastErr error
+	for _, peer := range candidates {
+		if written >= count {
+			break
+		}
+		if written > 0 {
+			stagger := ps.replicationStagger
+			if stagger <= 0 {
+				stagger = defaultPeerReplicationStagger
+			}
+			ps.replStaggersTotal.Add(1)
+			if err := sleepWithJitter(ctx, stagger/2, stagger*3/2); err != nil {
+				break
+			}
+		}
+		if err := ps.writeToPeer(ctx, peer.GRPCAddress, path, data); err == nil {
+			written++
+		} else if isPeerBusy(err) {
+			ps.replBusySkipsTotal.Add(1)
+			lastErr = err
+		} else {
+			lastErr = err
+		}
+	}
+	if written == 0 && lastErr != nil {
+		return 0, lastErr
+	}
+	return written, nil
+}
+
 // Delete removes a file from peer storage.
 func (ps *PeerStorage) Delete(ctx context.Context, path string) error {
 	peers, err := ps.getPeers(ctx)
