@@ -40,6 +40,7 @@ func main() {
 		benchmarkMB   = flag.Int("benchmark-mb", 64, "Benchmark file size in MiB")
 		refreshSec    = flag.Int("refresh-interval-sec", 60, "Daemon mode: capacity refresh interval")
 		exclude       = flag.String("exclude-prefixes", "", "Comma-separated extra mount-point prefixes to skip")
+		failOpen      = flag.Bool("fail-open", true, "On discovery failure, exit 0 without a config so the client falls back to its static -nvme path instead of crash-looping the pod")
 	)
 	flag.Parse()
 
@@ -61,6 +62,14 @@ func main() {
 	switch *mode {
 	case "init":
 		if err := runInit(logger, opts, *configPath); err != nil {
+			if *failOpen {
+				// Degrade instead of blocking the pod: no config is written, so
+				// after -node-init-wait-sec the client falls back to its static
+				// -nvme path (NI-4). Better a working node on the default disk
+				// than a crash-loop on discovery edge cases.
+				logger.Printf("init failed: %v — failing open, client will use its static -nvme path", err)
+				return
+			}
 			logger.Fatalf("init failed: %v", err)
 		}
 	case "daemon":
