@@ -359,3 +359,76 @@ All non-health endpoints require `X-API-Key` header when `-api-key` is set.
 - `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob` v1.0.0 — Azure Blob client
 - `github.com/gorilla/mux` — HTTP router
 - `go.etcd.io/etcd/client/v3` v3.5.13 — distributed coordinator state (optional; in-memory fallback when `-etcd-endpoints` is empty)
+
+## Session Context (July 2026): Thundering-Herd Control + node-init
+
+State of the stacked-PR series implementing `docs/peer-coordination-thundering-herd.md`.
+Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
+
+| PR | Branch | Contents |
+|----|--------|----------|
+| #4 | `peer-thundering-herd-phase1` (base: `main`) | Phase 1: serve-side admission control, busy failover + jittered retry, staggered headroom-aware replication, pairwise latency metadata |
+| #5 | `peer-thundering-herd-phase2-3` (base: phase1) | Phase 2: cross-node fetch leases. Phase 3: fast chunk advertisement, demand-driven replica reconciler |
+| #6 | `node-init` (base: phase2-3) | node-init disk discovery + deploy wiring + `docs/test-plan.md` (live-cluster validation incl. FUSE kill/hang lifecycle) |
+
+### Key components added
+
+- `internal/cache/peer_admission.go` — `peerServeGate` semaphore (default 64,
+  `-peer-serve-max-inflight`). gRPC peer server rejects with
+  `RESOURCE_EXHAUSTED`, raw HTTP `/api/peer/read` with 503+Retry-After.
+  Requesters treat busy as flow control: skip to next holder, one jittered
+  retry pass (10–150ms) only when ALL holders are busy; never evict
+  connections or record latency samples on busy.
+- `internal/cache/peer_latency.go` — per-(node→peer) EWMA latency/success
+  from real transfers; traversal reorders on it once a pair has ≥3 samples
+  (beats the coordinator's single-target netprobe). Exposed at
+  `/api/peers/latency` + `fuse_peer_pair_*` metrics.
+- `internal/coordinator/fetch_lease*.go` — advisory short-TTL leases
+  (`/api/fetch-lease`; etcd key `/fuse/inflight/<key>` with lease-backed
+  expiry; in-memory map fallback). `internal/cache/origin_lease.go` gates
+  ordered-fallback cloud reads: winner pulls origin, losers wait 100–400ms
+  then read the peer tier. Coordinator failure ⇒ plain cloud read, always.
+  Hedged/striped hybrid reads intentionally bypass leases.
+- `internal/cache/chunk_advertise.go` — remotely-fetched chunks are promoted
+  to NVMe and the node advertises itself as a parent-file holder on the FIRST
+  chunk (coalesced: 1 publish/parent/5s), growing the swarm mid-transfer.
+- `internal/cache/replica_reconciler.go` — periodic top-up of hot
+  (<10min-accessed, ≤64MiB) under-replicated local objects toward R
+  (default 3) via `PeerStorage.ReplicateTo` (excludes existing holders,
+  staggered, busy-aware, ≤8 ops/pass, busy cluster aborts the pass).
+  Cold-replica decay is deliberately delegated to LRU eviction.
+- `internal/nodeinit/` + `cmd/node-init/` — best-local-disk discovery:
+  /proc/mounts + sysfs classification (nvme/ssd/disk/unknown), scoring
+  (class dominates > log2 free space > micro-benchmark of top-3 finalists;
+  well-known cloud ephemeral mounts are tie-break hints only), prepares
+  `<mount>/fuse-cache`, writes `node-init.json` (dir + byte budget).
+  `-mode init` (init container) / `-mode daemon` (sidecar refreshing
+  capacity, re-discovers if dir vanishes). Client adopts it via
+  `-node-init-config` + `-node-init-host-root` with fallback to static
+  `-nvme` flags. Helm: `nodeInit.*` values (enabled by default).
+
+### Conventions established in this work
+
+- Busy (`RESOURCE_EXHAUSTED`/503) is admission control, NOT failure: don't
+  reconnect-retry the same node, don't record it in perf trackers.
+- All coordination is advisory — reads must succeed with the coordinator
+  down; correctness never depends on leases/advertisement/reconciler.
+- Jitter everything that could synchronize (`sleepWithJitter`, crypto/rand).
+- Herd-control counters live on `DefaultCacheManager` (`PeerLoadSnapshot`,
+  `HerdControlSnapshot`) and are exported in `handlePromMetrics`.
+- Tests for peer behavior use real in-process gRPC servers via
+  `startHerdPeer` (`peer_herd_test.go`) and a lease-capable mock coordinator
+  (`herd_phase23_test.go`).
+
+### Known gaps / follow-ups
+
+- Remote-tier chunk reads verify size only, not content checksums
+  (noted in test plan IR-3).
+- Fetch leases ride the coordinator HTTP fallback, not gRPC proto (add to
+  `proto/coordinator.proto` if lease QPS matters).
+- node-init end-to-end tested against synthetic host roots only — needs one
+  real AKS/EKS/GKE smoke rollout (test plan NI-1).
+- `docs/test-plan.md` (TH/NI/IR/FL scenarios) is written but not yet executed
+  against a live cluster.
+- Stray uncommitted files in repo root (`tmp_s3probe*.go`, test binaries,
+  `client`/`coordinator`/`csi-driver` dirs) predate this work — left alone.
