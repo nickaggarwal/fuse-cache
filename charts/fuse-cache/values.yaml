@@ -50,7 +50,11 @@ client:
 # the client — so this chart deploys unchanged on AKS, EKS, GKE, or bare
 # metal. When disabled, the static config.nvmeCachePath/nvmeMaxGB are used.
 nodeInit:
-  enabled: true
+  # Opt-in: automatic best-local-disk discovery. Off by default until disk
+  # discovery is hardened for all node types (some AKS pools expose no eligible
+  # separate data disk, so discovery finds nothing and the client falls back to
+  # the static -nvme path anyway). Enable per node pool once validated.
+  enabled: false
   hostRootContainerPath: /host
   configPath: /var/run/fuse-client/node-init.json
   cacheSubdir: fuse-cache

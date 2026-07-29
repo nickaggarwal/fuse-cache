@@ -74,6 +74,12 @@ func main() {
 		}
 	case "daemon":
 		if err := runDaemon(logger, opts, *configPath, time.Duration(*refreshSec)*time.Second); err != nil {
+			if *failOpen {
+				// The client is using its static -nvme path; the refresh daemon
+				// has nothing to track. Idle instead of crash-looping the sidecar.
+				logger.Printf("daemon: %v — failing open, idling (client uses static -nvme path)", err)
+				select {}
+			}
 			logger.Fatalf("daemon failed: %v", err)
 		}
 	default:
