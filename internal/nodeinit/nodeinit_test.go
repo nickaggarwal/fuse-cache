@@ -390,3 +390,63 @@ func TestDiscover_OneCandidatePerDevice(t *testing.T) {
 		t.Fatalf("kept mount = %s, want /mnt", cands[0].MountPoint)
 	}
 }
+
+// TestDiscover_SkipsFileBindMounts reproduces NI-1: Kubernetes bind-mounts
+// /etc/hosts as a FILE backed by the node root fs. statfs on it reports the
+// root fs's large free space, so it used to win discovery and then crash on
+// MkdirAll(<file>/fuse-cache). Discovery must skip non-directory mount points.
+func TestDiscover_SkipsFileBindMounts(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// /etc/hosts exists as a FILE on the fake host.
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/hosts"), []byte("127.0.0.1 x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts := `/dev/sda1 /etc/hosts ext4 rw 0 0
+/dev/sdb1 /data ext4 rw 0 0
+`
+	if err := os.WriteFile(filepath.Join(root, "proc/mounts"), []byte(mounts), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origStatfs := statfsFunc
+	defer func() { statfsFunc = origStatfs }()
+	// Make the /etc/hosts fs look *bigger* so it would win without the fix.
+	statfsFunc = func(path string) (int64, int64, error) {
+		if filepath.HasPrefix(path, filepath.Join(root, "etc")) {
+			return 1 << 40, 900 << 30, nil
+		}
+		return 256 << 30, 100 << 30, nil
+	}
+
+	opts := DefaultOptions()
+	opts.HostRoot = root
+	cands, err := Discover(opts)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	for _, c := range cands {
+		if c.MountPoint == "/etc/hosts" {
+			t.Fatalf("discovery selected file bind-mount /etc/hosts: %+v", c)
+		}
+	}
+	// The real directory mount must still be found.
+	found := false
+	for _, c := range cands {
+		if c.MountPoint == "/data" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("directory mount /data not discovered; candidates=%+v", cands)
+	}
+}

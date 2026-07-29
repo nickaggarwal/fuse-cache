@@ -127,6 +127,14 @@ func Discover(opts Options) ([]Candidate, error) {
 		}
 
 		hostPath := filepath.Join(opts.HostRoot, m.MountPoint)
+		// Skip file bind-mounts (Kubernetes mounts /etc/hosts, /etc/hostname,
+		// /etc/resolv.conf, /dev/termination-log as files backed by the node
+		// root fs). statfs on them reports the root fs's large free space, so
+		// they win the ranking and then MkdirAll(<file>/fuse-cache) fails. The
+		// cache dir must live on a real directory mount point.
+		if info, statErr := os.Stat(hostPath); statErr != nil || !info.IsDir() {
+			continue
+		}
 		total, free, err := statfsFunc(hostPath)
 		if err != nil || total <= 0 {
 			continue
