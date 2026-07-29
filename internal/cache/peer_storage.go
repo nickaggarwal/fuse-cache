@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +49,9 @@ type PeerStorage struct {
 	peersCacheTTL       time.Duration
 	fileHints           map[string]fileHintCacheEntry
 	fileHintsTTL        time.Duration
+	rawTransport        bool
+	apiKey              string
+	httpClient          *http.Client
 }
 
 type fileHintCacheEntry struct {
@@ -54,8 +59,11 @@ type fileHintCacheEntry struct {
 	expiresAt time.Time
 }
 
-// NewPeerStorage creates a new peer storage instance.
-func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localPeerID string, sortByNetwork bool, parallelFanout bool) (*PeerStorage, error) {
+// NewPeerStorage creates a new peer storage instance. When rawTransport is set,
+// bulk chunk reads prefer a plain-HTTP transport (with sendfile on the serving
+// side) over gRPC, falling back to gRPC on any error. apiKey, when non-empty,
+// is sent as X-API-Key on the HTTP read requests.
+func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localPeerID string, sortByNetwork bool, parallelFanout bool, rawTransport bool, apiKey string) (*PeerStorage, error) {
 	return &PeerStorage{
 		coordinator:         coord,
 		timeout:             timeout,
@@ -69,6 +77,18 @@ func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localP
 		peersCacheTTL:       2 * time.Second,
 		fileHints:           make(map[string]fileHintCacheEntry),
 		fileHintsTTL:        5 * time.Second,
+		rawTransport:        rawTransport,
+		apiKey:              apiKey,
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:          256,
+				MaxIdleConnsPerHost:   32,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: timeout,
+				WriteBufferSize:       256 * 1024,
+				ReadBufferSize:        256 * 1024,
+			},
+		},
 	}, nil
 }
 
@@ -218,7 +238,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 
 	for i := parallelFanout; i < len(candidates); i++ {
 		peer := candidates[i]
-		data, err := ps.readFromPeer(ctx, peer.GRPCAddress, path)
+		data, err := ps.readPeerData(ctx, peer, path)
 		if err == nil {
 			return data, nil
 		}
@@ -284,7 +304,7 @@ func (ps *PeerStorage) readFromPeersParallel(ctx context.Context, path string, p
 		return nil, fmt.Errorf("no peers provided")
 	}
 	if len(peers) == 1 {
-		return ps.readFromPeer(ctx, peers[0].GRPCAddress, path)
+		return ps.readPeerData(ctx, peers[0], path)
 	}
 
 	type readResult struct {
@@ -302,7 +322,7 @@ func (ps *PeerStorage) readFromPeersParallel(ctx context.Context, path string, p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			data, err := ps.readFromPeer(readCtx, p.GRPCAddress, path)
+			data, err := ps.readPeerData(readCtx, p, path)
 			resultCh <- readResult{data: data, err: err}
 		}()
 	}
@@ -673,6 +693,61 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 	ps.peersCacheAt = time.Now()
 	ps.metaMu.Unlock()
 	return filtered, nil
+}
+
+// readPeerData reads a path from one peer, preferring the raw HTTP transport
+// (with sendfile on the serving side) when enabled, and falling back to the
+// gRPC path on any raw error.
+func (ps *PeerStorage) readPeerData(ctx context.Context, peer *coordinator.PeerInfo, path string) ([]byte, error) {
+	if ps.rawTransport && peer != nil && peer.Address != "" {
+		if data, err := ps.readFromPeerRaw(ctx, peer.Address, path); err == nil {
+			return data, nil
+		}
+		// Fall through to gRPC on any raw-transport error.
+	}
+	return ps.readFromPeer(ctx, peer.GRPCAddress, path)
+}
+
+// readFromPeerRaw fetches a path from a peer's plain-HTTP bulk-read endpoint.
+func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path string) ([]byte, error) {
+	if ps.httpClient == nil {
+		return nil, fmt.Errorf("raw transport not initialized")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+
+	endpoint := "http://" + httpAddr + "/api/peer/read?path=" + url.QueryEscape(path)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ps.apiKey != "" {
+		req.Header.Set("X-API-Key", ps.apiKey)
+	}
+
+	resp, err := ps.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		// Drain so the connection can be reused.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer raw read %s: status %d", httpAddr, resp.StatusCode)
+	}
+
+	// Size the buffer from Content-Length when known to avoid reallocation.
+	if resp.ContentLength >= 0 {
+		buf := make([]byte, resp.ContentLength)
+		if _, err := io.ReadFull(resp.Body, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	return io.ReadAll(resp.Body)
 }
 
 func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) ([]byte, error) {

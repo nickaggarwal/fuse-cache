@@ -36,6 +36,7 @@ data:
   FUSE_HYBRID_HEDGE_DELAY_MS: {{ .Values.config.hybridHedgeDelayMs | quote }}
   FUSE_HYBRID_MAX_SECONDARY_INFLIGHT: {{ .Values.config.hybridMaxSecondaryInflight | quote }}
   FUSE_ADAPTIVE_REMOTE_READ: {{ .Values.config.adaptiveRemoteRead | quote }}
+  FUSE_PEER_RAW_TRANSPORT: {{ .Values.config.peerRawTransport | quote }}
   FUSE_IO_PROGRESS_MB: {{ .Values.config.fuseIOProgressMB | quote }}
   FUSE_NETPROBE_ENABLED: {{ .Values.config.netProbeEnabled | quote }}
   FUSE_NETPROBE_BYTES: {{ .Values.config.netProbeBytes | quote }}

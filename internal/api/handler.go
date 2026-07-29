@@ -128,6 +128,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/files/{path:.*}/size", h.handleFileSize).Methods("GET")
 
 	// Peer operations
+	router.HandleFunc("/api/peer/read", h.handlePeerRead).Methods("GET")
 	router.HandleFunc("/api/peers", h.handlePeers).Methods("GET")
 	router.HandleFunc("/api/peers/{peerID}", h.handlePeer).Methods("GET")
 	router.HandleFunc("/api/peers/{peerID}/heartbeat", h.handleHeartbeat).Methods("POST")

@@ -199,6 +199,15 @@ type CacheConfig struct {
 	// static peer-first order and purely size-based hedging. Enabled by default.
 	AdaptiveRemoteRead bool
 
+	// PeerRawTransport prefers a plain-HTTP bulk-read transport (with sendfile
+	// on the serving side) over gRPC for peer chunk reads, falling back to gRPC
+	// on error. Avoids gRPC/protobuf per-stream framing overhead.
+	PeerRawTransport bool
+
+	// APIKey authenticates peer raw-transport HTTP reads (sent as X-API-Key)
+	// when the client API is key-protected.
+	APIKey string
+
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
@@ -394,7 +403,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 
 	if config.Coordinator != nil {
 		var ps *PeerStorage
-		ps, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout)
+		ps, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout, config.PeerRawTransport, config.APIKey)
 		if err == nil {
 			ps.startGC(shutdownCtx)
 			cm.peerStorage = ps

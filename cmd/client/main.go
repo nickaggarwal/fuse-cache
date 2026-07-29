@@ -83,6 +83,7 @@ func main() {
 		hybridHedgeMS        = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
 		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
 		adaptiveRemoteRead   = flag.Bool("adaptive-remote-read", true, "Choose peer vs cloud read order and hedging from measured per-tier latency/success instead of a static peer-first policy")
+		peerRawTransport     = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -185,6 +186,8 @@ func main() {
 		HybridCloudHedgeDelay:      time.Duration(*hybridHedgeMS) * time.Millisecond,
 		HybridMaxSecondaryInflight: *hybridHedgeMax,
 		AdaptiveRemoteRead:         *adaptiveRemoteRead,
+		PeerRawTransport:           *peerRawTransport,
+		APIKey:                     *apiKey,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -391,6 +394,14 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_ADAPTIVE_REMOTE_READ value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_PEER_RAW_TRANSPORT"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.PeerRawTransport = parsed
+			*peerRawTransport = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_PEER_RAW_TRANSPORT value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_MOUNT_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			*mountRetries = n
@@ -538,6 +549,7 @@ func main() {
 	logger.Printf("- Hybrid hedge delay ms: %d", *hybridHedgeMS)
 	logger.Printf("- Hybrid max secondary inflight: %d", *hybridHedgeMax)
 	logger.Printf("- Adaptive remote read (peer vs cloud): %t", cacheConfig.AdaptiveRemoteRead)
+	logger.Printf("- Peer raw transport (HTTP sendfile): %t", cacheConfig.PeerRawTransport)
 	logger.Printf("- FUSE mount retries: %d", *mountRetries)
 	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
 
