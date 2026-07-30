@@ -50,10 +50,13 @@ client:
 # the client — so this chart deploys unchanged on AKS, EKS, GKE, or bare
 # metal. When disabled, the static config.nvmeCachePath/nvmeMaxGB are used.
 nodeInit:
-  # Opt-in: automatic best-local-disk discovery. Off by default until disk
-  # discovery is hardened for all node types (some AKS pools expose no eligible
-  # separate data disk, so discovery finds nothing and the client falls back to
-  # the static -nvme path anyway). Enable per node pool once validated.
+  # Automatic best-local-disk discovery. Validated on AKS A100 + L-series:
+  # reads the host mount table and, for a large raw/unformatted local NVMe,
+  # formats it ext4 and mounts it, so the client uses the full NVMe (e.g.
+  # ~700 GiB) instead of the small temp disk; falls open to the static -nvme
+  # path if discovery fails. Left OFF by default because it FORMATS a raw disk
+  # (safe only on empty, non-OS, unmounted disks — guarded, but destructive):
+  # enable per node pool once you've confirmed the target disk layout.
   enabled: false
   hostRootContainerPath: /host
   configPath: /var/run/fuse-client/node-init.json

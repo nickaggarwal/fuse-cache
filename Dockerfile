@@ -28,7 +28,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM ubuntu:22.04
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends fuse3 ca-certificates && \
+    apt-get install -y --no-install-recommends fuse3 ca-certificates \
+        e2fsprogs util-linux && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /bin/coordinator /usr/local/bin/coordinator
