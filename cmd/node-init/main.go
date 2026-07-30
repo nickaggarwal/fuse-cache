@@ -41,6 +41,7 @@ func main() {
 		refreshSec    = flag.Int("refresh-interval-sec", 60, "Daemon mode: capacity refresh interval")
 		exclude       = flag.String("exclude-prefixes", "", "Comma-separated extra mount-point prefixes to skip")
 		failOpen      = flag.Bool("fail-open", true, "On discovery failure, exit 0 without a config so the client falls back to its static -nvme path instead of crash-looping the pod")
+		mountRawDisks = flag.Bool("mount-raw-disks", true, "Discover, format (ext4), and mount raw unformatted local disks (e.g. a large NVMe) that mount-based discovery misses; only touches empty, unmounted, non-OS disks")
 	)
 	flag.Parse()
 
@@ -55,6 +56,7 @@ func main() {
 	opts.Benchmark = *benchmark
 	opts.BenchmarkBytes = int64(*benchmarkMB) << 20
 	opts.NodeName = os.Getenv("NODE_NAME")
+	opts.MountRawDisks = *mountRawDisks
 	if *exclude != "" {
 		opts.ExtraExcludePrefixes = splitNonEmpty(*exclude)
 	}

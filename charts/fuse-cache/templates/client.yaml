@@ -51,6 +51,8 @@ spec:
           volumeMounts:
             - name: host-root
               mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+              # See raw-disk mounts node-init makes in the host mount namespace.
+              mountPropagation: HostToContainer
             - name: agent-socket
               mountPath: /var/run/fuse-client
         {{- end }}
@@ -124,6 +126,8 @@ spec:
           volumeMounts:
             - name: host-root
               mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+              # See raw-disk mounts node-init makes in the host mount namespace.
+              mountPropagation: HostToContainer
             - name: agent-socket
               mountPath: /var/run/fuse-client
           resources:

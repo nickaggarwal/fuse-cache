@@ -1,8 +1,10 @@
 package nodeinit
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -448,5 +450,90 @@ func TestDiscover_SkipsFileBindMounts(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("directory mount /data not discovered; candidates=%+v", cands)
+	}
+}
+
+// TestDiscoverAndMountRawDisks_SafetyAndIdempotency exercises raw-disk
+// selection with mocked block-device listing and shell commands: it must
+// format+mount an empty NVMe, skip the in-use OS disk, skip a disk holding
+// another volume's data, and re-mount (not reformat) a disk already carrying
+// our fusecache label.
+func TestDiscoverAndMountRawDisks_SafetyAndIdempotency(t *testing.T) {
+	root := t.TempDir()
+	// sysfs sizes: nvme0n1 & nvme1n1 = 900GiB, sdb = 64GiB, sda(OS)=128GiB.
+	for name, sectors := range map[string]string{
+		"nvme0n1": "1887436800", // 900 GiB
+		"nvme1n1": "1887436800",
+		"sdb":     "134217728", // 64 GiB
+		"sda":     "268435456", // 128 GiB (OS)
+		"sr0":     "1024",
+	} {
+		dir := filepath.Join(root, "sys/block", name)
+		os.MkdirAll(dir, 0o755)
+		os.WriteFile(filepath.Join(dir, "size"), []byte(sectors+"\n"), 0o644)
+		os.MkdirAll(filepath.Join(dir, "queue"), 0o755)
+		os.WriteFile(filepath.Join(dir, "queue/rotational"), []byte("0\n"), 0o644)
+	}
+
+	origList, origRun := blockDeviceLister, runCmd
+	defer func() { blockDeviceLister, runCmd = origList, origRun }()
+	blockDeviceLister = func(string) ([]string, error) {
+		return []string{"nvme0n1", "nvme1n1", "sdb", "sda", "sr0", "loop0"}, nil
+	}
+
+	var mkfsCalls []string
+	var mountCalls []string
+	runCmd = func(name string, args ...string) (string, error) {
+		switch {
+		case name == "blkid":
+			dev := args[len(args)-1]
+			switch dev {
+			case "/dev/nvme0n1", "/dev/nvme0n1p1", "/dev/nvme0n1_1":
+				return "", fmt.Errorf("no fs") // empty → format
+			case "/dev/nvme1n1":
+				return "LABEL=fusecache\nTYPE=ext4\n", nil // ours → remount only
+			default:
+				return "", fmt.Errorf("no fs")
+			}
+		case name == "mkfs.ext4":
+			mkfsCalls = append(mkfsCalls, args[len(args)-1])
+			return "", nil
+		case name == "nsenter":
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "mountpoint -q") {
+				return "", nil // not already mounted
+			}
+			if strings.Contains(joined, " mount ") || (len(args) > 0 && args[len(args)-2] == "mount") {
+				mountCalls = append(mountCalls, args[len(args)-1])
+			}
+			return "", nil
+		}
+		return "", nil
+	}
+
+	// sda is the OS disk (mounted at /), sdb is the temp disk (mounted at /mnt).
+	mounts := []mountEntry{
+		{Device: "/dev/sda1", MountPoint: "/", FSType: "ext4"},
+		{Device: "/dev/sdb1", MountPoint: "/mnt", FSType: "ext4"},
+	}
+
+	cands := discoverAndMountRawDisks(Options{HostRoot: root}, mounts)
+
+	got := map[string]bool{}
+	for _, c := range cands {
+		got[c.Device] = true
+	}
+	if !got["/dev/nvme0n1"] {
+		t.Fatal("empty nvme0n1 should be formatted+mounted and returned")
+	}
+	if !got["/dev/nvme1n1"] {
+		t.Fatal("labeled nvme1n1 should be re-mounted and returned")
+	}
+	if got["/dev/sda"] || got["/dev/sdb"] {
+		t.Fatal("in-use OS/temp disks must never be selected")
+	}
+	// nvme0n1 empty → formatted; nvme1n1 ours → NOT formatted.
+	if len(mkfsCalls) != 1 || mkfsCalls[0] != "/dev/nvme0n1" {
+		t.Fatalf("mkfs calls = %v, want only [/dev/nvme0n1]", mkfsCalls)
 	}
 }

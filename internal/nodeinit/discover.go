@@ -109,11 +109,46 @@ func allDigits(s string) bool {
 // Discover enumerates eligible mounted filesystems under opts.HostRoot and
 // returns them (unranked). Filesystem sizes come from statfs on the
 // host-root-prefixed mount point.
+// readHostMounts returns the node's real mount table. The obvious path,
+// <HostRoot>/proc/mounts, is a symlink to self/mounts and resolves to *this
+// container's* mount namespace (an overlay root with none of the node's
+// disks). The host table lives at proc/<host-pid-1>/mounts. Try the
+// host-pid-1 table first (under the host-root prefix, then unprefixed with
+// hostPID), and only fall back to the plain self view if those are missing.
+func readHostMounts(hostRoot string) (string, error) {
+	candidates := []string{
+		filepath.Join(hostRoot, "proc/1/mounts"),
+		filepath.Join(hostRoot, "proc/mounts"),
+		"/proc/1/mounts",
+		"/proc/mounts",
+	}
+	var firstErr error
+	for _, p := range candidates {
+		content, err := os.ReadFile(p)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// Accept the first table that actually shows a real /dev disk mount —
+		// this skips a container-local self/mounts (overlay root, no disks).
+		for _, m := range parseMounts(string(content)) {
+			if strings.HasPrefix(m.Device, "/dev/") && allowedFilesystems[m.FSType] {
+				return string(content), nil
+			}
+		}
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("no host mount table with a real disk found under %q", hostRoot)
+}
+
 func Discover(opts Options) ([]Candidate, error) {
-	mountsPath := filepath.Join(opts.HostRoot, "proc/mounts")
-	content, err := os.ReadFile(mountsPath)
+	content, err := readHostMounts(opts.HostRoot)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", mountsPath, err)
+		return nil, err
 	}
 
 	seen := make(map[string]bool) // one candidate per device: keep shallowest mount point
@@ -162,6 +197,16 @@ func SelectAndPrepare(opts Options) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Raw local disks (a large unformatted NVMe is common on cloud nodes and
+	// invisible to mount-based discovery) — format+mount the empty ones and add
+	// them so the ranker can pick the big NVMe over the small temp disk.
+	if opts.MountRawDisks {
+		if content, mErr := readHostMounts(opts.HostRoot); mErr == nil {
+			candidates = append(candidates, discoverAndMountRawDisks(opts, parseMounts(content))...)
+		}
+	}
+
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no eligible local filesystem found (host root %q, min free %d bytes)", opts.HostRoot, opts.MinFreeBytes)
 	}

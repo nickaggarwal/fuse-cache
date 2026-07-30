@@ -87,6 +87,9 @@ type Options struct {
 	ExtraExcludePrefixes []string
 	// NodeName is stamped into the config (from the downward API).
 	NodeName string
+	// MountRawDisks enables discovering, formatting, and mounting raw local
+	// disks (e.g. a large unformatted NVMe) that mount-based discovery misses.
+	MountRawDisks bool
 }
 
 // DefaultOptions returns production defaults.
@@ -97,6 +100,7 @@ func DefaultOptions() Options {
 		CacheFraction:  0.8,
 		Benchmark:      true,
 		BenchmarkBytes: 64 << 20,
+		MountRawDisks:  true,
 	}
 }
 
@@ -112,12 +116,12 @@ const (
 // wellKnownEphemeralPrefixes are tie-break hints for cloud ephemeral disks:
 // Azure (waagent resource disk), GKE/EKS local SSD conventions.
 var wellKnownEphemeralPrefixes = []string{
-	"/mnt/resource",       // Azure waagent default
-	"/mnt",                // AKS ephemeral (cloud-init)
-	"/mnt/disks",          // GKE local SSD
+	"/mnt/resource",           // Azure waagent default
+	"/mnt",                    // AKS ephemeral (cloud-init)
+	"/mnt/disks",              // GKE local SSD
 	"/mnt/stateful_partition", // COS
-	"/media/ephemeral",    // older EKS AMIs
-	"/local1",             // some EKS/AL2 local NVMe conventions
+	"/media/ephemeral",        // older EKS AMIs
+	"/local1",                 // some EKS/AL2 local NVMe conventions
 }
 
 const wellKnownEphemeralBonus = 25.0
