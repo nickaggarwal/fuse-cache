@@ -8,6 +8,9 @@ metadata:
 spec:
   type: ClusterIP
   clusterIP: None
+  # Publish per-pod DNS before readiness: members must resolve each other to
+  # form the initial quorum, and readiness itself requires quorum.
+  publishNotReadyAddresses: true
   selector:
     app: etcd
   ports:
@@ -73,26 +76,24 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: etcd
+          # NOTE: quay.io/coreos/etcd v3.5+ images have no shell; use direct
+          # exec with Kubernetes $(VAR) expansion instead of /bin/sh.
           image: quay.io/coreos/etcd:v3.5.13
           command:
-            - /bin/sh
-            - -c
-            - |
-              PEERS="etcd-0=http://etcd-0.etcd:2380,etcd-1=http://etcd-1.etcd:2380,etcd-2=http://etcd-2.etcd:2380"
-              exec etcd \
-                --name "${HOSTNAME}" \
-                --listen-peer-urls "http://0.0.0.0:2380" \
-                --listen-client-urls "http://0.0.0.0:2379" \
-                --advertise-client-urls "http://${HOSTNAME}.etcd:2379" \
-                --initial-advertise-peer-urls "http://${HOSTNAME}.etcd:2380" \
-                --initial-cluster-token "fuse-etcd-cluster" \
-                --initial-cluster "${PEERS}" \
-                --initial-cluster-state "new" \
-                --data-dir "/var/lib/etcd" \
-                --auto-compaction-mode "periodic" \
-                --auto-compaction-retention "1h" \
-                --snapshot-count "10000" \
-                --quota-backend-bytes "$((2 * 1024 * 1024 * 1024))"
+            - etcd
+            - --name=$(HOSTNAME)
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(HOSTNAME).etcd:2379
+            - --initial-advertise-peer-urls=http://$(HOSTNAME).etcd:2380
+            - --initial-cluster-token=fuse-etcd-cluster
+            - --initial-cluster=etcd-0=http://etcd-0.etcd:2380,etcd-1=http://etcd-1.etcd:2380,etcd-2=http://etcd-2.etcd:2380
+            - --initial-cluster-state=new
+            - --data-dir=/var/lib/etcd
+            - --auto-compaction-mode=periodic
+            - --auto-compaction-retention=1h
+            - --snapshot-count=10000
+            - --quota-backend-bytes=2147483648
           ports:
             - containerPort: 2379
               name: client
@@ -109,18 +110,24 @@ spec:
           livenessProbe:
             exec:
               command:
-                - /bin/sh
-                - -c
-                - etcdctl endpoint health --endpoints=http://127.0.0.1:2379
-            initialDelaySeconds: 15
-            periodSeconds: 10
+                - etcdctl
+                - endpoint
+                - health
+                - --endpoints=http://127.0.0.1:2379
+            # Health requires quorum; give a fresh cluster time to elect
+            # before killing members (a tight probe deadlocks bootstrap:
+            # kill → restart → re-elect → kill).
+            initialDelaySeconds: 60
+            periodSeconds: 15
             timeoutSeconds: 5
+            failureThreshold: 8
           readinessProbe:
             exec:
               command:
-                - /bin/sh
-                - -c
-                - etcdctl endpoint health --endpoints=http://127.0.0.1:2379
+                - etcdctl
+                - endpoint
+                - health
+                - --endpoints=http://127.0.0.1:2379
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 5

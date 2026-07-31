@@ -205,7 +205,12 @@ spec:
               memory: 512Mi
             limits:
               cpu: "2"
-              memory: 4Gi
+              # Multi-GB reads/writes (e.g. GPU checkpoint tars) buffer
+              # 4MB chunks in flight on both the cloud-persist and the
+              # range-read paths; 4-8Gi OOM-kills the client mid-transfer
+              # and tears down the FUSE mount on the node. TODO: bound the
+              # chunk buffers in the client instead of oversizing the pod.
+              memory: 16Gi
       volumes:
         - name: fuse-device
           hostPath:
