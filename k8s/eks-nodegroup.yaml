@@ -1,0 +1,27 @@
+# Node group for fuse-snap-test (control plane created separately).
+# - us-east-1d = use1-az6, same AZ as the S3 Express One Zone directory
+#   bucket (fuse-snap-cache--use1-az6--x-s3): single-digit-ms first byte
+#   only holds intra-AZ.
+# - Ubuntu2404: containerd 2.x (pod-snapshotter hard requirement) and
+#   apt-installable CRIU, matching its verified AKS environment.
+# - m6id.2xlarge: 8 vCPU / 32 GiB / 474 GB instance-store NVMe for
+#   fuse-client node-init discovery / 12.5 Gbps.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: fuse-snap-test
+  region: us-east-1
+  version: "1.33"
+
+managedNodeGroups:
+  - name: nvme-ubuntu
+    instanceType: m6id.2xlarge
+    desiredCapacity: 3
+    minSize: 0
+    maxSize: 3
+    amiFamily: Ubuntu2404
+    availabilityZones: ["us-east-1d"]
+    volumeSize: 80
+    labels:
+      workload: fuse-snap-test

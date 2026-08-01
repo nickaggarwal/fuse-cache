@@ -81,6 +81,11 @@ func NewCloudStorageWithTuning(bucket, region string, timeout time.Duration, tun
 	if tuning.ForcePathStyle {
 		cfg.S3ForcePathStyle = aws.Bool(true)
 	}
+	if shouldPreferDirectPut(bucket, tuning.Endpoint) {
+		// S3 Express directory buckets reject the Content-MD5 header the SDK
+		// attaches to uploads by default (501 NotImplemented on PutObject).
+		cfg.S3DisableContentMD5Validation = aws.Bool(true)
+	}
 	sess, err := session.NewSession(cfg)
 	if err != nil {
 		return nil, err
