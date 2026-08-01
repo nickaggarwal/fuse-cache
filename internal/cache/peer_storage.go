@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	pb "fuse-client/internal/pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
@@ -32,6 +34,13 @@ const (
 	peerGRPCInitialConnWindowBytes = 256 * 1024 * 1024
 	peerGRPCMaxMessageBytes        = 128 * 1024 * 1024
 	peerDefaultReadConnPerPeer     = 8
+
+	// peerConnectTimeout bounds TCP connection establishment to a peer, for
+	// both the raw HTTP transport and gRPC dials. In-cluster peers connect in
+	// microseconds; a multi-second connect means the address is a stale
+	// registry entry (dead pod IP blackholing SYNs) and must fail fast so the
+	// read proceeds to the next holder or tier instead of stalling ~30s.
+	peerConnectTimeout = 2 * time.Second
 )
 
 // PeerStorage implements TierStorage for peer-to-peer storage via gRPC.
@@ -103,6 +112,19 @@ func isPeerBusy(err error) bool {
 	return status.Code(err) == codes.ResourceExhausted
 }
 
+// isPeerUnreachable reports whether err is a connection-establishment
+// failure (connect timeout, refused, no route), i.e. the peer address is
+// dead rather than the request having failed. Deliberately narrow — only
+// dial-op errors count, so a response-header timeout from a slow-but-alive
+// peer still falls through to the gRPC transport.
+func isPeerUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
 type fileHintCacheEntry struct {
 	peerIDs   map[string]struct{}
 	expiresAt time.Time
@@ -131,6 +153,15 @@ func NewPeerStorage(coord coordinator.Coordinator, timeout time.Duration, localP
 		pairLatency:         newPeerLatencyTracker(),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
+				// Short connect timeout: a stale registry entry (pod IP that
+				// no longer exists) blackholes TCP SYNs; without this, the
+				// first read after a rollout hangs the full request timeout
+				// (observed 30s stalls). Live in-cluster peers connect in
+				// well under a millisecond.
+				DialContext: (&net.Dialer{
+					Timeout:   peerConnectTimeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
 				MaxIdleConns:          256,
 				MaxIdleConnsPerHost:   32,
 				IdleConnTimeout:       90 * time.Second,
@@ -147,6 +178,15 @@ func dialPeerConn(addr string) (*grpc.ClientConn, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialWindowSize(peerGRPCInitialWindowBytes),
 		grpc.WithInitialConnWindowSize(peerGRPCInitialConnWindowBytes),
+		// Bound each connect attempt: gRPC dials lazily, so without this a
+		// stale peer address (dead pod IP) stalls the first RPC for its full
+		// deadline (~30s observed after every rollout). With it, the channel
+		// enters TransientFailure after peerConnectTimeout and non-wait-for-
+		// ready RPCs fail immediately, letting reads move to the next holder.
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff:           backoff.DefaultConfig,
+			MinConnectTimeout: peerConnectTimeout,
+		}),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(peerGRPCMaxMessageBytes),
 			grpc.MaxCallSendMsgSize(peerGRPCMaxMessageBytes),
@@ -920,6 +960,12 @@ func (ps *PeerStorage) readPeerDataInner(ctx context.Context, peer *coordinator.
 		// the same node over gRPC would just hit the same full gate. Surface it
 		// so the caller fails over to another holder.
 		if isPeerBusy(err) {
+			return nil, err
+		}
+		// Connect-level failure means the node itself is unreachable (stale
+		// registry entry, dead pod). The gRPC port on the same address is just
+		// as dead — falling through would pay the connect timeout twice.
+		if isPeerUnreachable(err) {
 			return nil, err
 		}
 		// Fall through to gRPC on any other raw-transport error.
