@@ -41,8 +41,8 @@ func benchPut(b *testing.B, size int64) {
 	}
 }
 
-func BenchmarkPut256KB(b *testing.B)  { benchPut(b, 256<<10) }
-func BenchmarkPut2MB(b *testing.B)    { benchPut(b, 2<<20) }
+func BenchmarkPut256KB(b *testing.B)       { benchPut(b, 256<<10) }
+func BenchmarkPut2MB(b *testing.B)         { benchPut(b, 2<<20) }
 func BenchmarkPut64MBChunked(b *testing.B) { benchPut(b, 64<<20) }
 
 func BenchmarkGetNVMeHit(b *testing.B) {

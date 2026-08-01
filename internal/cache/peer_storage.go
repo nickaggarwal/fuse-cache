@@ -974,7 +974,8 @@ func (ps *PeerStorage) readPeerDataInner(ctx context.Context, peer *coordinator.
 }
 
 // bestEffortWriter forwards writes to w until one fails, then silently drops
-// the rest: the promotion is abandoned (Abort) but the read continues.
+// the rest: the promotion falls short (Commit's size check aborts it) but the
+// read continues.
 type bestEffortWriter struct {
 	w      io.Writer
 	failed bool
@@ -1034,17 +1035,15 @@ func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path strin
 				// bestEffortWriter: a disk-write failure abandons the
 				// promotion but must never fail the network read, so the tee
 				// swallows write errors (io.TeeReader would surface them).
+				// Commit itself rejects short writes (BytesWritten != size),
+				// so a swallowed failure can never land a partial file.
 				bw := &bestEffortWriter{w: promo}
 				buf := make([]byte, resp.ContentLength)
 				if _, err := io.ReadFull(io.TeeReader(resp.Body, bw), buf); err != nil {
 					promo.Abort()
 					return nil, err
 				}
-				if bw.failed {
-					promo.Abort()
-				} else {
-					promo.Commit()
-				}
+				promo.Commit()
 				return buf, nil
 			}
 		}

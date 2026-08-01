@@ -22,6 +22,22 @@ const (
 	adaptiveWindowMinSamples = 8
 )
 
+// peerPerStreamBytesPerSec returns the measured single-stream peer read rate
+// (PeerReadNanos sums per-op wall time, so bytes/nanos is per-stream, not
+// aggregate). ok=false until enough samples exist — the single gate every
+// throughput-derived knob shares.
+func (cm *DefaultCacheManager) peerPerStreamBytesPerSec() (float64, bool) {
+	if cm.metrics.PeerReadOps.Load() < adaptiveWindowMinSamples {
+		return 0, false
+	}
+	bytes := cm.metrics.PeerReadBytes.Load()
+	nanos := cm.metrics.PeerReadNanos.Load()
+	if bytes <= 0 || nanos <= 0 {
+		return 0, false
+	}
+	return float64(bytes) / (float64(nanos) / 1e9), true
+}
+
 // adaptivePrefetchMaxChunks returns the effective max readahead window in
 // chunks. Falls back to the configured static cap until enough peer reads
 // have been observed.
@@ -30,20 +46,10 @@ func (cm *DefaultCacheManager) adaptivePrefetchMaxChunks(chunkSize int64) int {
 	if chunkSize <= 0 {
 		return staticMax
 	}
-	ops := cm.metrics.PeerReadOps.Load()
-	if ops < adaptiveWindowMinSamples {
+	perStreamBytesPerSec, ok := cm.peerPerStreamBytesPerSec()
+	if !ok {
 		return staticMax
 	}
-	bytes := cm.metrics.PeerReadBytes.Load()
-	nanos := cm.metrics.PeerReadNanos.Load()
-	if bytes <= 0 || nanos <= 0 {
-		return staticMax
-	}
-
-	// Per-op throughput x parallel workers approximates aggregate delivery
-	// rate (ops overlap; NNanos sums per-op wall time, so bytes/nanos is the
-	// single-stream rate).
-	perStreamBytesPerSec := float64(bytes) / (float64(nanos) / 1e9)
 	workers := cm.config.ParallelRangeReads
 	if workers <= 0 {
 		workers = 1

@@ -267,20 +267,24 @@ type CacheConfig struct {
 
 // DefaultCacheManager implements CacheManager
 type DefaultCacheManager struct {
-	config           *CacheConfig
-	nvmeStorage      TierStorage
-	peerStorage      TierStorage
-	cloudStorage     TierStorage
-	entries          map[string]*CacheEntry
-	nvmeUsed         int64
-	mu               sync.RWMutex
-	rangeMu          sync.RWMutex
-	fetchMu          sync.Mutex
-	logger           *log.Logger
-	metrics          *CacheMetrics
-	metadataAt       time.Time
-	metadataView     []*CacheEntry
-	rangeChunks      map[string]*chunkFileCache
+	config       *CacheConfig
+	nvmeStorage  TierStorage
+	peerStorage  TierStorage
+	cloudStorage TierStorage
+	entries      map[string]*CacheEntry
+	nvmeUsed     int64
+	mu           sync.RWMutex
+	rangeMu      sync.RWMutex
+	fetchMu      sync.Mutex
+	logger       *log.Logger
+	metrics      *CacheMetrics
+	metadataAt   time.Time
+	metadataView []*CacheEntry
+	rangeChunks  map[string]*chunkFileCache
+	// rangeTotalBytes tracks the sum of all per-file cache bytes so the
+	// global budget check is O(1) per insert instead of an O(files) scan
+	// under rangeMu on every cached chunk.
+	rangeTotalBytes  int64
 	hybridHints      map[string]hybridReadHint
 	chunkFetches     map[string]*chunkFetchState
 	hedgeLimiter     chan struct{}
@@ -2287,10 +2291,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	// Per-file profile: workers derive from file size and measured link
 	// speed (configured value is the floor; small files skip fan-out).
 	profile := cm.readProfileFor(totalSize, chunkSize)
-	workerCount := profile.workers
-	if workerCount < 1 {
-		workerCount = 1
-	}
+	workerCount := profile.workers // >= 1 on every readProfileFor path
 	if workerCount > chunkCount {
 		workerCount = chunkCount
 	}
@@ -2894,6 +2895,7 @@ func (cm *DefaultCacheManager) evictOldestRangeChunkLocked(fileCache *chunkFileC
 	fileCache.order = fileCache.order[1:]
 	if cached, ok := fileCache.chunks[evictChunk]; ok {
 		fileCache.bytes -= int64(len(cached.data))
+		cm.rangeTotalBytes -= int64(len(cached.data))
 		if cached.prefetched {
 			cm.metrics.PrefetchWasted.Add(1)
 		}
@@ -2906,6 +2908,7 @@ func (cm *DefaultCacheManager) evictOldestRangeChunkLocked(fileCache *chunkFileC
 func (cm *DefaultCacheManager) dropFileCacheLocked(filePath string) {
 	fileCache, ok := cm.rangeChunks[filePath]
 	if ok && fileCache != nil {
+		cm.rangeTotalBytes -= fileCache.bytes
 		for _, cached := range fileCache.chunks {
 			if cached.prefetched {
 				cm.metrics.PrefetchWasted.Add(1)
@@ -3015,6 +3018,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	fileCache.touchLocked(time.Now())
 	if existing, exists := fileCache.chunks[chunkIndex]; exists {
 		fileCache.bytes -= int64(len(existing.data))
+		cm.rangeTotalBytes -= int64(len(existing.data))
 	} else {
 		fileCache.order = append(fileCache.order, chunkIndex)
 	}
@@ -3023,6 +3027,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 		tier: tier,
 	}
 	fileCache.bytes += int64(len(data))
+	cm.rangeTotalBytes += int64(len(data))
 
 	for len(fileCache.order) > cm.config.RangeChunkCacheSize {
 		cm.evictOldestRangeChunkLocked(fileCache)
@@ -3275,13 +3280,13 @@ func (cm *DefaultCacheManager) Stats() (used, capacity int64) {
 	return cm.nvmeUsed, cm.config.MaxNVMeSize
 }
 
-// GetMetrics returns the cache metrics for reporting
 // GetCacheMetrics exposes the raw counter struct (for Prometheus export of
 // counters not in the Snapshot map).
 func (cm *DefaultCacheManager) GetCacheMetrics() *CacheMetrics {
 	return cm.metrics
 }
 
+// GetMetrics returns the cache metrics for reporting.
 func (cm *DefaultCacheManager) GetMetrics() map[string]interface{} {
 	return cm.metrics.Snapshot()
 }
@@ -3464,44 +3469,47 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 	readWallOther := m.ReadWallOther.Load()
 
 	return map[string]interface{}{
-		"nvme_hits":             m.NVMeHits.Load(),
-		"nvme_misses":           m.NVMeMisses.Load(),
-		"peer_hits":             m.PeerHits.Load(),
-		"peer_misses":           m.PeerMisses.Load(),
-		"cloud_hits":            m.CloudHits.Load(),
-		"cloud_misses":          m.CloudMisses.Load(),
-		"write_count":           m.WriteCount.Load(),
-		"write_bytes":           m.WriteBytes.Load(),
-		"eviction_count":        m.EvictionCount.Load(),
-		"nvme_read_bytes":       nvmeReadBytes,
-		"nvme_read_nanos":       nvmeReadNanos,
-		"nvme_read_ops":         m.NVMeReadOps.Load(),
-		"peer_read_bytes":       peerReadBytes,
-		"peer_read_nanos":       peerReadNanos,
-		"peer_read_ops":         m.PeerReadOps.Load(),
-		"cloud_read_bytes":      cloudReadBytes,
-		"cloud_read_nanos":      cloudReadNanos,
-		"cloud_read_ops":        m.CloudReadOps.Load(),
-		"nvme_read_mbps":        bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
-		"peer_read_mbps":        bytesPerSecToMBps(peerReadBytes, peerReadNanos),
-		"cloud_read_mbps":       bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
-		"read_wall_bytes":       readWallBytes,
-		"read_wall_nanos":       readWallNanos,
-		"read_wall_ops":         m.ReadWallOps.Load(),
-		"read_wall_mbps":        bytesPerSecToMBps(readWallBytes, readWallNanos),
-		"nvme_read_wall_bytes":  nvmeReadWall,
-		"peer_read_wall_bytes":  peerReadWall,
-		"cloud_read_wall_bytes": cloudReadWall,
-		"read_wall_other_bytes": readWallOther,
-		"prefetch_issued":       m.PrefetchIssued.Load(),
-		"prefetch_hits":         m.PrefetchHits.Load(),
-		"prefetch_wasted":       m.PrefetchWasted.Load(),
+		"nvme_hits":                  m.NVMeHits.Load(),
+		"nvme_misses":                m.NVMeMisses.Load(),
+		"peer_hits":                  m.PeerHits.Load(),
+		"peer_misses":                m.PeerMisses.Load(),
+		"cloud_hits":                 m.CloudHits.Load(),
+		"cloud_misses":               m.CloudMisses.Load(),
+		"write_count":                m.WriteCount.Load(),
+		"write_bytes":                m.WriteBytes.Load(),
+		"eviction_count":             m.EvictionCount.Load(),
+		"nvme_read_bytes":            nvmeReadBytes,
+		"nvme_read_nanos":            nvmeReadNanos,
+		"nvme_read_ops":              m.NVMeReadOps.Load(),
+		"peer_read_bytes":            peerReadBytes,
+		"peer_read_nanos":            peerReadNanos,
+		"peer_read_ops":              m.PeerReadOps.Load(),
+		"cloud_read_bytes":           cloudReadBytes,
+		"cloud_read_nanos":           cloudReadNanos,
+		"cloud_read_ops":             m.CloudReadOps.Load(),
+		"nvme_read_mbps":             bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
+		"peer_read_mbps":             bytesPerSecToMBps(peerReadBytes, peerReadNanos),
+		"cloud_read_mbps":            bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
+		"read_wall_bytes":            readWallBytes,
+		"read_wall_nanos":            readWallNanos,
+		"read_wall_ops":              m.ReadWallOps.Load(),
+		"read_wall_mbps":             bytesPerSecToMBps(readWallBytes, readWallNanos),
+		"nvme_read_wall_bytes":       nvmeReadWall,
+		"peer_read_wall_bytes":       peerReadWall,
+		"cloud_read_wall_bytes":      cloudReadWall,
+		"read_wall_other_bytes":      readWallOther,
+		"prefetch_issued":            m.PrefetchIssued.Load(),
+		"prefetch_hits":              m.PrefetchHits.Load(),
+		"prefetch_wasted":            m.PrefetchWasted.Load(),
 		"range_cache_file_evictions": m.RangeCacheFileEvictions.Load(),
 		"range_cache_idle_expiries":  m.RangeCacheIdleExpiries.Load(),
-		"nvme_read_wall_mbps":   bytesPerSecToMBps(nvmeReadWall, readWallNanos),
-		"peer_read_wall_mbps":   bytesPerSecToMBps(peerReadWall, readWallNanos),
-		"cloud_read_wall_mbps":  bytesPerSecToMBps(cloudReadWall, readWallNanos),
-		"read_wall_other_mbps":  bytesPerSecToMBps(readWallOther, readWallNanos),
+		"chunk_completion_assembled": m.ChunkCompletionAssembled.Load(),
+		"chunk_completion_fetched":   m.ChunkCompletionFetched.Load(),
+		"chunk_completion_skipped":   m.ChunkCompletionSkipped.Load(),
+		"nvme_read_wall_mbps":        bytesPerSecToMBps(nvmeReadWall, readWallNanos),
+		"peer_read_wall_mbps":        bytesPerSecToMBps(peerReadWall, readWallNanos),
+		"cloud_read_wall_mbps":       bytesPerSecToMBps(cloudReadWall, readWallNanos),
+		"read_wall_other_mbps":       bytesPerSecToMBps(readWallOther, readWallNanos),
 	}
 }
 

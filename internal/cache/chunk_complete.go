@@ -65,6 +65,17 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 	}
 	st.inFlight[filePath] = struct{}{}
 	st.lastAttempt[filePath] = time.Now()
+	// Opportunistic GC (same pattern as chunkAdvertiser): entries older than
+	// the cooldown are inert, and without pruning this map grows by one entry
+	// per distinct chunked file for the life of the node.
+	if len(st.lastAttempt) > 4096 {
+		cutoff := time.Now().Add(-2 * chunkCompletionCooldown)
+		for p, at := range st.lastAttempt {
+			if at.Before(cutoff) {
+				delete(st.lastAttempt, p)
+			}
+		}
+	}
 	st.mu.Unlock()
 
 	numChunks, size := entry.NumChunks, entry.Size
@@ -164,6 +175,9 @@ func (cm *DefaultCacheManager) runChunkCompletion(ctx context.Context, filePath 
 		if derr := cm.nvmeStorage.Delete(ctx, cp); derr != nil {
 			continue
 		}
+		// Checksum sidecars ride along with chunk files; without this every
+		// completed file leaked numChunks orphan .sha256 files on NVMe.
+		_ = cm.nvmeStorage.Delete(ctx, cp+".sha256")
 		cm.mu.Lock()
 		delete(cm.entries, cp)
 		if serr == nil {
@@ -194,7 +208,14 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 	if workers > len(missing) {
 		workers = len(missing)
 	}
-	idxCh := make(chan int64)
+	// Buffered and pre-filled before workers start: no feeder goroutine, no
+	// shutdown-time block on an unbuffered send (the other pools select on
+	// ctx.Done in their feed loop; prefilling makes that unnecessary here).
+	idxCh := make(chan int64, len(missing))
+	for _, idx := range missing {
+		idxCh <- idx
+	}
+	close(idxCh)
 	errCh := make(chan error, len(missing))
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -202,14 +223,14 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 		go func() {
 			defer wg.Done()
 			for idx := range idxCh {
+				if ctx.Err() != nil {
+					errCh <- ctx.Err()
+					return
+				}
 				errCh <- cm.fetchAndLandChunk(ctx, chunkPathFor(filePath, idx))
 			}
 		}()
 	}
-	for _, idx := range missing {
-		idxCh <- idx
-	}
-	close(idxCh)
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
@@ -242,6 +263,7 @@ func (cm *DefaultCacheManager) fetchAndLandChunk(ctx context.Context, chunkPath 
 		cm.mu.Lock()
 		cm.entries[chunkPath] = &meta
 		cm.mu.Unlock()
+		cm.metrics.RecordWrite(landed.Size)
 		return nil
 	}
 	if lastErr == nil {

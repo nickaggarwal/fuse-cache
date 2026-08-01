@@ -62,13 +62,9 @@ func (cm *DefaultCacheManager) enforceGlobalRangeBudgetLocked(keepPath string) {
 	if budget <= 0 {
 		return
 	}
-	total := int64(0)
-	for _, fc := range cm.rangeChunks {
-		if fc != nil {
-			total += fc.bytes
-		}
-	}
-	for total > budget && len(cm.rangeChunks) > 0 {
+	// Maintained counter, not a scan: this runs on every chunk insert under
+	// rangeMu, and O(files) work there throttles the whole read path.
+	for cm.rangeTotalBytes > budget && len(cm.rangeChunks) > 0 {
 		oldestPath := ""
 		var oldest time.Time
 		for path, fc := range cm.rangeChunks {
@@ -85,9 +81,6 @@ func (cm *DefaultCacheManager) enforceGlobalRangeBudgetLocked(keepPath string) {
 		}
 		if oldestPath == "" {
 			return
-		}
-		if fc := cm.rangeChunks[oldestPath]; fc != nil {
-			total -= fc.bytes
 		}
 		cm.dropFileCacheLocked(oldestPath)
 		cm.metrics.RangeCacheFileEvictions.Add(1)

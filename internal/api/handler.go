@@ -788,8 +788,9 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_range_cache_bytes %d\n", rangeSnap.Bytes)
 	fmt.Fprintf(w, "fuse_range_prefetch_inflight %d\n", rangeSnap.PrefetchInFlight)
 	fmt.Fprintf(w, "fuse_range_prefetch_bytes %d\n", rangeSnap.PrefetchBytes)
-	fmt.Fprintf(w, "fuse_range_cache_file_evictions_total %d\n", dcm.GetCacheMetrics().RangeCacheFileEvictions.Load())
-	fmt.Fprintf(w, "fuse_range_cache_idle_expiries_total %d\n", dcm.GetCacheMetrics().RangeCacheIdleExpiries.Load())
+	cmx := dcm.GetCacheMetrics()
+	fmt.Fprintf(w, "fuse_range_cache_file_evictions_total %d\n", cmx.RangeCacheFileEvictions.Load())
+	fmt.Fprintf(w, "fuse_range_cache_idle_expiries_total %d\n", cmx.RangeCacheIdleExpiries.Load())
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
@@ -829,9 +830,9 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)
-	fmt.Fprintf(w, "fuse_chunk_completion_assembled_total %d\n", dcm.GetCacheMetrics().ChunkCompletionAssembled.Load())
-	fmt.Fprintf(w, "fuse_chunk_completion_fetched_total %d\n", dcm.GetCacheMetrics().ChunkCompletionFetched.Load())
-	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", dcm.GetCacheMetrics().ChunkCompletionSkipped.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_assembled_total %d\n", cmx.ChunkCompletionAssembled.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_fetched_total %d\n", cmx.ChunkCompletionFetched.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", cmx.ChunkCompletionSkipped.Load())
 
 	// Observed pairwise latency (this node → each peer), used for traversal
 	// ordering on the peer read path.

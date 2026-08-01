@@ -6,6 +6,16 @@ import (
 	"time"
 )
 
+// nvmePressureNum/Den express the NVMe usage watermark (80%) above which
+// opportunistic promotion is skipped: promotion writes above the eviction
+// watermark trigger full-entry eviction scans that block foreground reads.
+// Shared by BeginPromotion and maybeAdvertiseFetchedChunk so streaming and
+// background promotion cannot drift apart.
+const (
+	nvmePressureNum = 8
+	nvmePressureDen = 10
+)
+
 // PromotionSink lets a transport stream remote bytes straight to local NVMe
 // while the response is still arriving (tee), instead of materializing the
 // object in memory and re-writing it to disk in a background promotion pass.
@@ -54,20 +64,15 @@ func (cm *DefaultCacheManager) BeginPromotion(path string, size int64) (StreamPr
 		}
 	}
 
-	cm.mu.RLock()
-	used, capacity := cm.nvmeUsed, cm.config.MaxNVMeSize
-	existing := cm.entries[path]
-	cm.mu.RUnlock()
+	used, capacity := cm.Stats()
 
 	// Pressure skip (same threshold as maybeAdvertiseFetchedChunk) and a
 	// no-evict capacity check: streaming promotion is opportunistic.
-	if capacity > 0 && (used > capacity*8/10 || used+size > capacity) {
+	if capacity > 0 && (used > capacity*nvmePressureNum/nvmePressureDen || used+size > capacity) {
 		release()
 		return nil, false
 	}
-	// Already local with the same size: nothing to do.
-	if existing != nil && existing.Tier == TierNVMe && existing.Size == size &&
-		cm.nvmeStorage.Exists(context.Background(), path) {
+	if cm.alreadyLocalNVMe(context.Background(), path, size) {
 		release()
 		return nil, false
 	}

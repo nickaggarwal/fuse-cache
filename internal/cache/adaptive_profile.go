@@ -1,7 +1,5 @@
 package cache
 
-import "time"
-
 // Per-file adaptive I/O profiles.
 //
 // The static flags (ParallelRangeReads, RangePrefetch*) describe ONE
@@ -54,16 +52,17 @@ type readProfile struct {
 
 // readProfileFor derives the read pipeline shape for one file.
 func (cm *DefaultCacheManager) readProfileFor(fileSize, chunkSize int64) readProfile {
+	if chunkSize <= 0 || fileSize <= chunkSize {
+		// Small: single-object read; no fan-out, no readahead (and no
+		// throughput-derivation work — this is the hottest class).
+		return readProfile{workers: 1, prefetchMaxChunks: 0}
+	}
+
 	workers := cm.config.ParallelRangeReads
 	if workers < 1 {
 		workers = 1
 	}
 	prefetchMax := cm.adaptivePrefetchMaxChunks(chunkSize)
-
-	if chunkSize <= 0 || fileSize <= chunkSize {
-		// Small: single-object read; no fan-out, no readahead.
-		return readProfile{workers: 1, prefetchMaxChunks: 0}
-	}
 	if fileSize <= mediumFileMax {
 		// Medium: configured baseline, window capped to the file itself so a
 		// 64MB file can't reserve a 512MB readahead budget.
@@ -90,17 +89,11 @@ func (cm *DefaultCacheManager) readProfileFor(fileSize, chunkSize int64) readPro
 // throughput ≈ one chunk per chunk-transfer-time across the window. With no
 // samples yet it returns 0 (caller keeps the configured baseline).
 func (cm *DefaultCacheManager) derivedLargeReadWorkers(chunkSize int64) int {
-	ops := cm.metrics.PeerReadOps.Load()
-	if ops < adaptiveWindowMinSamples || chunkSize <= 0 {
+	if chunkSize <= 0 {
 		return 0
 	}
-	bytes := cm.metrics.PeerReadBytes.Load()
-	nanos := cm.metrics.PeerReadNanos.Load()
-	if bytes <= 0 || nanos <= 0 {
-		return 0
-	}
-	perStreamBps := float64(bytes) / (float64(nanos) / 1e9)
-	if perStreamBps <= 0 {
+	perStreamBps, ok := cm.peerPerStreamBytesPerSec()
+	if !ok {
 		return 0
 	}
 	// Keep windowTargetDuration of data in flight, one chunk per worker.
@@ -132,7 +125,3 @@ func (cm *DefaultCacheManager) persistWorkersFor(numChunks int64) int {
 	}
 	return workers
 }
-
-// profileObservabilityInterval rate-limits profile logging per file class so
-// derivation decisions are visible in production without log spam.
-const profileObservabilityInterval = time.Minute

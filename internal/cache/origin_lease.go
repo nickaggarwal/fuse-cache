@@ -103,7 +103,7 @@ func (cm *DefaultCacheManager) getFromCloudLeased(ctx context.Context, path stri
 	}
 
 	acquireCtx, cancel := context.WithTimeout(ctx, originLeaseCallTimeout)
-	holder, granted, err := leaser.AcquireFetchLease(acquireCtx, path, cm.config.LocalPeerID, originLeaseTTL)
+	_, granted, err := leaser.AcquireFetchLease(acquireCtx, path, cm.config.LocalPeerID, originLeaseTTL)
 	cancel()
 	if err != nil {
 		// Advisory: coordinator trouble must never block the read.
@@ -128,7 +128,6 @@ func (cm *DefaultCacheManager) getFromCloudLeased(ctx context.Context, path stri
 	// the leader's chunk to NVMe and peer reads scan all active peers, so the
 	// leader is reachable even before advertisement lands.
 	cm.herdStats.leaseDenied.Add(1)
-	_ = holder
 	if err := sleepWithJitter(ctx, originLeaseFollowerWaitMin, originLeaseFollowerWaitMax); err != nil {
 		return nil, TierCloud, err
 	}

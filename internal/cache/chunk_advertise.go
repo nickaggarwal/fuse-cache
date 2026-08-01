@@ -167,7 +167,7 @@ func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath st
 		// 90% eviction watermark, triggers a full-entry eviction scan that
 		// blocks the read path's RLocks. Never let a foreground read pay that —
 		// skip promotion once NVMe is busy and let existing holders serve.
-		if used, capacity := cm.Stats(); capacity > 0 && used > capacity*8/10 {
+		if used, capacity := cm.Stats(); capacity > 0 && used > capacity*nvmePressureNum/nvmePressureDen {
 			<-cm.chunkPromoteGate
 			return
 		}

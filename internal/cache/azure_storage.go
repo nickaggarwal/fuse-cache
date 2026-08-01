@@ -130,10 +130,8 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 // downloader. Small blobs (<= one block) complete in exactly one round-trip;
 // larger ones get concurrency without the GetProperties latency tax.
 func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path string) ([]byte, error) {
+	// Constructor guarantees downloadBlockSize > 0.
 	blockSize := as.downloadBlockSize
-	if blockSize <= 0 {
-		blockSize = 4 * 1024 * 1024
-	}
 
 	resp, err := as.client.DownloadStream(ctx, as.containerName, path, &azblob.DownloadStreamOptions{
 		Range: azblob.HTTPRange{Offset: 0, Count: blockSize},
@@ -153,13 +151,10 @@ func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path str
 		}
 	}
 	if total < 0 {
-		// No Content-Range (zero-byte blob or server quirk): drain what came.
-		defer resp.Body.Close()
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, resp.Body); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+		// No Content-Range (zero-byte blob or server quirk): fall back to the
+		// plain stream read rather than re-implementing it here.
+		resp.Body.Close()
+		return as.readStream(ctx, path)
 	}
 
 	buf := make([]byte, total)
