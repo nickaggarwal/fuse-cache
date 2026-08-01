@@ -110,7 +110,15 @@ config:
   fuseBackend: "gofuse"
   goFuseEnablePassthrough: "true"
   goFuseWriteAppendBufferMB: "8"
-  goFuseWritebackCache: "true"
+  # Writeback cache measured on EKS i7ie (2026-08-01): +4-6% on >=64MB
+  # sequential writes but -14% on small files (flush amplification), and the
+  # append buffer already coalesces small writes. Default OFF; flip per
+  # deployment only for workloads that are exclusively large sequential
+  # writes (e.g. checkpoint-save-heavy nodes).
+  goFuseWritebackCache: "false"
+  # 4MB kernel write size: fewer FUSE round-trips on bulk writes, no
+  # measured downside (default was 1MB).
+  goFuseMaxWriteKB: "4096"
 
 secrets:
   aws:

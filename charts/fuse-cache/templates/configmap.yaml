@@ -46,3 +46,4 @@ data:
   FUSE_GOFUSE_ENABLE_PASSTHROUGH: {{ .Values.config.goFuseEnablePassthrough | quote }}
   FUSE_GOFUSE_WRITE_APPEND_BUFFER_MB: {{ .Values.config.goFuseWriteAppendBufferMB | quote }}
   FUSE_GOFUSE_WRITEBACK_CACHE: {{ .Values.config.goFuseWritebackCache | quote }}
+  FUSE_GOFUSE_MAX_WRITE_KB: {{ .Values.config.goFuseMaxWriteKB | quote }}
