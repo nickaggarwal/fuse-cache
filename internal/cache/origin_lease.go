@@ -41,6 +41,10 @@ type herdControlStats struct {
 	reconcileRuns         atomic.Int64
 	reconcileReplications atomic.Int64
 	reconcileSkippedBusy  atomic.Int64
+	// Ordered chunk fallback: busy-peer retries attempted / recovered
+	// (each hit is a cloud round-trip avoided).
+	busyChunkRetries   atomic.Int64
+	busyChunkRetryHits atomic.Int64
 }
 
 // HerdControlSnapshot is the exported view of Phase 2/3 counters.
@@ -54,6 +58,8 @@ type HerdControlSnapshot struct {
 	ReconcileRunsTotal         int64
 	ReconcileReplicationsTotal int64
 	ReconcileSkippedBusyTotal  int64
+	BusyChunkRetriesTotal      int64
+	BusyChunkRetryHitsTotal    int64
 }
 
 // HerdControlSnapshot returns Phase 2/3 counters.
@@ -68,6 +74,8 @@ func (cm *DefaultCacheManager) HerdControlSnapshot() HerdControlSnapshot {
 		ReconcileRunsTotal:         cm.herdStats.reconcileRuns.Load(),
 		ReconcileReplicationsTotal: cm.herdStats.reconcileReplications.Load(),
 		ReconcileSkippedBusyTotal:  cm.herdStats.reconcileSkippedBusy.Load(),
+		BusyChunkRetriesTotal:      cm.herdStats.busyChunkRetries.Load(),
+		BusyChunkRetryHitsTotal:    cm.herdStats.busyChunkRetryHits.Load(),
 	}
 }
 
@@ -145,4 +153,37 @@ func (cm *DefaultCacheManager) getFromRemoteTier(ctx context.Context, path strin
 	}
 	entry, err := cm.getFromTier(ctx, path, tier)
 	return entry, tier, err
+}
+
+// peerBusyChunkRetryMin/Max bound the jittered wait before re-trying a
+// busy peer tier on the ordered chunk fallback. Short on purpose: it must
+// stay well under one cloud chunk fetch (~400ms for 4MiB at 10MB/s observed)
+// or the retry costs more than the fallback it avoids.
+const (
+	peerBusyChunkRetryMinWait = 20 * time.Millisecond
+	peerBusyChunkRetryMaxWait = 80 * time.Millisecond
+)
+
+// getFromRemoteTierWithBusyRetry is getFromRemoteTier plus one jittered
+// same-tier retry when the peer tier failed busy. Rationale: on the chunk
+// fallback path, "peer busy" almost always means the (often only) holder is
+// momentarily at its serve gate — the data is provably there, since sibling
+// chunks are being served from it. Falling straight to cloud turns a ~5ms
+// peer read into a ~400ms origin read (observed 79-197 cloud leaks per 5GB
+// cold read). One short retry drains the vast majority of these; a genuinely
+// overloaded peer still fails busy again and the caller proceeds to cloud.
+func (cm *DefaultCacheManager) getFromRemoteTierWithBusyRetry(ctx context.Context, path string, tier CacheTier) (*CacheEntry, CacheTier, error) {
+	entry, servedTier, err := cm.getFromRemoteTier(ctx, path, tier)
+	if err == nil || tier != TierPeer || !isPeerBusy(err) || ctx.Err() != nil {
+		return entry, servedTier, err
+	}
+	cm.herdStats.busyChunkRetries.Add(1)
+	if serr := sleepWithJitter(ctx, peerBusyChunkRetryMinWait, peerBusyChunkRetryMaxWait); serr != nil {
+		return nil, tier, err
+	}
+	entry, servedTier, retryErr := cm.getFromRemoteTier(ctx, path, tier)
+	if retryErr == nil {
+		cm.herdStats.busyChunkRetryHits.Add(1)
+	}
+	return entry, servedTier, retryErr
 }

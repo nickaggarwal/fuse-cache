@@ -177,6 +177,10 @@ type CacheConfig struct {
 	// without a read. 0 uses the default; negative disables idle expiry.
 	RangeCacheIdleExpiry time.Duration
 
+	// ChunkCompletionDisabled turns off the post-read completion pass that
+	// fills unlanded chunks and assembles whole parent files on NVMe.
+	ChunkCompletionDisabled bool
+
 	// RangePrefetchMaxBytes bounds bytes reserved for prefetch that are not yet
 	// part of the settled range cache.
 	RangePrefetchMaxBytes int64
@@ -285,6 +289,7 @@ type DefaultCacheManager struct {
 	chunkAds         *chunkAdvertiser
 	chunkPromoteGate chan struct{}
 	tierPerf         *tierPerfTracker
+	chunkCompletion  chunkCompletionState
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
 	bgWg             sync.WaitGroup
@@ -2718,7 +2723,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	// the leader via the peer tier. servedTier is where the data actually came
 	// from (a lease follower asked for cloud but got peer).
 	tierStart = time.Now()
-	if chunkEntry, servedTier, err := cm.getFromRemoteTier(ctx, chunkPath, primary); err == nil {
+	if chunkEntry, servedTier, err := cm.getFromRemoteTierWithBusyRetry(ctx, chunkPath, primary); err == nil {
 		tierDur := time.Since(tierStart)
 		cm.metrics.RecordHit(servedTier)
 		cm.metrics.RecordTierRead(servedTier, int64(len(chunkEntry.Data)), tierDur)
@@ -2737,7 +2742,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 	cm.metrics.RecordMiss(primary)
 
 	tierStart = time.Now()
-	if chunkEntry, servedTier, err := cm.getFromRemoteTier(ctx, chunkPath, secondary); err == nil {
+	if chunkEntry, servedTier, err := cm.getFromRemoteTierWithBusyRetry(ctx, chunkPath, secondary); err == nil {
 		tierDur := time.Since(tierStart)
 		cm.metrics.RecordHit(servedTier)
 		cm.metrics.RecordTierRead(servedTier, int64(len(chunkEntry.Data)), tierDur)
@@ -2922,7 +2927,9 @@ func (cm *DefaultCacheManager) observeReadPattern(filePath string, offset, end, 
 	if base <= 0 || chunkSize <= 0 {
 		return 0, false
 	}
-	maxChunks := cm.config.RangePrefetchMaxChunks
+	// Derive the window cap from measured peer throughput (static cap is the
+	// floor); a fast link earns a deeper window, a slow one keeps memory flat.
+	maxChunks := cm.adaptivePrefetchMaxChunks(chunkSize)
 	if maxChunks < base {
 		maxChunks = base
 	}
@@ -3310,6 +3317,11 @@ type CacheMetrics struct {
 	// the all-files byte budget, and idle-expiry sweeps.
 	RangeCacheFileEvictions atomic.Int64
 	RangeCacheIdleExpiries  atomic.Int64
+	// Chunk completion: whole files assembled, hole chunks fetched, passes
+	// skipped for NVMe headroom.
+	ChunkCompletionAssembled atomic.Int64
+	ChunkCompletionFetched   atomic.Int64
+	ChunkCompletionSkipped   atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics

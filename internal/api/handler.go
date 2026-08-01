@@ -827,6 +827,11 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_replica_reconcile_runs_total %d\n", hc.ReconcileRunsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_replications_total %d\n", hc.ReconcileReplicationsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
+	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
+	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)
+	fmt.Fprintf(w, "fuse_chunk_completion_assembled_total %d\n", dcm.GetCacheMetrics().ChunkCompletionAssembled.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_fetched_total %d\n", dcm.GetCacheMetrics().ChunkCompletionFetched.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", dcm.GetCacheMetrics().ChunkCompletionSkipped.Load())
 
 	// Observed pairwise latency (this node → each peer), used for traversal
 	// ordering on the peer read path.

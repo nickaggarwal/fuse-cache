@@ -127,10 +127,12 @@ func (cm *DefaultCacheManager) startRangeCacheSweeper(interval time.Duration) {
 // sweepIdleRangeCaches drops per-file caches whose last access is older than
 // expiry. Files with prefetch still in flight are skipped — the fetch is
 // about to write into the cache, so dropping it would leak the accounting.
+// Each expired file is also a "read session ended" signal: schedule the
+// chunk-completion pass so the next read of it can be fully local.
 func (cm *DefaultCacheManager) sweepIdleRangeCaches(now time.Time, expiry time.Duration) {
 	cutoff := now.Add(-expiry)
+	var expired []string
 	cm.rangeMu.Lock()
-	defer cm.rangeMu.Unlock()
 	for path, fc := range cm.rangeChunks {
 		if fc == nil {
 			delete(cm.rangeChunks, path)
@@ -142,6 +144,12 @@ func (cm *DefaultCacheManager) sweepIdleRangeCaches(now time.Time, expiry time.D
 		if fc.lastAccess.Before(cutoff) {
 			cm.dropFileCacheLocked(path)
 			cm.metrics.RangeCacheIdleExpiries.Add(1)
+			expired = append(expired, path)
 		}
+	}
+	cm.rangeMu.Unlock()
+
+	for _, path := range expired {
+		cm.maybeScheduleChunkCompletion(path)
 	}
 }
