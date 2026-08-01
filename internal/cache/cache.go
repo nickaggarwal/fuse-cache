@@ -1779,13 +1779,10 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 		return
 	}
 
-	workers := cm.config.ParallelRangeReads
-	if workers < 1 {
-		workers = 4
-	}
-	if workers > 8 {
-		workers = 8
-	}
+	// Persist concurrency scales with backlog: a 640-chunk checkpoint gets
+	// the max pool, a 3-chunk file the floor (the old fixed cap of 8
+	// throttled multi-GB uploads).
+	workers := cm.persistWorkersFor(numChunks)
 
 	jobs := make(chan int64, workers*2)
 	var wg sync.WaitGroup
@@ -2287,7 +2284,10 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		hybridRead = cm.shouldUseHybridRead(ctx, fmt.Sprintf("%s_chunk_%d", filePath, 0), totalSize)
 	}
 
-	workerCount := cm.config.ParallelRangeReads
+	// Per-file profile: workers derive from file size and measured link
+	// speed (configured value is the floor; small files skip fan-out).
+	profile := cm.readProfileFor(totalSize, chunkSize)
+	workerCount := profile.workers
 	if workerCount < 1 {
 		workerCount = 1
 	}
@@ -2357,7 +2357,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 	chunkEndBoundary := (endChunk + 1) * chunkSize
 	nearBoundary := chunkSize > 0 && chunkEndBoundary-end <= prefetchTrigger
-	window, sequential := cm.observeReadPattern(filePath, offset, end, endChunk, chunkSize)
+	window, sequential := cm.observeReadPattern(filePath, totalSize, offset, end, endChunk, chunkSize)
 	if window > 0 && (sequential || offset%chunkSize == 0 || nearBoundary) {
 		prefetchChunks, prefetchBudgetBytes, rangeBytes := cm.reservePrefetchChunks(filePath, endChunk, entry.NumChunks, chunkSize, window)
 		if largeRead && len(prefetchChunks) > 0 {
@@ -2922,14 +2922,19 @@ func (cm *DefaultCacheManager) dropFileCacheLocked(filePath string) {
 // a random access resets it to the base. A sequential stream re-reading below
 // the prefetch high-water mark (e.g. a second pass over the file) re-arms
 // lastPrefetchTrigger so prefetch works for repeat passes.
-func (cm *DefaultCacheManager) observeReadPattern(filePath string, offset, end, endChunk, chunkSize int64) (int, bool) {
+func (cm *DefaultCacheManager) observeReadPattern(filePath string, fileSize, offset, end, endChunk, chunkSize int64) (int, bool) {
 	base := cm.config.RangePrefetchChunks
 	if base <= 0 || chunkSize <= 0 {
 		return 0, false
 	}
-	// Derive the window cap from measured peer throughput (static cap is the
-	// floor); a fast link earns a deeper window, a slow one keeps memory flat.
-	maxChunks := cm.adaptivePrefetchMaxChunks(chunkSize)
+	// Per-file profile: throughput-derived window, gated by size class
+	// (small files get no readahead, medium files can't reserve more than
+	// their own length). Static config remains the floor for large files.
+	profile := cm.readProfileFor(fileSize, chunkSize)
+	maxChunks := profile.prefetchMaxChunks
+	if maxChunks <= 0 {
+		return 0, false
+	}
 	if maxChunks < base {
 		maxChunks = base
 	}

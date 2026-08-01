@@ -174,7 +174,7 @@ func TestObserveReadPattern_TouchesLastAccess(t *testing.T) {
 
 	fillFile(cm, "/s.bin", 2, time.Now().Add(-time.Hour))
 	before := time.Now()
-	cm.observeReadPattern("/s.bin", 0, 8, 1, 4)
+	cm.observeReadPattern("/s.bin", 1<<20, 0, 8, 1, 4)
 
 	cm.rangeMu.RLock()
 	la := cm.rangeChunks["/s.bin"].lastAccess

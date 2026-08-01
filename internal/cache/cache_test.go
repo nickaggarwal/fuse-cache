@@ -1654,7 +1654,7 @@ func TestObserveReadPattern_SequentialGrowsWindow(t *testing.T) {
 
 	path := "/seq.bin"
 	// First read has no history: base window, not sequential.
-	window, sequential := cm.observeReadPattern(path, 0, 4, 0, 4)
+	window, sequential := cm.observeReadPattern(path, 1<<20, 0, 4, 0, 4)
 	if window != 2 || sequential {
 		t.Fatalf("first read window=%d sequential=%t, want 2 false", window, sequential)
 	}
@@ -1662,7 +1662,7 @@ func TestObserveReadPattern_SequentialGrowsWindow(t *testing.T) {
 	wantWindows := []int{4, 8, 8, 8}
 	for i, want := range wantWindows {
 		offset := int64(4 * (i + 1))
-		window, sequential = cm.observeReadPattern(path, offset, offset+4, offset/4, 4)
+		window, sequential = cm.observeReadPattern(path, 1<<20, offset, offset+4, offset/4, 4)
 		if !sequential {
 			t.Fatalf("read %d not detected as sequential", i+2)
 		}
@@ -1679,14 +1679,14 @@ func TestObserveReadPattern_RandomResetsWindow(t *testing.T) {
 	cm.config.RangePrefetchMaxChunks = 8
 
 	path := "/rand.bin"
-	cm.observeReadPattern(path, 0, 4, 0, 4)
-	cm.observeReadPattern(path, 4, 8, 1, 4)
-	window, sequential := cm.observeReadPattern(path, 8, 12, 2, 4)
+	cm.observeReadPattern(path, 1<<20, 0, 4, 0, 4)
+	cm.observeReadPattern(path, 1<<20, 4, 8, 1, 4)
+	window, sequential := cm.observeReadPattern(path, 1<<20, 8, 12, 2, 4)
 	if window != 8 || !sequential {
 		t.Fatalf("sequential ramp window=%d sequential=%t, want 8 true", window, sequential)
 	}
 	// A far seek resets the streak back to the base window.
-	window, sequential = cm.observeReadPattern(path, 100, 104, 25, 4)
+	window, sequential = cm.observeReadPattern(path, 1<<20, 100, 104, 25, 4)
 	if window != 2 || sequential {
 		t.Fatalf("random read window=%d sequential=%t, want 2 false", window, sequential)
 	}
@@ -1708,8 +1708,8 @@ func TestObserveReadPattern_RearmsPrefetchOnSecondPass(t *testing.T) {
 
 	// A restarted stream at the beginning of the file re-arms the trigger once
 	// it is recognized as sequential.
-	cm.observeReadPattern(path, 0, 4, 0, 4)
-	_, sequential := cm.observeReadPattern(path, 4, 8, 1, 4)
+	cm.observeReadPattern(path, 1<<20, 0, 4, 0, 4)
+	_, sequential := cm.observeReadPattern(path, 1<<20, 4, 8, 1, 4)
 	if !sequential {
 		t.Fatal("second-pass read not detected as sequential")
 	}
