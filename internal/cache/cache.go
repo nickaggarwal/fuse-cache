@@ -167,6 +167,16 @@ type CacheConfig struct {
 	// OOMs on chunk-heavy workloads.
 	RangeChunkCacheMaxBytes int64
 
+	// RangeCacheGlobalMaxBytes bounds the range cache across ALL files. Per-file
+	// budgets alone let N sequential readers pin N full per-file caches long
+	// after the reads finish (observed: 5 files x 1GiB retained on a 16GB node).
+	// 0 derives min(4 x per-file budget, 25% of system RAM); negative disables.
+	RangeCacheGlobalMaxBytes int64
+
+	// RangeCacheIdleExpiry drops a file's whole range cache after this long
+	// without a read. 0 uses the default; negative disables idle expiry.
+	RangeCacheIdleExpiry time.Duration
+
 	// RangePrefetchMaxBytes bounds bytes reserved for prefetch that are not yet
 	// part of the settled range cache.
 	RangePrefetchMaxBytes int64
@@ -290,6 +300,10 @@ type chunkFileCache struct {
 	// Sequential-stream detection for adaptive readahead.
 	lastReadEnd int64
 	seqStreak   int
+	// lastAccess drives global LRU-by-file eviction and idle expiry: a file
+	// nobody is reading must not pin heap (a 5GB sequential read leaves a
+	// full per-file cache behind otherwise).
+	lastAccess time.Time
 }
 
 type RangeCacheSnapshot struct {
@@ -384,6 +398,12 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if config.RangePrefetchMaxChunks < config.RangePrefetchChunks {
 		config.RangePrefetchMaxChunks = config.RangePrefetchChunks
 	}
+	if config.RangeCacheGlobalMaxBytes == 0 {
+		config.RangeCacheGlobalMaxBytes = deriveRangeCacheGlobalMaxBytes(config.RangeChunkCacheMaxBytes)
+	}
+	if config.RangeCacheIdleExpiry == 0 {
+		config.RangeCacheIdleExpiry = defaultRangeCacheIdleExpiry
+	}
 	if config.PeerReadThroughputBytesPerSec <= 0 {
 		config.PeerReadThroughputBytesPerSec = 200 * 1024 * 1024
 	}
@@ -451,6 +471,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		ps, err = NewPeerStorage(config.Coordinator, config.PeerTimeout, config.LocalPeerID, config.PeerReadSortByNetwork, config.PeerReadParallelFanout, config.PeerRawTransport, config.APIKey)
 		if err == nil {
 			ps.replicationStagger = config.PeerReplicationStagger
+			// Stream raw-transport peer reads to NVMe as bytes arrive, so
+			// promotion doesn't re-write the object in the background.
+			ps.promoteSink = cm
 			ps.startGC(shutdownCtx)
 			cm.peerStorage = ps
 		}
@@ -503,6 +526,10 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if config.ReplicaReconcileInterval > 0 {
 		cm.startReplicaReconciler(shutdownCtx)
 	}
+
+	// Idle-expiry sweeper for the range cache: reclaims per-file chunk caches
+	// once their reader has moved on (global budget bounds the worst case).
+	cm.startRangeCacheSweeper(rangeCacheSweepInterval)
 
 	// Background GC for hybridHints — prevents unbounded growth.
 	gcInterval := config.MetadataRefreshTTL * 10
@@ -2095,7 +2122,22 @@ func mergeEntries(local []*CacheEntry, remote []*CacheEntry) []*CacheEntry {
 	return merged
 }
 
+// alreadyLocalNVMe reports whether path is NVMe-resident with the given size,
+// so promotion passes can skip re-writing bytes a streaming (tee) promotion
+// already landed.
+func (cm *DefaultCacheManager) alreadyLocalNVMe(ctx context.Context, path string, size int64) bool {
+	cm.mu.RLock()
+	existing := cm.entries[path]
+	cm.mu.RUnlock()
+	return existing != nil && existing.Tier == TierNVMe && existing.Size == size &&
+		cm.nvmeStorage.Exists(ctx, path)
+}
+
 func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEntry) {
+	if cm.alreadyLocalNVMe(ctx, entry.FilePath, entry.Size) {
+		cm.touchEntries(entry.FilePath)
+		return
+	}
 	newEntry := &CacheEntry{
 		FilePath:     entry.FilePath,
 		StoragePath:  entry.StoragePath,
@@ -2887,6 +2929,7 @@ func (cm *DefaultCacheManager) observeReadPattern(filePath string, offset, end, 
 
 	cm.rangeMu.Lock()
 	fileCache := cm.fileCacheLocked(filePath)
+	fileCache.touchLocked(time.Now())
 	sequential := fileCache.lastReadEnd > 0 &&
 		offset >= fileCache.lastReadEnd-chunkSize &&
 		offset <= fileCache.lastReadEnd+chunkSize
@@ -2957,6 +3000,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 
 	cm.rangeMu.Lock()
 	fileCache := cm.fileCacheLocked(filePath)
+	fileCache.touchLocked(time.Now())
 	if existing, exists := fileCache.chunks[chunkIndex]; exists {
 		fileCache.bytes -= int64(len(existing.data))
 	} else {
@@ -2974,6 +3018,7 @@ func (cm *DefaultCacheManager) setChunkInRangeCache(filePath string, chunkIndex 
 	for fileCache.bytes > cm.config.RangeChunkCacheMaxBytes && len(fileCache.order) > 0 {
 		cm.evictOldestRangeChunkLocked(fileCache)
 	}
+	cm.enforceGlobalRangeBudgetLocked(filePath)
 	snapshotChunks := len(fileCache.order)
 	snapshotBytes := fileCache.bytes
 	shouldLog := false
@@ -3219,6 +3264,12 @@ func (cm *DefaultCacheManager) Stats() (used, capacity int64) {
 }
 
 // GetMetrics returns the cache metrics for reporting
+// GetCacheMetrics exposes the raw counter struct (for Prometheus export of
+// counters not in the Snapshot map).
+func (cm *DefaultCacheManager) GetCacheMetrics() *CacheMetrics {
+	return cm.metrics
+}
+
 func (cm *DefaultCacheManager) GetMetrics() map[string]interface{} {
 	return cm.metrics.Snapshot()
 }
@@ -3255,6 +3306,10 @@ type CacheMetrics struct {
 	PrefetchIssued atomic.Int64
 	PrefetchHits   atomic.Int64
 	PrefetchWasted atomic.Int64
+	// Global range-cache budget accounting: whole-file cache evictions from
+	// the all-files byte budget, and idle-expiry sweeps.
+	RangeCacheFileEvictions atomic.Int64
+	RangeCacheIdleExpiries  atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics
@@ -3424,6 +3479,8 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"prefetch_issued":       m.PrefetchIssued.Load(),
 		"prefetch_hits":         m.PrefetchHits.Load(),
 		"prefetch_wasted":       m.PrefetchWasted.Load(),
+		"range_cache_file_evictions": m.RangeCacheFileEvictions.Load(),
+		"range_cache_idle_expiries":  m.RangeCacheIdleExpiries.Load(),
 		"nvme_read_wall_mbps":   bytesPerSecToMBps(nvmeReadWall, readWallNanos),
 		"peer_read_wall_mbps":   bytesPerSecToMBps(peerReadWall, readWallNanos),
 		"cloud_read_wall_mbps":  bytesPerSecToMBps(cloudReadWall, readWallNanos),

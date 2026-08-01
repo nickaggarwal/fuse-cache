@@ -788,6 +788,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_range_cache_bytes %d\n", rangeSnap.Bytes)
 	fmt.Fprintf(w, "fuse_range_prefetch_inflight %d\n", rangeSnap.PrefetchInFlight)
 	fmt.Fprintf(w, "fuse_range_prefetch_bytes %d\n", rangeSnap.PrefetchBytes)
+	fmt.Fprintf(w, "fuse_range_cache_file_evictions_total %d\n", dcm.GetCacheMetrics().RangeCacheFileEvictions.Load())
+	fmt.Fprintf(w, "fuse_range_cache_idle_expiries_total %d\n", dcm.GetCacheMetrics().RangeCacheIdleExpiries.Load())
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)

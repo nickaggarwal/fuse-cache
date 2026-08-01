@@ -82,24 +82,35 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 		return
 	}
 
-	chunkEntry := &CacheEntry{
-		FilePath:     chunkPath,
-		StoragePath:  chunkPath,
-		Size:         int64(len(data)),
-		LastAccessed: time.Now(),
-		Tier:         TierNVMe,
-		Data:         data,
+	// A streaming (tee) promotion may have landed these bytes during the
+	// transfer itself; skip the redundant write but still advertise.
+	if !cm.alreadyLocalNVMe(ctx, chunkPath, int64(len(data))) {
+		chunkEntry := &CacheEntry{
+			FilePath:     chunkPath,
+			StoragePath:  chunkPath,
+			Size:         int64(len(data)),
+			LastAccessed: time.Now(),
+			Tier:         TierNVMe,
+			Data:         data,
+		}
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
+			cm.logger.Printf("Chunk promote to NVMe failed for %s: %v", chunkPath, err)
+			return
+		}
+		chunkMeta := *chunkEntry
+		chunkMeta.Data = nil
+		cm.mu.Lock()
+		cm.entries[chunkPath] = &chunkMeta
+		cm.mu.Unlock()
 	}
-	if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
-		cm.logger.Printf("Chunk promote to NVMe failed for %s: %v", chunkPath, err)
-		return
-	}
-	chunkMeta := *chunkEntry
-	chunkMeta.Data = nil
-	cm.mu.Lock()
-	cm.entries[chunkPath] = &chunkMeta
-	cm.mu.Unlock()
 
+	cm.advertiseChunkParent(ctx, filePath)
+}
+
+// advertiseChunkParent publishes this node as a holder of filePath (coalesced
+// via chunkAds). Split from promotion so a chunk landed by a streaming (tee)
+// promotion still grows the swarm without a second payload write.
+func (cm *DefaultCacheManager) advertiseChunkParent(ctx context.Context, filePath string) {
 	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
 		return
 	}
@@ -160,6 +171,17 @@ func (cm *DefaultCacheManager) maybeAdvertiseFetchedChunk(filePath, chunkPath st
 			<-cm.chunkPromoteGate
 			return
 		}
+	}
+	// A streaming (tee) promotion may have already landed this chunk during
+	// the transfer; advertise without copying or rewriting the payload.
+	if cm.alreadyLocalNVMe(cm.shutdownCtx, chunkPath, int64(len(data))) {
+		cm.goBackground(func() {
+			if cm.chunkPromoteGate != nil {
+				defer func() { <-cm.chunkPromoteGate }()
+			}
+			cm.advertiseChunkParent(cm.shutdownCtx, filePath)
+		})
+		return
 	}
 	// Copy: the caller's buffer is shared with the range cache.
 	dataCopy := make([]byte, len(data))

@@ -305,6 +305,20 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_MAX_BYTES_MB value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_RANGE_CACHE_GLOBAL_MAX_BYTES_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n != 0 {
+			cacheConfig.RangeCacheGlobalMaxBytes = int64(n) * 1024 * 1024
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_CACHE_GLOBAL_MAX_BYTES_MB value %q: %v", v, err)
+		}
+	}
+	if v := os.Getenv("FUSE_RANGE_CACHE_IDLE_EXPIRY_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n != 0 {
+			cacheConfig.RangeCacheIdleExpiry = time.Duration(n) * time.Second
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_RANGE_CACHE_IDLE_EXPIRY_SEC value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_PEER_READ_SORT_BY_NETWORK"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			cacheConfig.PeerReadSortByNetwork = parsed

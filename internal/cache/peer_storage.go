@@ -57,6 +57,12 @@ type PeerStorage struct {
 	apiKey              string
 	httpClient          *http.Client
 
+	// promoteSink, when set, lets raw HTTP reads stream arriving bytes to
+	// local NVMe while the response buffer fills (tee), so promotion costs no
+	// second full-file write after the transfer. Nil disables streaming
+	// promotion; the cache manager's background promote path still applies.
+	promoteSink PromotionSink
+
 	// replicationStagger is the base jittered delay between successive replica
 	// writes of one object; 0 uses the default.
 	replicationStagger time.Duration
@@ -921,6 +927,22 @@ func (ps *PeerStorage) readPeerDataInner(ctx context.Context, peer *coordinator.
 	return ps.readFromPeer(ctx, peer.GRPCAddress, path)
 }
 
+// bestEffortWriter forwards writes to w until one fails, then silently drops
+// the rest: the promotion is abandoned (Abort) but the read continues.
+type bestEffortWriter struct {
+	w      io.Writer
+	failed bool
+}
+
+func (b *bestEffortWriter) Write(p []byte) (int, error) {
+	if !b.failed {
+		if _, err := b.w.Write(p); err != nil {
+			b.failed = true
+		}
+	}
+	return len(p), nil
+}
+
 // readFromPeerRaw fetches a path from a peer's plain-HTTP bulk-read endpoint.
 func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path string) ([]byte, error) {
 	if ps.httpClient == nil {
@@ -957,6 +979,29 @@ func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path strin
 
 	// Size the buffer from Content-Length when known to avoid reallocation.
 	if resp.ContentLength >= 0 {
+		// Streaming promotion: tee arriving bytes to local NVMe while the
+		// buffer fills, so promotion costs no second full-object write (and
+		// no background copy) after the transfer. Failure to promote never
+		// fails the read.
+		if ps.promoteSink != nil {
+			if promo, ok := ps.promoteSink.BeginPromotion(path, resp.ContentLength); ok {
+				// bestEffortWriter: a disk-write failure abandons the
+				// promotion but must never fail the network read, so the tee
+				// swallows write errors (io.TeeReader would surface them).
+				bw := &bestEffortWriter{w: promo}
+				buf := make([]byte, resp.ContentLength)
+				if _, err := io.ReadFull(io.TeeReader(resp.Body, bw), buf); err != nil {
+					promo.Abort()
+					return nil, err
+				}
+				if bw.failed {
+					promo.Abort()
+				} else {
+					promo.Commit()
+				}
+				return buf, nil
+			}
+		}
 		buf := make([]byte, resp.ContentLength)
 		if _, err := io.ReadFull(resp.Body, buf); err != nil {
 			return nil, err
