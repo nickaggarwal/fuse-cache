@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,8 +78,19 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	defer cancel()
 
 	// Chunk-object reads dominate cold range-read traffic. Avoiding a separate
-	// GetProperties HEAD request removes one round-trip per chunk.
+	// GetProperties HEAD request removes one round-trip per chunk, and the
+	// first-range read discovers the size from Content-Range so the rest of
+	// the blob downloads in parallel (a single sequential GET was the ~10MB/s
+	// tail on every cloud-fallback chunk).
 	if isChunkObjectPath(path) {
+		data, err := as.readFirstRangeThenParallel(timeoutCtx, path)
+		if err == nil {
+			return data, nil
+		}
+		if timeoutCtx.Err() != nil {
+			return nil, err
+		}
+		// Any non-timeout failure falls back to the plain stream read.
 		return as.readStream(timeoutCtx, path)
 	}
 
@@ -110,6 +122,70 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	return as.readStream(timeoutCtx, path)
+}
+
+// readFirstRangeThenParallel reads one blob without a prior HEAD: it GETs the
+// first block with an explicit Range, learns the total size from the
+// response, and pulls the remainder with the SDK's parallel ranged
+// downloader. Small blobs (<= one block) complete in exactly one round-trip;
+// larger ones get concurrency without the GetProperties latency tax.
+func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path string) ([]byte, error) {
+	blockSize := as.downloadBlockSize
+	if blockSize <= 0 {
+		blockSize = 4 * 1024 * 1024
+	}
+
+	resp, err := as.client.DownloadStream(ctx, as.containerName, path, &azblob.DownloadStreamOptions{
+		Range: azblob.HTTPRange{Offset: 0, Count: blockSize},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// ContentLength is the range length; the blob's total size arrives in
+	// ContentRange ("bytes 0-N/total").
+	total := int64(-1)
+	if resp.ContentRange != nil {
+		if idx := strings.LastIndex(*resp.ContentRange, "/"); idx >= 0 {
+			if v, perr := strconv.ParseInt((*resp.ContentRange)[idx+1:], 10, 64); perr == nil {
+				total = v
+			}
+		}
+	}
+	if total < 0 {
+		// No Content-Range (zero-byte blob or server quirk): drain what came.
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, resp.Body); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
+	buf := make([]byte, total)
+	first := total
+	if first > blockSize {
+		first = blockSize
+	}
+	_, err = io.ReadFull(resp.Body, buf[:first])
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if total <= blockSize {
+		return buf, nil
+	}
+
+	// Remainder in parallel ranged blocks.
+	_, err = as.client.DownloadBuffer(ctx, as.containerName, path, buf[first:], &azblob.DownloadBufferOptions{
+		Range:       azblob.HTTPRange{Offset: first, Count: total - first},
+		BlockSize:   blockSize,
+		Concurrency: as.downloadConcurrency,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (as *AzureStorage) readStream(ctx context.Context, path string) ([]byte, error) {
