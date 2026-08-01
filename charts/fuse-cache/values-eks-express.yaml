@@ -1,0 +1,48 @@
+# EKS + S3 Express One Zone overlay for the fuse-cache chart.
+# Validated live on cluster fuse-snap-test (2026-08-01). Gotchas this file
+# encodes — do not "simplify" them away:
+#   - storageClassName gp2, not managed-csi: fresh EKS ships only the gp2
+#     StorageClass (via the aws-ebs-csi-driver addon; the addon plus the
+#     AmazonEBSCSIDriverPolicy on the node role must exist — terraform/aws
+#     creates both). managed-csi is AKS-only and pends forever here.
+#   - No agentpool nodeSelector: that label is AKS-specific; on EKS the
+#     DaemonSet schedules on 0 nodes with it (observed: DESIRED 0).
+#   - s3Endpoint must be the ZONAL Express endpoint and the node group must
+#     sit in the same AZ (us-east-1d = use1-az6 in this account) or every
+#     cloud-tier byte pays a cross-AZ hop.
+#   - Image must include fuse-client commit f154904 (Content-MD5 disabled
+#     for --x-s3 buckets) — older images get 501 on every Express upload.
+#   - Secret aws-credentials needs AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/
+#     AWS_REGION with s3express:CreateSession + s3:* on the bucket. Prefer
+#     a scoped IAM user or IRSA over an account-level key.
+
+image:
+  repository: 375353318962.dkr.ecr.us-east-1.amazonaws.com/fuse-client
+  tag: express-v1
+
+coordinator:
+  replicaCount: 3
+  persistence:
+    enabled: true
+    storageClassName: gp2
+
+client:
+  nodeSelector: {}
+  cloudProvider: s3
+
+config:
+  chunkSizeMB: "8"
+  s3Bucket: "fuse-snap-cache--use1-az6--x-s3"
+  s3Region: "us-east-1"
+  s3Endpoint: "https://s3express-use1-az6.us-east-1.amazonaws.com"
+  s3DownloadConcurrency: "32"
+  s3UploadConcurrency: "16"
+
+# Secret aws-credentials is expected to exist already (create it out of band;
+# never commit keys). azure.create false skips the Azure secret entirely.
+secrets:
+  aws:
+    create: false
+    name: aws-credentials
+  azure:
+    create: false

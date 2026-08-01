@@ -4,8 +4,10 @@
 #   only holds intra-AZ.
 # - Ubuntu2404: containerd 2.x (pod-snapshotter hard requirement) and
 #   apt-installable CRIU, matching its verified AKS environment.
-# - m6id.2xlarge: 8 vCPU / 32 GiB / 474 GB instance-store NVMe for
-#   fuse-client node-init discovery / 12.5 Gbps.
+# - i7ie.xlarge: 4 vCPU / 32 GiB / 2.5 TB latest-gen instance-store NVMe /
+#   up to 25 Gbps — fastest NVMe+network per vCPU within the account's
+#   16-vCPU on-demand quota (3 nodes = 12 vCPUs; raise to 32 requested,
+#   status PENDING).
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 
@@ -16,12 +18,14 @@ metadata:
 
 managedNodeGroups:
   - name: nvme-ubuntu
-    instanceType: m6id.2xlarge
+    instanceType: i7ie.xlarge
     desiredCapacity: 3
     minSize: 0
     maxSize: 3
     amiFamily: Ubuntu2404
-    availabilityZones: ["us-east-1d"]
+    # Public subnet created manually in us-east-1d (the eksctl-managed VPC
+    # only covered 1b/1c): 192.168.128.0/19, IGW route, cluster-shared tag.
+    subnets: ["subnet-0da349ad3a220c210"]
     volumeSize: 80
     labels:
       workload: fuse-snap-test

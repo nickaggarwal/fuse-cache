@@ -1,0 +1,15 @@
+# Provider binaries / module cache
+**/.terraform/
+
+# Local state (test infra uses local state; never commit it)
+*.tfstate
+*.tfstate.*
+
+# Real variable files may carry account-specific values
+*.tfvars
+!*.tfvars.example
+
+# Crash logs / plan files
+crash.log
+crash.*.log
+*.tfplan

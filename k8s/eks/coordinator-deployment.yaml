@@ -1,0 +1,126 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coordinator
+  namespace: fuse-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: coordinator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: fuse-system
+  labels:
+    app: coordinator
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: coordinator
+  template:
+    metadata:
+      labels:
+        app: coordinator
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: coordinator
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: coordinator
+          image: 375353318962.dkr.ecr.us-east-1.amazonaws.com/fuse-client:express-v1
+          command: ["coordinator"]
+          args:
+            - "-port"
+            - "8080"
+            - "-grpc-port"
+            - "9080"
+            - "-etcd-endpoints"
+            - "$(ETCD_ENDPOINTS)"
+            - "-etcd-prefix"
+            - "/fuse"
+            # ~3x the client heartbeat interval (30s) so one delayed
+            # heartbeat can't expire the peer's liveness lease.
+            - "-etcd-peer-lease-ttl"
+            - "90"
+          env:
+            - name: ETCD_ENDPOINTS
+              value: "http://etcd-0.etcd.fuse-system.svc.cluster.local:2379,http://etcd-1.etcd.fuse-system.svc.cluster.local:2379,http://etcd-2.etcd.fuse-system.svc.cluster.local:2379"
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9080
+              name: grpc
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: fuse-system
+  labels:
+    app: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app: coordinator
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+    - port: 9080
+      targetPort: 9080
+      protocol: TCP
+      name: grpc
+---
+# Headless service for gRPC client-side load balancing (dns:///).
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-headless
+  namespace: fuse-system
+  labels:
+    app: coordinator
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: coordinator
+  ports:
+    - port: 9080
+      targetPort: 9080
+      protocol: TCP
+      name: grpc

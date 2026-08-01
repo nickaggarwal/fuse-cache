@@ -297,3 +297,24 @@ spec:
       targetPort: {{ .Values.client.grpcPort }}
       protocol: TCP
       name: grpc
+---
+# Stable ClusterIP service for external consumers (pod-snapshotter's manager
+# defaults its fuseAPIEndpoint to fuse-client.<ns>.svc:8081). GOTCHA
+# (2026-08-01, EKS): only client-headless existed, so every artifact
+# existence check failed DNS and restores timed out in Pending.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuse-client
+  namespace: {{ include "fuse-cache.namespace" . }}
+  labels:
+    app: client
+spec:
+  type: ClusterIP
+  selector:
+    app: client
+  ports:
+    - port: {{ .Values.client.httpPort }}
+      targetPort: {{ .Values.client.httpPort }}
+      protocol: TCP
+      name: http

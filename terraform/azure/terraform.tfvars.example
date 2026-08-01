@@ -1,0 +1,42 @@
+# Copy to terraform.tfvars and adjust. All values shown are the defaults.
+
+# Required by azurerm 4.x (or export ARM_SUBSCRIPTION_ID instead).
+# Auth itself is `az login` — no credentials belong in this file.
+subscription_id = ""
+
+location            = "eastus"
+resource_group_name = "fuse-snap-aks-rg"
+cluster_name        = "fuse-snap-aks"
+kubernetes_version  = "1.33" # Ubuntu2404 os_sku needs AKS >= 1.32
+
+# System pool: small, always on.
+system_pool_vm_size = "Standard_D4as_v5"
+system_pool_count   = 1
+
+# NVMe pool: local NVMe for fuse-client node-init. ~$0.62/hr/node —
+# default 0 (scale-to-zero); scale up only while testing:
+#   az aks nodepool scale -g fuse-snap-aks-rg --cluster-name fuse-snap-aks -n nvme --node-count 3
+nvme_pool_vm_size   = "Standard_L8s_v3"
+nvme_pool_count     = 0
+nvme_pool_max_count = 3
+
+# GPU pool: A100 for GPU checkpoint/restore. ~$3.7/hr/node — keep gated off
+# and at count 0 unless actively testing.
+enable_gpu_pool  = false
+gpu_pool_vm_size = "Standard_NC24ads_A100_v4"
+gpu_pool_count   = 0
+
+# Storage account name = prefix + random 8-char suffix; container for the
+# fuse-client cloud tier.
+storage_account_prefix = "fusesnap"
+blob_container_name    = "fuse-cache"
+
+# true (default) = Premium block blob account: SSD-backed, single-digit-ms
+# latency (Azure's S3 Express analogue). false = Standard StorageV2, ~8x
+# cheaper per GB, for comparison runs. Flipping this REPLACES the account.
+premium_blob = true
+
+# Existing ACR (images already live in stargzrepo — no ACR is created).
+# Set both to grant the cluster AcrPull on it; leave empty to skip.
+existing_acr_name           = ""
+existing_acr_resource_group = ""

@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: fuse-system
+  labels:
+    app: etcd
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # Publish per-pod DNS before readiness: members must resolve each other to
+  # form the initial quorum, and readiness itself requires quorum.
+  publishNotReadyAddresses: true
+  selector:
+    app: etcd
+  ports:
+    - port: 2379
+      name: client
+    - port: 2380
+      name: peer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-client
+  namespace: fuse-system
+  labels:
+    app: etcd
+spec:
+  type: ClusterIP
+  selector:
+    app: etcd
+  ports:
+    - port: 2379
+      targetPort: 2379
+      name: client
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: etcd
+  namespace: fuse-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: etcd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: fuse-system
+  labels:
+    app: etcd
+spec:
+  serviceName: etcd
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: etcd
+                topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: data
+          emptyDir: {}
+      containers:
+        - name: etcd
+          # NOTE: quay.io/coreos/etcd v3.5+ images have no shell; use direct
+          # exec with Kubernetes $(VAR) expansion instead of /bin/sh.
+          image: quay.io/coreos/etcd:v3.5.13
+          command:
+            - etcd
+            - --name=$(HOSTNAME)
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(HOSTNAME).etcd:2379
+            - --initial-advertise-peer-urls=http://$(HOSTNAME).etcd:2380
+            - --initial-cluster-token=fuse-etcd-cluster
+            - --initial-cluster=etcd-0=http://etcd-0.etcd:2380,etcd-1=http://etcd-1.etcd:2380,etcd-2=http://etcd-2.etcd:2380
+            - --initial-cluster-state=new
+            - --data-dir=/var/lib/etcd
+            - --auto-compaction-mode=periodic
+            - --auto-compaction-retention=1h
+            - --snapshot-count=10000
+            - --quota-backend-bytes=2147483648
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+          livenessProbe:
+            exec:
+              command:
+                - etcdctl
+                - endpoint
+                - health
+                - --endpoints=http://127.0.0.1:2379
+            # Health requires quorum; give a fresh cluster time to elect
+            # before killing members (a tight probe deadlocks bootstrap:
+            # kill → restart → re-elect → kill).
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 8
+          readinessProbe:
+            exec:
+              command:
+                - etcdctl
+                - endpoint
+                - health
+                - --endpoints=http://127.0.0.1:2379
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

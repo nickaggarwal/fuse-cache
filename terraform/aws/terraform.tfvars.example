@@ -1,0 +1,34 @@
+# Copy to terraform.tfvars and adjust. All values shown are the defaults.
+
+aws_profile        = "pod-snap-test"
+region             = "us-east-1"
+cluster_name       = "fuse-snap-test"
+kubernetes_version = "1.33"
+
+# Single-AZ pinning: availability_zone (name) and az_id (zone ID) must refer
+# to the SAME zone. The name→ID mapping differs per AWS account — verify:
+#   aws ec2 describe-availability-zones --region us-east-1 \
+#     --query 'AvailabilityZones[].[ZoneName,ZoneId]' --output table
+availability_zone = "us-east-1d"
+az_id             = "use1-az6"
+
+node_instance_type = "m6id.2xlarge" # ~$0.47/hr on-demand, x3 nodes
+node_desired_size  = 3
+node_min_size      = 0
+node_max_size      = 3
+
+# "AL2023_x86_64_STANDARD" (default) or "UBUNTU" (EKS-optimized Ubuntu 24.04
+# via custom launch template). Both give containerd >= 2.0 on EKS 1.33.
+node_ami_family  = "AL2023_x86_64_STANDARD"
+node_volume_size = 80
+
+# Directory bucket becomes: <express_bucket_base>--<az_id>--x-s3
+express_bucket_base = "fuse-snap-cache"
+
+# Flip on to also create a standard S3 bucket for Express-vs-standard tests.
+create_standard_bucket = false
+standard_bucket_name   = "fuse-snap-cache-standard"
+
+# Transfer Acceleration on the standard bucket: only useful for clients far
+# from the region — pointless (and billed) for intra-region EKS traffic.
+enable_transfer_acceleration = false
