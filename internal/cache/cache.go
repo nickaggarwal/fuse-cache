@@ -51,6 +51,11 @@ type CacheEntry struct {
 	IsChunked    bool
 	NumChunks    int64
 	Checksum     string
+	// PersistedToCloud is set once the background write-through confirms the
+	// object is durable in the cloud tier. Eviction must not delete NVMe
+	// bytes whose only copy is local — that turns cache pressure into data
+	// loss.
+	PersistedToCloud bool
 }
 
 // CacheManager manages the 3-tier cache system
@@ -180,6 +185,10 @@ type CacheConfig struct {
 	// ChunkCompletionDisabled turns off the post-read completion pass that
 	// fills unlanded chunks and assembles whole parent files on NVMe.
 	ChunkCompletionDisabled bool
+
+	// WatermarkEvictDisabled turns off the background pressure evictor
+	// (reactive write-path eviction still applies).
+	WatermarkEvictDisabled bool
 
 	// RangePrefetchMaxBytes bounds bytes reserved for prefetch that are not yet
 	// part of the settled range cache.
@@ -539,6 +548,11 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// Idle-expiry sweeper for the range cache: reclaims per-file chunk caches
 	// once their reader has moved on (global budget bounds the worst case).
 	cm.startRangeCacheSweeper(rangeCacheSweepInterval)
+
+	// Background watermark evictor: keeps NVMe inside the pressure band so
+	// foreground writes (almost) never pay the eviction scan, and reacts to
+	// real device fullness (shared host disk), not just our own accounting.
+	cm.startWatermarkEvictor()
 
 	// Background GC for hybridHints — prevents unbounded growth.
 	gcInterval := config.MetadataRefreshTTL * 10
@@ -1662,12 +1676,18 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 	if tier != TierNVMe {
 		return nil
 	}
+	cm.evictToTarget(ctx, cm.config.MaxNVMeSize*9/10) // evict down to 90%
+	return nil
+}
 
-	target := cm.config.MaxNVMeSize * 9 / 10 // evict down to 90%
+// evictToTarget deletes least-recently-accessed NVMe entries until usage is
+// at or under target bytes. Shared by the reactive write-path Evict and the
+// background watermark evictor; both honor pinning and the durability guard.
+func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) {
 	cm.mu.RLock()
 	if cm.nvmeUsed <= target {
 		cm.mu.RUnlock()
-		return nil
+		return
 	}
 
 	// Collect NVMe entries and sort by LastAccessed (oldest first)
@@ -1707,6 +1727,13 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 		if isPathPinned(ref.key, pinnedPrefixes) {
 			continue
 		}
+		// Durability guard: never evict the only copy. Under sustained
+		// pressure with a slow cloud link this can leave usage above target —
+		// by design; ENOSPC risk beats data loss.
+		if !cm.evictionSafe(ctx, ref.key, ref.entry) {
+			cm.metrics.EvictionSkippedUnpersisted.Add(1)
+			continue
+		}
 		freed, err := cm.deleteLocalNVMeFootprint(ctx, ref.key, true, true)
 		if err != nil {
 			cm.logger.Printf("Eviction delete failed for %s: %v", ref.key, err)
@@ -1715,8 +1742,60 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 		cm.metrics.RecordEviction()
 		cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 	}
+}
 
-	return nil
+// markPersistedToCloud flags filePath (and, for a chunk, refreshes the parent
+// when every sibling chunk is durable) as safely evictable.
+func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if e, ok := cm.entries[filePath]; ok && e != nil {
+		e.PersistedToCloud = true
+	}
+	parentPath, isChunk := parentFilePathFromChunkPath(filePath)
+	if !isChunk {
+		return
+	}
+	parent, ok := cm.entries[parentPath]
+	if !ok || parent == nil || !parent.IsChunked || parent.PersistedToCloud {
+		return
+	}
+	for i := int64(0); i < parent.NumChunks; i++ {
+		ce, ok := cm.entries[chunkPathFor(parentPath, i)]
+		if !ok || ce == nil || !ce.PersistedToCloud {
+			return
+		}
+	}
+	parent.PersistedToCloud = true
+}
+
+// evictionSafe reports whether an entry's bytes exist beyond this node.
+// Unpersisted entries are only evictable if the cloud tier independently has
+// the object (covers restarts, where the in-memory bit is lost).
+func (cm *DefaultCacheManager) evictionSafe(ctx context.Context, key string, entry *CacheEntry) bool {
+	if entry != nil && entry.PersistedToCloud {
+		return true
+	}
+	if cm.cloudStorage == nil {
+		return false
+	}
+	// HEAD probes, only on the eviction path (covers restart, where the
+	// in-memory bit is lost). Chunked parents persist as chunk objects, so
+	// probe first+last chunk as a bounded proxy for the set.
+	if entry != nil && entry.IsChunked && entry.NumChunks > 0 {
+		if !cm.cloudStorage.Exists(ctx, chunkPathFor(key, 0)) {
+			return false
+		}
+		if entry.NumChunks > 1 && !cm.cloudStorage.Exists(ctx, chunkPathFor(key, entry.NumChunks-1)) {
+			return false
+		}
+		return true
+	}
+	if cm.cloudStorage.Exists(ctx, key) {
+		cm.markPersistedToCloud(key)
+		return true
+	}
+	return false
 }
 
 // isPathPinned reports whether path falls under any of the given prefixes.
@@ -1750,6 +1829,7 @@ func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath stri
 
 		if err == nil {
 			cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", filePath, len(data))
+			cm.markPersistedToCloud(filePath)
 			// Already in a background goroutine; call synchronously to stay tracked.
 			cm.publishFileLocation(context.Background(), &CacheEntry{
 				FilePath:     filePath,
@@ -3332,6 +3412,10 @@ type CacheMetrics struct {
 	ChunkCompletionAssembled atomic.Int64
 	ChunkCompletionFetched   atomic.Int64
 	ChunkCompletionSkipped   atomic.Int64
+	// Eviction durability guard + watermark evictor.
+	EvictionSkippedUnpersisted atomic.Int64
+	WatermarkEvictorRuns       atomic.Int64
+	WatermarkEvictedBytes      atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics
@@ -3469,47 +3553,50 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 	readWallOther := m.ReadWallOther.Load()
 
 	return map[string]interface{}{
-		"nvme_hits":                  m.NVMeHits.Load(),
-		"nvme_misses":                m.NVMeMisses.Load(),
-		"peer_hits":                  m.PeerHits.Load(),
-		"peer_misses":                m.PeerMisses.Load(),
-		"cloud_hits":                 m.CloudHits.Load(),
-		"cloud_misses":               m.CloudMisses.Load(),
-		"write_count":                m.WriteCount.Load(),
-		"write_bytes":                m.WriteBytes.Load(),
-		"eviction_count":             m.EvictionCount.Load(),
-		"nvme_read_bytes":            nvmeReadBytes,
-		"nvme_read_nanos":            nvmeReadNanos,
-		"nvme_read_ops":              m.NVMeReadOps.Load(),
-		"peer_read_bytes":            peerReadBytes,
-		"peer_read_nanos":            peerReadNanos,
-		"peer_read_ops":              m.PeerReadOps.Load(),
-		"cloud_read_bytes":           cloudReadBytes,
-		"cloud_read_nanos":           cloudReadNanos,
-		"cloud_read_ops":             m.CloudReadOps.Load(),
-		"nvme_read_mbps":             bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
-		"peer_read_mbps":             bytesPerSecToMBps(peerReadBytes, peerReadNanos),
-		"cloud_read_mbps":            bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
-		"read_wall_bytes":            readWallBytes,
-		"read_wall_nanos":            readWallNanos,
-		"read_wall_ops":              m.ReadWallOps.Load(),
-		"read_wall_mbps":             bytesPerSecToMBps(readWallBytes, readWallNanos),
-		"nvme_read_wall_bytes":       nvmeReadWall,
-		"peer_read_wall_bytes":       peerReadWall,
-		"cloud_read_wall_bytes":      cloudReadWall,
-		"read_wall_other_bytes":      readWallOther,
-		"prefetch_issued":            m.PrefetchIssued.Load(),
-		"prefetch_hits":              m.PrefetchHits.Load(),
-		"prefetch_wasted":            m.PrefetchWasted.Load(),
-		"range_cache_file_evictions": m.RangeCacheFileEvictions.Load(),
-		"range_cache_idle_expiries":  m.RangeCacheIdleExpiries.Load(),
-		"chunk_completion_assembled": m.ChunkCompletionAssembled.Load(),
-		"chunk_completion_fetched":   m.ChunkCompletionFetched.Load(),
-		"chunk_completion_skipped":   m.ChunkCompletionSkipped.Load(),
-		"nvme_read_wall_mbps":        bytesPerSecToMBps(nvmeReadWall, readWallNanos),
-		"peer_read_wall_mbps":        bytesPerSecToMBps(peerReadWall, readWallNanos),
-		"cloud_read_wall_mbps":       bytesPerSecToMBps(cloudReadWall, readWallNanos),
-		"read_wall_other_mbps":       bytesPerSecToMBps(readWallOther, readWallNanos),
+		"nvme_hits":                    m.NVMeHits.Load(),
+		"nvme_misses":                  m.NVMeMisses.Load(),
+		"peer_hits":                    m.PeerHits.Load(),
+		"peer_misses":                  m.PeerMisses.Load(),
+		"cloud_hits":                   m.CloudHits.Load(),
+		"cloud_misses":                 m.CloudMisses.Load(),
+		"write_count":                  m.WriteCount.Load(),
+		"write_bytes":                  m.WriteBytes.Load(),
+		"eviction_count":               m.EvictionCount.Load(),
+		"nvme_read_bytes":              nvmeReadBytes,
+		"nvme_read_nanos":              nvmeReadNanos,
+		"nvme_read_ops":                m.NVMeReadOps.Load(),
+		"peer_read_bytes":              peerReadBytes,
+		"peer_read_nanos":              peerReadNanos,
+		"peer_read_ops":                m.PeerReadOps.Load(),
+		"cloud_read_bytes":             cloudReadBytes,
+		"cloud_read_nanos":             cloudReadNanos,
+		"cloud_read_ops":               m.CloudReadOps.Load(),
+		"nvme_read_mbps":               bytesPerSecToMBps(nvmeReadBytes, nvmeReadNanos),
+		"peer_read_mbps":               bytesPerSecToMBps(peerReadBytes, peerReadNanos),
+		"cloud_read_mbps":              bytesPerSecToMBps(cloudReadBytes, cloudReadNanos),
+		"read_wall_bytes":              readWallBytes,
+		"read_wall_nanos":              readWallNanos,
+		"read_wall_ops":                m.ReadWallOps.Load(),
+		"read_wall_mbps":               bytesPerSecToMBps(readWallBytes, readWallNanos),
+		"nvme_read_wall_bytes":         nvmeReadWall,
+		"peer_read_wall_bytes":         peerReadWall,
+		"cloud_read_wall_bytes":        cloudReadWall,
+		"read_wall_other_bytes":        readWallOther,
+		"prefetch_issued":              m.PrefetchIssued.Load(),
+		"prefetch_hits":                m.PrefetchHits.Load(),
+		"prefetch_wasted":              m.PrefetchWasted.Load(),
+		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),
+		"range_cache_idle_expiries":    m.RangeCacheIdleExpiries.Load(),
+		"chunk_completion_assembled":   m.ChunkCompletionAssembled.Load(),
+		"chunk_completion_fetched":     m.ChunkCompletionFetched.Load(),
+		"chunk_completion_skipped":     m.ChunkCompletionSkipped.Load(),
+		"eviction_skipped_unpersisted": m.EvictionSkippedUnpersisted.Load(),
+		"watermark_evictor_runs":       m.WatermarkEvictorRuns.Load(),
+		"watermark_evicted_bytes":      m.WatermarkEvictedBytes.Load(),
+		"nvme_read_wall_mbps":          bytesPerSecToMBps(nvmeReadWall, readWallNanos),
+		"peer_read_wall_mbps":          bytesPerSecToMBps(peerReadWall, readWallNanos),
+		"cloud_read_wall_mbps":         bytesPerSecToMBps(cloudReadWall, readWallNanos),
+		"read_wall_other_mbps":         bytesPerSecToMBps(readWallOther, readWallNanos),
 	}
 }
 

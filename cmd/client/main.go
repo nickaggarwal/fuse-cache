@@ -312,6 +312,13 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_RANGE_CACHE_GLOBAL_MAX_BYTES_MB value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_WATERMARK_EVICT_DISABLED"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.WatermarkEvictDisabled = parsed
+		} else {
+			logger.Printf("WARNING: invalid FUSE_WATERMARK_EVICT_DISABLED value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_RANGE_CACHE_IDLE_EXPIRY_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n != 0 {
 			cacheConfig.RangeCacheIdleExpiry = time.Duration(n) * time.Second

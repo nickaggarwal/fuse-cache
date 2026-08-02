@@ -355,6 +355,8 @@ func TestCacheManager_Evict(t *testing.T) {
 			Size:         30,
 			LastAccessed: time.Now().Add(time.Duration(i) * time.Second),
 			Data:         make([]byte, 30),
+			// Durable in cloud: eviction refuses to delete the only copy.
+			PersistedToCloud: true,
 		}
 		cm.nvmeStorage.Write(ctx, entry.FilePath, entry.Data)
 		cm.mu.Lock()
@@ -644,6 +646,8 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 		Tier:         TierNVMe,
 		IsChunked:    true,
 		NumChunks:    2,
+		// Durable in cloud: eviction refuses to delete the only copy.
+		PersistedToCloud: true,
 	}
 	cm.nvmeUsed = 8
 	cm.mu.Unlock()
