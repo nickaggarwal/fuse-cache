@@ -130,3 +130,86 @@ func TestMultipartPartSizeFor(t *testing.T) {
 		}
 	}
 }
+
+// TestRehydrateNVMeAccounting: a fresh manager over a pre-populated cache dir
+// adopts files with sizes, mtime-based LRU age, and no persisted bit; skips
+// sidecars and staging temps; leaves pre-existing entries alone.
+func TestRehydrateNVMeAccounting(t *testing.T) {
+	cm := evictTestManager(t, 1<<30)
+	ctx := context.Background()
+
+	// Simulate the PREVIOUS process: land files directly on disk.
+	cm.nvmeStorage.Write(ctx, "/old-whole.bin", make([]byte, 3000))
+	cm.nvmeStorage.Write(ctx, "/old.bin_chunk_0", make([]byte, 1024))
+	cm.nvmeStorage.Write(ctx, "/sub/dir/nested.bin", make([]byte, 500))
+	cm.nvmeStorage.Write(ctx, "/old-whole.bin.sha256", []byte("cafe"))
+	// Pre-existing entry must not be double-counted.
+	seedNVMe(t, cm, "/known.bin", 2000, true, time.Hour)
+
+	adopted, bytes := cm.rehydrateNVMeAccounting()
+
+	if adopted != 3 {
+		t.Fatalf("adopted = %d, want 3 (whole, chunk, nested; not sidecar/known)", adopted)
+	}
+	if bytes != 3000+1024+500 {
+		t.Fatalf("bytes = %d, want %d", bytes, 3000+1024+500)
+	}
+	cm.mu.RLock()
+	used := cm.nvmeUsed
+	e := cm.entries["/old-whole.bin"]
+	nested := cm.entries["/sub/dir/nested.bin"]
+	cm.mu.RUnlock()
+	if used != 2000+3000+1024+500 {
+		t.Fatalf("nvmeUsed = %d, want %d", used, 2000+3000+1024+500)
+	}
+	if e == nil || e.Tier != TierNVMe || e.PersistedToCloud {
+		t.Fatalf("rehydrated entry wrong: %+v (persisted bit must be false)", e)
+	}
+	if nested == nil || nested.Size != 500 {
+		t.Fatalf("nested entry not adopted: %+v", nested)
+	}
+
+	// Idempotent: second pass adopts nothing.
+	adopted2, _ := cm.rehydrateNVMeAccounting()
+	if adopted2 != 0 {
+		t.Fatalf("second rehydration adopted %d, want 0", adopted2)
+	}
+}
+
+// TestRehydratedEntriesEvictOnlyWhenCloudConfirms: the restart flow end to
+// end — rehydrated (unpersisted-bit) entries evict only after the cloud
+// size-probe confirms durability.
+func TestRehydratedEntriesEvictOnlyWhenCloudConfirms(t *testing.T) {
+	cm := evictTestManager(t, 5_000)
+	ctx := context.Background()
+
+	// Previous process landed two files; only one made it to cloud.
+	cm.nvmeStorage.Write(ctx, "/durable.bin", make([]byte, 3000))
+	cm.cloudStorage.Write(ctx, "/durable.bin", make([]byte, 3000))
+	cm.nvmeStorage.Write(ctx, "/local-only.bin", make([]byte, 3000))
+
+	cm.rehydrateNVMeAccounting()
+	// Make /durable.bin the older (preferred) eviction candidate.
+	cm.mu.Lock()
+	cm.entries["/durable.bin"].LastAccessed = time.Now().Add(-2 * time.Hour)
+	cm.entries["/local-only.bin"].LastAccessed = time.Now().Add(-1 * time.Hour)
+	used := cm.nvmeUsed
+	cm.mu.Unlock()
+	if used != 6000 {
+		t.Fatalf("nvmeUsed = %d, want 6000", used)
+	}
+
+	// 6000 > 5000 budget: evict down to 4500.
+	cm.Evict(ctx, TierNVMe)
+
+	cm.mu.RLock()
+	_, durableAlive := cm.entries["/durable.bin"]
+	_, localAlive := cm.entries["/local-only.bin"]
+	cm.mu.RUnlock()
+	if durableAlive {
+		t.Fatal("cloud-confirmed rehydrated entry should have been evicted")
+	}
+	if !localAlive {
+		t.Fatal("local-only rehydrated entry must survive (only copy)")
+	}
+}

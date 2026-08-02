@@ -556,6 +556,12 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// once their reader has moved on (global budget bounds the worst case).
 	cm.startRangeCacheSweeper(rangeCacheSweepInterval)
 
+	// Rebuild entries + nvmeUsed from what is actually on disk BEFORE the
+	// evictor starts: after a restart the accounting says zero while the
+	// dir holds everything the previous process landed, so budgets and LRU
+	// silently exclude pre-restart files.
+	cm.rehydrateNVMeAccounting()
+
 	// Background watermark evictor: keeps NVMe inside the pressure band so
 	// foreground writes (almost) never pay the eviction scan, and reacts to
 	// real device fullness (shared host disk), not just our own accounting.
