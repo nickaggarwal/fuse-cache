@@ -1,38 +1,62 @@
 # FUSE Client with 3-Tier Cache
 
-A distributed file system using FUSE (Filesystem in Userspace) with a 3-tier cache architecture, implemented in Go.
+A distributed file system that mounts as a local FUSE directory on every
+node. Writes land on local NVMe and persist to cloud storage asynchronously;
+reads hit the fastest tier that has the bytes and fall through automatically.
+Validated as the storage layer for GPU/CPU pod checkpoint-restore
+([pod-snapshotter](https://github.com/nickaggarwal/pod-snapshotter)) on both
+AKS and EKS.
 
 ## Architecture
 
-The system consists of:
+1. **Coordinator** (3 replicas, stateless, etcd-backed): peer registry with
+   TTL leases, file location metadata, fetch leases (thundering-herd
+   control). HTTP `:8080`, gRPC `:9080`.
+2. **Client** (DaemonSet, one per node): FUSE mount (`gofuse` backend with
+   kernel passthrough), 3-tier cache manager, peer HTTP `:8081` +
+   gRPC `:9081`, CSI agent socket.
+3. **3-Tier Cache**:
+   - **Tier 1 — local NVMe** (`~μs`): discovered per node by `node-init`
+     (raw-device format/mount supported); bounded by a byte budget with a
+     host-aware watermark evictor (85/75 band, statfs pressure, never evicts
+     bytes not yet durable in cloud)
+   - **Tier 2 — peers** (`~ms`): raw-HTTP bulk transport with sendfile on
+     the serve side and a streaming tee that lands remote chunks on local
+     NVMe during the transfer; gRPC fallback; serve-side admission control
+   - **Tier 3 — cloud** (`~100ms+`): AWS S3 (incl. **S3 Express One Zone**
+     directory buckets), Azure Blob (incl. premium block blob), GCS; chunk
+     reads use ranged parallel GETs with no HEAD round-trip
+4. **CSI subsystem**: CSI node plugin + agent gRPC + session manager for
+   mounting cache subtrees into pods with refcounting and pinning.
+5. **node-init**: per-node disk bootstrap — discovers the best local disk,
+   formats/mounts raw NVMe when needed, publishes the cache dir + byte
+   budget the client adopts (cloud-agnostic DaemonSet).
 
-1. **Master Coordinator**: Manages peer registration and metadata
-2. **Client Nodes**: Each exposes a FUSE filesystem and serves as a seed client
-3. **3-Tier Cache System**:
-   - **Tier 1**: NVME local storage (fastest)
-   - **Tier 2**: Other seed peers (distributed cache)
-   - **Tier 3**: Cloud storage (AWS S3 / Azure Blob / GCP Cloud Storage)
+## Highlights (validated Aug 2026)
 
-## Recent Features
-
-- **Helm + AKS-ready mount model**:
-  - Privileged client DaemonSet with `hostPID: true`
-  - Dedicated host-visible mount path (`/host/mnt/fuse` in container -> `/mnt/fuse` on node)
-  - Init container and preStop hooks to reduce stale FUSE mount failures
-- **Prometheus metrics endpoint**:
-  - Client now exposes `GET /metrics` (Prometheus text format)
-  - Includes cache hits/misses, write bytes/count, eviction counters, NVMe capacity/usage, coordinator availability
-  - Also includes read source contribution, range-cache memory, Go runtime memory, goroutines, and go-fuse write-phase vs sync totals
-- **Large file stability improvements**:
-  - Write path uses buffered growth to avoid O(n^2) realloc/copy behavior
-  - Chunked uploads avoid unbounded goroutine fanout
-  - Chunked reads use range-based reads with chunk reuse to avoid full-file in-memory reconstruction
-- **Ops runbook scripts** in `scripts/ops/` for deploy, node mount repair, and read benchmarking
-  - `test-smart-read.sh` supports cross-pod read/write benchmarks for arbitrary sizes (e.g. 100MB/1GB/5GB)
-  - `test-smart-read-5gb.sh` remains as a compatibility wrapper
-  - `benchmark-fuse-scenario.sh` records benchmark throughput together with node class, source contribution, cache state, CPU snapshots, network telemetry, and git commit
-  - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
-  - `test-smart-read-s3-profile.sh` labels `standard` vs `s3express` runs and checks zone alignment for S3 Express endpoints
+- **Performance** (5GB cross-node cold read): ~1.04 GB/s single reader,
+  ~1.34 GB/s aggregate with two concurrent readers (EKS `i7ie` + S3
+  Express); warm reads of completion-assembled files run at kernel
+  passthrough / device speed; 1GB served entirely from S3 Express in ~2.7s.
+- **Streaming tee promotion**: peer reads write NVMe while bytes arrive —
+  no second full-object write; a post-read completion pass fetches missed
+  chunks and assembles the whole file for passthrough serving.
+- **Per-file adaptive I/O profiles**: prefetch window, read fan-out, and
+  cloud-persist concurrency derive per call from file size and measured
+  link throughput; configured values are floors, not behavior.
+- **Bounded memory and disk**: global range-cache byte budget with
+  LRU-by-file eviction + idle expiry; host-aware NVMe watermark evictor
+  that reacts to real device pressure (statfs) and refuses to evict the
+  only unpersisted copy.
+- **Thundering-herd control**: serve-side admission gates, busy-peer
+  jittered retry before cloud fallback, cross-node fetch leases, fast chunk
+  advertisement (mid-transfer swarm growth), replica reconciler.
+- **Stale-peer fast fail**: 2s connect timeout on both transports, no
+  double-dial of dead addresses (rollout first-read stall: 30s → ~2s).
+- **Ops**: Prometheus `/metrics` + Grafana dashboard, benchmark scripts
+  that record node class/tier contribution/git SHA, Terraform for AWS
+  (EKS + S3 Express directory bucket + VPC endpoints) and Azure (AKS +
+  premium blob), Helm chart with per-cloud overlays.
 
 ## Operating Modes
 
@@ -114,58 +138,32 @@ reservations, `fuse_chunk_completion_*`, `fuse_busy_chunk_retry_*`,
 limits from FUSE-path limits from peer/cloud bottlenecks from cache-budget
 regressions in one pass.
 
-## Components
-
-### Master Coordinator
-- Manages peer registration and discovery
-- Tracks file locations across the distributed system
-- Provides REST API for peer communication
-- Handles peer heartbeats and status updates
-
-### Client Nodes
-- Exposes FUSE filesystem to users
-- Implements 3-tier cache hierarchy
-- Serves as seed peers for other nodes
-- Provides HTTP API for peer-to-peer communication
-
-### Cache Tiers
-
-#### Tier 1: NVME Storage
-- Local NVME/SSD storage for fastest access
-- Configurable cache size and location
-- Automatic promotion of frequently accessed files
-
-#### Tier 2: Peer Storage
-- Distributed cache across other seed peers
-- Peer discovery through master coordinator
-- HTTP-based file transfer between peers
-
-#### Tier 3: Cloud Storage
-- Pluggable backend for persistent storage (AWS S3, Azure Blob, or GCP Cloud Storage)
-- Configurable provider credentials, timeouts, and bucket/container settings
-- Fallback for files not found locally or on peers
-
 ## Project Structure
 
 ```
 fuse-client/
 ├── cmd/
-│   ├── coordinator/        # Master coordinator application
-│   └── client/            # FUSE client application
+│   ├── coordinator/       # Coordinator (HTTP + gRPC, etcd-backed)
+│   ├── client/            # FUSE client daemon
+│   ├── csi-driver/        # Kubernetes CSI node plugin
+│   └── node-init/         # Per-node disk discovery/bootstrap
 ├── charts/
-│   └── fuse-cache/        # Helm chart for coordinator/client deployment
+│   └── fuse-cache/        # Helm chart (+ values-eks-express.yaml overlay)
 ├── internal/
-│   ├── api/               # HTTP API handlers
-│   ├── cache/             # Cache management and tier implementations
-│   ├── coordinator/       # Coordinator service
-│   ├── fuse/             # FUSE filesystem implementation
-│   └── proto/            # Protocol buffer definitions
+│   ├── api/               # Client HTTP API (files, peer read, metrics)
+│   ├── cache/             # Cache manager, tiers, adaptive profiles,
+│   │                      #   tee promotion, completion, eviction
+│   ├── coordinator/       # Coordinator service + etcd store + leases
+│   ├── fuse/              # bazil + gofuse backends (passthrough)
+│   ├── nodeinit/          # Disk discovery/benchmark/mount
+│   ├── agentserver/, session/, csidriver/   # CSI subsystem
+│   └── pb/                # Generated gRPC stubs
+├── k8s/                   # Raw manifests (+ k8s/eks/ overlay)
+├── terraform/             # aws/ (EKS + S3 Express) and azure/ (AKS) modules
 ├── scripts/
 │   ├── devbox/            # kind-based local cluster tooling
-│   └── ops/               # AKS/Helm operational scripts
-├── go.mod
-├── go.sum
-└── README.md
+│   └── ops/               # Deploy, repair, benchmark scripts
+└── docs/                  # Test plans, design notes
 ```
 
 ## Building
@@ -259,34 +257,33 @@ Options:
 
 ## Known Best Configs
 
-The most stable high-performance profile we have validated so far is:
+Current chart defaults (measured, see Operating Modes for the numbers):
 
-- `gofuse` backend
-- passthrough enabled
-- writeback cache enabled through go-fuse capability negotiation
-- simple `8MiB` append buffer
-- byte-bounded range cache (`512MiB`)
-- byte-bounded prefetch budget (`128MiB`)
-- reduced repeated prefetch near chunk boundaries
-- avoid the segmented write-window / segmented coalescing path
+- `config.fuseBackend: "gofuse"` + `config.goFuseEnablePassthrough: "true"`
+- `config.goFuseWritebackCache: "false"` — A/B measured: +4-6% on large
+  sequential writes but −14% on small files; the 8MiB append buffer
+  (`config.goFuseWriteAppendBufferMB: "8"`) already coalesces small writes.
+  Flip to `"true"` per deployment only for exclusively-large-sequential
+  writers.
+- `config.goFuseMaxWriteKB: "4096"` — 4MB kernel writes, fewer round-trips
+- `config.chunkSizeMB: "8"`
+- Range/prefetch values (`parallelRangeReads`, `rangePrefetchChunks`,
+  `rangeChunkCacheMaxBytesMB`, `rangePrefetchMaxBytesMB`) are floors: the
+  per-file adaptive profile widens the pipeline for large files on fast
+  links and shrinks it to nothing for single-chunk files.
 
-Recommended chart defaults for this profile are now:
-
-- `config.fuseBackend: "gofuse"`
-- `config.goFuseEnablePassthrough: "true"`
-- `config.goFuseWritebackCache: "true"`
-- `config.goFuseWriteAppendBufferMB: "8"`
-- `config.parallelRangeReads: "32"`
-- `config.rangePrefetchChunks: "8"`
-- `config.rangeChunkCacheMaxBytesMB: "512"`
-- `config.rangePrefetchMaxBytesMB: "128"`
+Per-cloud overlays: `charts/fuse-cache/values-eks-express.yaml` (EKS + S3
+Express: gp2 storage class, zonal endpoint, ECR image — see its comments for
+the gotchas it encodes).
 
 ## Placement And Policy Defaults
 
 Operationally, the best results have come from treating node classes differently:
 
-- `L64s_v3` as the write-preferred / ingest node class
-- `A100` as the read-preferred node class when you need high remote-read throughput
+- `L64s_v3` as the write-preferred / ingest node class on Azure; `i7ie`/`i3en`
+  on AWS (instance-store NVMe, 25Gbps)
+- any NVMe-class node serves reads well — A100s work but are not
+  cost-effective for storage roles (validated repeatedly)
 - local NVMe as the primary fast path
 - peer first for remote reads, with cloud added to accelerate large reads
 - file-size based hybrid behavior using `hybridAlwaysMinSizeMB` and `hybridStripeMinSizeMB`
@@ -304,29 +301,37 @@ Azure sizing note from 2026-05-12:
 
 ## Cache Behavior
 
-1. **File Read**: 
-   - First checks Tier 1 (NVME)
-   - If not found, always tries Tier 2 (Peers) before Tier 3 (Cloud)
-   - For large files, hybrid read mode can be enabled when:
-     - multiple peers have the file metadata
-     - cloud copy is available
-     - file size `>` `(peer replicas * assumed per-peer MB/s)`
-   - In hybrid mode, peer remains primary and cloud is added in parallel to accelerate when needed
-   - Promotes files to higher tiers on access
-   - Chunked objects are served through range reads (no full-file reassembly required)
+1. **File Read**:
+   - Tier order: NVMe -> peers -> cloud, with promotion on access
+   - Chunked objects are served through range reads (no full-file reassembly)
+   - Remote chunks stream to local NVMe **during** the transfer (tee
+     promotion); after the read session ends, a background completion pass
+     fetches any missed chunks and assembles the whole file so subsequent
+     reads take kernel passthrough
+   - Hybrid mode adds parallel cloud reads for large files; the ordered
+     fallback takes a cross-node fetch lease so a herd of misses collapses
+     to one origin pull; a busy peer gets one jittered retry before the
+     read falls back to cloud
+   - Per-file profile picks fan-out and readahead from file size + measured
+     link throughput (small files skip the range machinery entirely)
 
 2. **File Write**:
-   - Tries to store in Tier 1 first
-   - Falls back to Tier 2 if Tier 1 is full
-   - Falls back to Tier 3 if Tier 2 is unavailable
-   - Buffered write growth reduces large-file write amplification
-   - Flush/Fsync persists accumulated buffered writes
+   - NVMe first (caller acks at NVMe speed); files larger than the chunk
+     size split into `_chunk_N` objects
+   - Cloud persistence runs in the background with backlog-scaled workers
+     (4-16); `PersistedToCloud` is tracked per entry and per chunked parent
+   - If NVMe is full: evict (durable entries only), then retry; peers/cloud
+     as write fallbacks
 
 3. **Cache Management**:
-   - LRU eviction within each tier
-   - Automatic promotion of frequently accessed files
-   - Background cleanup of inactive entries
-   - Chunked persistence uses bounded memory behavior
+   - Range cache: per-file byte budget + **global** byte budget with
+     LRU-by-file eviction (active file spared) + 30s idle expiry
+   - NVMe: background watermark evictor (evict at 85%, target 75%) driven
+     by max(internal budget usage, real device usage via statfs); pinned
+     paths and entries not yet durable in cloud are never evicted —
+     validated live: 5GB written through a 3GB budget, zero loss
+   - After restart, eviction HEAD-probes cloud before trusting an entry as
+     evictable
 
 ## Benchmark Mode
 
@@ -448,8 +453,11 @@ Default cache sizes:
 
 ## Dependencies
 
-- `bazil.org/fuse` - FUSE implementation
-- `github.com/aws/aws-sdk-go` - AWS S3 client
+- `github.com/hanwen/go-fuse/v2` - default FUSE backend (local fork in
+  `third_party/`, kernel passthrough support); `bazil.org/fuse` remains as
+  the alternate backend
+- `github.com/aws/aws-sdk-go` v1.55+ - AWS S3 client (S3 Express One Zone
+  directory buckets supported; Content-MD5 auto-disabled for `--x-s3`)
 - `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob` - Azure Blob client
 - GCP support uses the AWS S3 SDK against `storage.googleapis.com` (S3 interoperability mode)
 - `github.com/gorilla/mux` - HTTP router
@@ -540,10 +548,12 @@ Notes:
 
 ## Future Enhancements
 
-- gRPC for faster peer communication
-- Encryption for data in transit and at rest
-- More sophisticated cache eviction policies
-- Web UI for monitoring and management
+- Streaming write-side cloud persist (mirror of the read-path tee — writes
+  currently buffer whole chunks before upload)
+- Per-chunk eviction granularity for chunked entries under tight budgets
+- gRPC transport for fetch leases (currently HTTP fallback)
+- Content checksums on remote-tier chunk reads (size-only today)
+- Encryption in transit for the peer tier (kTLS-style, keeping sendfile)
 
 ## Contributing
 
