@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fuse-csi-node
+  namespace: fuse-system
+  labels:
+    app: fuse-csi-node
+spec:
+  selector:
+    matchLabels:
+      app: fuse-csi-node
+  template:
+    metadata:
+      labels:
+        app: fuse-csi-node
+    spec:
+      # EKS overlay: no agentpool selector (AKS-only label; with it the
+      # DaemonSet schedules on 0 EKS nodes — same gotcha as client DS).
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: fuse-csi-node
+      containers:
+        # CSI driver
+        - name: csi-driver
+          image: 375353318962.dkr.ecr.us-east-1.amazonaws.com/fuse-client:express-v1
+          command: ["csi-driver"]
+          args:
+            - "--endpoint=unix:///csi/csi.sock"
+            - "--node-id=$(NODE_NAME)"
+            - "--agent-socket=/var/run/fuse-client/agent.sock"
+            - "--fuse-root=/host/mnt/fuse"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
+            - name: mountpoint-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: fuse-mount
+              mountPath: /host/mnt
+              mountPropagation: HostToContainer
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+        # CSI node-driver-registrar sidecar
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/fuse.csi.storage.io/csi.sock"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/fuse.csi.storage.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: mountpoint-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: agent-socket
+          hostPath:
+            path: /var/run/fuse-client
+            type: DirectoryOrCreate
+        - name: fuse-mount
+          hostPath:
+            path: /mnt
+            type: Directory
