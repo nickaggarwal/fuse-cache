@@ -34,110 +34,85 @@ The system consists of:
   - `test-gofuse-cached-read-suite.sh` runs 1GB + 5GB cold vs cached read throughput tests under go-fuse
   - `test-smart-read-s3-profile.sh` labels `standard` vs `s3express` runs and checks zone alignment for S3 Express endpoints
 
-## Best Usage Modes
+## Operating Modes
 
-If you want the project in its current best-known operating shape, start here.
+Three modes, chosen by what the deployment optimizes for. All three share the
+same baseline (chart defaults, validated Aug 2026 on AKS and EKS): `gofuse`
+backend with kernel passthrough, 8MiB chunks, writeback cache **off**
+(measured: +4-6% on large sequential writes but −14% on small files; the 8MiB
+append buffer already coalesces small writes), and per-file adaptive I/O
+profiles — prefetch window, read workers, and persist concurrency derive at
+call time from file size and measured link throughput, with the configured
+values as floors. Memory is bounded by the global range-cache budget + idle
+expiry; disk by the watermark evictor (85/75 band, statfs-aware, never evicts
+the only unpersisted copy).
 
-### Mode 1: Stable General-Purpose Deployment
+### Mode 1: Read-Optimized Remote Serving
 
-Use this as the default mode for most Azure and AWS testing:
+For large-file read throughput (checkpoint restore, model loading):
 
-- `gofuse` backend
-- passthrough enabled
-- writeback cache enabled
-- simple `8MiB` append buffer
-- byte-bounded range cache (`512MiB`)
-- byte-bounded prefetch budget (`128MiB`)
-- reduced repeated prefetch near chunk boundaries
-
-Why this is the default:
-
-- it gave the most stable large-file behavior
-- it avoided the earlier range-cache memory blow-up
-- it kept the best writeback-based write path without the segmented coalescing regressions
-
-Avoid:
-
-- segmented write-window / segmented coalescing experiments
-- unbounded chunk-count-based read caching on large files
+- peer-first remote reads with parallel fan-out; hybrid peer+cloud striping
+  engages automatically for files ≥ the hybrid thresholds
+- streaming tee promotion lands remote chunks on NVMe during the transfer;
+  the post-read completion pass assembles whole files so warm reads take
+  kernel passthrough at device speed
+- reader nodes need real local NVMe (Azure: `L8s_v3`+; AWS: `i7ie`/`i3en`);
+  pin readers and writers to explicit node classes in tests — never rely on
+  whichever pod pairing gets scheduled
+- measured: 5GB cold cross-node ~1.04 GB/s single reader, ~1.34 GB/s
+  aggregate with two concurrent readers (EKS i7ie + S3 Express); warm
+  assembled reads at NVMe/page-cache speed
 
 ### Mode 2: Write-Optimized Ingest
 
-Use this when the main goal is to write large files quickly and persist them locally first:
+For writing large files fast with durability trailing asynchronously:
 
-- prefer `L64s_v3` as the writer node class
-- keep local NVMe as the primary fast path
-- let peer/cloud publication happen asynchronously where semantics allow
+- local NVMe is the primary path; the caller gets ack at NVMe speed and
+  cloud persist happens in the background (persist workers scale with chunk
+  backlog, 4–16)
+- writer node class matters more than anything in the config: `L64s_v3` is
+  the best-validated Azure writer; A100 nodes are not cost-effective as
+  writers; on AWS, `i7ie` write throughput tracks the device
+- keep writeback cache off unless the workload is exclusively large
+  sequential writes (`goFuseWritebackCache: "true"` per deployment then)
+- eviction is safe under overcommit: the watermark evictor only removes
+  cloud-confirmed bytes (validated live: 5GB written through a 3GB budget,
+  zero failures, zero loss)
 
-Current operating guidance:
+### Mode 3: Cloud-First
 
-- `L64s_v3` is the best Azure writer node class we validated
-- A100 nodes are not cost-effective as the primary writer path
+For minimum-footprint or burst topologies where the cloud tier is the
+authority and local/peer tiers are pure accelerators:
 
-### Mode 3: Read-Optimized Remote Serving
+- size the NVMe budget small and let the watermark evictor cycle it; every
+  read transparently re-fetches from cloud (chunk reads use ranged parallel
+  GETs — no HEAD — on both S3 and Azure)
+- put the bucket in the same AZ/zone as the nodes: S3 Express One Zone
+  (`--x-s3` directory buckets, zonal endpoint) or Azure premium block blob;
+  measured 1GB fully-from-Express in ~2.7s in-cluster
+- smallest validated Azure topology: 1x `D4as_v5` system + 1x `D8ads_v5`
+  reader + 1x `L64s_v3` writer, GPU pools at zero
+- cost note: cloud-first trades read latency for footprint — the peer tier
+  still activates automatically between whatever nodes exist
 
-Use this when the main goal is large-file read throughput:
+### Measuring (applies to every mode)
 
-- keep peer-first remote reads
-- add cloud in parallel for larger files when hybrid mode is enabled
-- use explicit writer and reader node classes in tests so results are comparable
-
-Current operating guidance:
-
-- treat local NVMe as the hot path
-- use peer plus cloud to accelerate larger remote reads
-- do not rely on whichever pod pairing happens to be scheduled
-
-### Mode 4: Cost-Efficient Azure Baseline
-
-Use this when you want the smallest Azure topology that still worked well on the current build:
-
-- `1x Standard_D4as_v5` system node
-- `1x Standard_D8ads_v5` general user/reader node
-- `1x Standard_L64s_v3` writer node
-- `0x Standard_NC24ads_A100_v4` unless you are explicitly validating an A100-specific read scenario
-
-This is the current best minimum-footprint recommendation because:
-
-- `L64s_v3` materially improved write throughput
-- adding A100 did not improve the important `5GB` path enough to justify the cost on the current build
-
-### Mode 5: Benchmark And Tuning
-
-Use this when you want a result you can compare later, not just a one-off terminal number:
+Benchmarks that stay comparable across builds:
 
 ```bash
 ./scripts/ops/benchmark-fuse-scenario.sh <namespace> <size-mb> [writer-class-substr] [reader-class-substr]
 ```
 
-This is the recommended benchmark path because it records:
+records size, node classes, write/read throughput, per-tier contribution,
+cache state, CPU/network snapshots, and git commit + image tags.
 
-- file size
-- writer and reader node class
-- write and read throughput
-- peer, cloud, and NVMe contribution
-- cache state
-- CPU snapshots
-- network telemetry
-- git commit and image tags
-
-### Mode 6: Observability And Regression Hunting
-
-Use this when performance moves unexpectedly and you need to see where the time went:
-
-- enable the Prometheus endpoint
-- enable the Grafana dashboard ConfigMap
-- watch go-fuse write phase vs sync phase
-- watch peer/cloud/NVMe source contribution
-- watch range-cache bytes, prefetch reservation, heap, and goroutines
-
-This is the fastest way to distinguish:
-
-- local disk limits
-- FUSE write-path limits
-- peer-read bottlenecks
-- cloud-read bottlenecks
-- cache-budget regressions
+When performance moves unexpectedly: enable the Prometheus endpoint and
+Grafana dashboard ConfigMap, then read the split — go-fuse write vs sync
+phase, peer/cloud/NVMe source contribution, range-cache bytes and prefetch
+reservations, `fuse_chunk_completion_*`, `fuse_busy_chunk_retry_*`,
+`eviction_skipped_unpersisted`, heap and goroutines. That distinguishes disk
+limits from FUSE-path limits from peer/cloud bottlenecks from cache-budget
+regressions in one pass.
 
 ## Components
 
