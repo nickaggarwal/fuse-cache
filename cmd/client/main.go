@@ -173,6 +173,17 @@ func main() {
 			logger.Printf("node-init: config %s not usable, falling back to -nvme=%s", *nodeInitConfig, *nvmePath)
 		}
 	}
+	// Explicit budget override wins over both the flag default and the
+	// node-init discovered budget — needed for eviction testing and for
+	// operators intentionally capping the cache below the disk size.
+	if v := os.Getenv("FUSE_NVME_MAX_GB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			nvmeMaxBytes = int64(n) * 1024 * 1024 * 1024
+			logger.Printf("NVMe budget override: FUSE_NVME_MAX_GB=%d", n)
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_NVME_MAX_GB value %q: %v", v, err)
+		}
+	}
 
 	// Create gRPC coordinator client
 	var coordClient coordinator.Coordinator
