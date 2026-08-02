@@ -104,3 +104,29 @@ func TestThroughputCeiling_CapsDerivation(t *testing.T) {
 		t.Fatalf("capped window %d fell below static floor", capped)
 	}
 }
+
+// TestMultipartPartSizeFor: configured size below the 10,000-part ceiling is
+// kept; oversized objects get the minimal part size that fits.
+func TestMultipartPartSizeFor(t *testing.T) {
+	const mib = int64(1024 * 1024)
+	cases := []struct {
+		object, configured, want int64
+	}{
+		{100 * mib, 8 * mib, 8 * mib},                            // small: unchanged
+		{78 * 1024 * mib, 8 * mib, 8 * mib},                      // 78GiB: exactly at cap, fits
+		{80 * 1024 * mib, 8 * mib, (80*1024*mib + 9999) / 10000}, // past cap: raised
+		{0, 8 * mib, 8 * mib},                                    // empty object
+	}
+	for _, c := range cases {
+		if got := multipartPartSizeFor(c.object, c.configured); got != c.want {
+			t.Fatalf("multipartPartSizeFor(%d, %d) = %d, want %d", c.object, c.configured, got, c.want)
+		}
+		// Invariant: result always fits in 10,000 parts.
+		if c.object > 0 {
+			got := multipartPartSizeFor(c.object, c.configured)
+			if parts := (c.object + got - 1) / got; parts > 10000 {
+				t.Fatalf("object %d at part size %d needs %d parts", c.object, got, parts)
+			}
+		}
+	}
+}

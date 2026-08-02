@@ -198,10 +198,7 @@ func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) err
 	// 8MiB default; mountpoint-s3 documents the same ceiling). Raise the
 	// part size for this call so big objects still upload.
 	uploadOpts := func(u *s3manager.Uploader) {
-		const maxParts = 10000
-		if minPart := (int64(len(data)) + maxParts - 1) / maxParts; minPart > u.PartSize {
-			u.PartSize = minPart
-		}
+		u.PartSize = multipartPartSizeFor(int64(len(data)), u.PartSize)
 	}
 	_, err := cs.uploader.UploadWithContext(timeoutCtx, &s3manager.UploadInput{
 		Bucket: aws.String(cs.bucket),
@@ -318,6 +315,18 @@ func supportsPutObjectFallback(err error) bool {
 	return strings.Contains(msg, "content md5") ||
 		strings.Contains(msg, "content-md5") ||
 		strings.Contains(msg, "does not support content md5 header")
+}
+
+// multipartPartSizeFor returns the part size for one upload: the configured
+// size unless the object would exceed S3's 10,000-part cap, in which case the
+// minimum part size that fits (ceil division). S3's own bounds (5MiB..5GiB
+// per part) still apply upstream; objects past 48.8TiB are unuploadable.
+func multipartPartSizeFor(objectSize, configuredPartSize int64) int64 {
+	const maxParts = 10000
+	if minPart := (objectSize + maxParts - 1) / maxParts; minPart > configuredPartSize {
+		return minPart
+	}
+	return configuredPartSize
 }
 
 func shouldPreferDirectPut(bucket, endpoint string) bool {
