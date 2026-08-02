@@ -20,6 +20,15 @@ const (
 	// adaptiveWindowMinSamples gates derivation until the peer-throughput
 	// estimate has enough ops behind it to be meaningful.
 	adaptiveWindowMinSamples = 8
+
+	// longStreakThreshold/Multiplier: after this many consecutive sequential
+	// reads, the window may grow past the bandwidth-delay target up to
+	// multiplier x (mountpoint-s3 auto-scales per-handle windows to 2GiB for
+	// the same reason: one long sequential stream — checkpoint restore —
+	// wants maximum pipeline depth, while short streams shouldn't pay the
+	// memory). Budget caps still apply after multiplication.
+	longStreakThreshold  = 32
+	longStreakMultiplier = 4
 )
 
 // peerPerStreamBytesPerSec returns the measured single-stream peer read rate
@@ -35,7 +44,19 @@ func (cm *DefaultCacheManager) peerPerStreamBytesPerSec() (float64, bool) {
 	if bytes <= 0 || nanos <= 0 {
 		return 0, false
 	}
-	return float64(bytes) / (float64(nanos) / 1e9), true
+	rate := float64(bytes) / (float64(nanos) / 1e9)
+	// Operator throughput ceiling: derive pipelines as if the link were no
+	// faster than the cap, so aggregate cache traffic stays under it.
+	if cap := cm.config.MaxThroughputBytesPerSec; cap > 0 {
+		workers := cm.config.ParallelRangeReads
+		if workers <= 0 {
+			workers = 1
+		}
+		if perStreamCap := float64(cap) / float64(workers); rate > perStreamCap {
+			rate = perStreamCap
+		}
+	}
+	return rate, true
 }
 
 // adaptivePrefetchMaxChunks returns the effective max readahead window in

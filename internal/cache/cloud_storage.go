@@ -193,11 +193,21 @@ func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) err
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
+	// S3 multipart caps at 10,000 parts: at the configured part size, a
+	// whole-object upload silently fails past partSize*10000 (~78GiB at the
+	// 8MiB default; mountpoint-s3 documents the same ceiling). Raise the
+	// part size for this call so big objects still upload.
+	uploadOpts := func(u *s3manager.Uploader) {
+		const maxParts = 10000
+		if minPart := (int64(len(data)) + maxParts - 1) / maxParts; minPart > u.PartSize {
+			u.PartSize = minPart
+		}
+	}
 	_, err := cs.uploader.UploadWithContext(timeoutCtx, &s3manager.UploadInput{
 		Bucket: aws.String(cs.bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(data),
-	})
+	}, uploadOpts)
 	if err == nil {
 		return nil
 	}

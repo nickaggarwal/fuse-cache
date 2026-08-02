@@ -190,6 +190,13 @@ type CacheConfig struct {
 	// (reactive write-path eviction still applies).
 	WatermarkEvictDisabled bool
 
+	// MaxThroughputBytesPerSec caps the bandwidth the adaptive profile will
+	// provision pipelines for (0 = uncapped). On shared GPU nodes the cache
+	// must not starve training traffic; this is the ceiling mirror of the
+	// configured floors (mountpoint-s3 exposes the same knob as
+	// --maximum-throughput-gbps).
+	MaxThroughputBytesPerSec int64
+
 	// RangePrefetchMaxBytes bounds bytes reserved for prefetch that are not yet
 	// part of the settled range cache.
 	RangePrefetchMaxBytes int64
@@ -1780,16 +1787,33 @@ func (cm *DefaultCacheManager) evictionSafe(ctx context.Context, key string, ent
 		return false
 	}
 	// HEAD probes, only on the eviction path (covers restart, where the
-	// in-memory bit is lost). Chunked parents persist as chunk objects, so
-	// probe first+last chunk as a bounded proxy for the set.
-	if entry != nil && entry.IsChunked && entry.NumChunks > 0 {
+	// in-memory bit is lost). Revalidate by SIZE, not just existence — a
+	// same-key object with a different length is a different version, and
+	// evicting the local copy against it silently loses the local write
+	// (mountpoint-s3 revalidates cached content by etag for the same
+	// reason; size is the check every backend already exposes).
+	if entry != nil && entry.IsChunked && entry.NumChunks > 0 && cm.config.ChunkSize > 0 {
+		// Chunked parents persist as chunk objects: probe first chunk for
+		// existence and the last chunk for exact expected size.
 		if !cm.cloudStorage.Exists(ctx, chunkPathFor(key, 0)) {
 			return false
 		}
-		if entry.NumChunks > 1 && !cm.cloudStorage.Exists(ctx, chunkPathFor(key, entry.NumChunks-1)) {
+		lastIdx := entry.NumChunks - 1
+		wantLast := entry.Size - lastIdx*cm.config.ChunkSize
+		if wantLast <= 0 || wantLast > cm.config.ChunkSize {
+			// Size/chunk-count metadata disagrees; do not trust the probe.
 			return false
 		}
-		return true
+		gotLast, err := cm.cloudStorage.Size(ctx, chunkPathFor(key, lastIdx))
+		return err == nil && gotLast == wantLast
+	}
+	if entry != nil {
+		got, err := cm.cloudStorage.Size(ctx, key)
+		if err == nil && got == entry.Size {
+			cm.markPersistedToCloud(key)
+			return true
+		}
+		return false
 	}
 	if cm.cloudStorage.Exists(ctx, key) {
 		cm.markPersistedToCloud(key)
@@ -3037,12 +3061,30 @@ func (cm *DefaultCacheManager) observeReadPattern(filePath string, fileSize, off
 		fileCache.seqStreak = 0
 	}
 	fileCache.lastReadEnd = end
-	window := base
-	for i := 0; i < fileCache.seqStreak && window < maxChunks; i++ {
-		window *= 2
-	}
+	streak := fileCache.seqStreak
 	cm.rangeMu.Unlock()
 
+	// Confirmed long sequential stream (checkpoint restore shape): allow the
+	// window past the bandwidth-delay target, still under the byte budget.
+	if streak >= longStreakThreshold {
+		widened := maxChunks * longStreakMultiplier
+		if budget := cm.config.RangePrefetchMaxBytes; budget > 0 {
+			if byBudget := int(budget / chunkSize); widened > byBudget {
+				widened = byBudget
+			}
+		}
+		if fileChunks := int((fileSize + chunkSize - 1) / chunkSize); widened > fileChunks {
+			widened = fileChunks
+		}
+		if widened > maxChunks {
+			maxChunks = widened
+		}
+	}
+
+	window := base
+	for i := 0; i < streak && window < maxChunks; i++ {
+		window *= 2
+	}
 	if window > maxChunks {
 		window = maxChunks
 	}

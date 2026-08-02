@@ -323,6 +323,13 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_RANGE_CACHE_GLOBAL_MAX_BYTES_MB value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_MAX_THROUGHPUT_MBPS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cacheConfig.MaxThroughputBytesPerSec = n * 1024 * 1024
+		} else if err != nil {
+			logger.Printf("WARNING: invalid FUSE_MAX_THROUGHPUT_MBPS value %q: %v", v, err)
+		}
+	}
 	if v := os.Getenv("FUSE_WATERMARK_EVICT_DISABLED"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			cacheConfig.WatermarkEvictDisabled = parsed

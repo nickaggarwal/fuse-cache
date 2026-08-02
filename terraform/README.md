@@ -99,6 +99,15 @@ nobody re-discovers them by hand):
   pinning the AZ.
 - **Fresh-account on-demand vCPU quota is 16** (L-1216C47A): 3×i7ie.xlarge
   (12 vCPU) fits; anything bigger needs a service-quota increase first.
+- **Chunk objects accumulate in the directory bucket forever** — fuse-cache
+  deletes cloud objects only on explicit file delete, so benchmark/test
+  churn builds up storage cost (mountpoint-s3's shared-cache docs push the
+  same responsibility to bucket lifecycle). S3 Express directory buckets
+  support lifecycle expiration: set an expiration rule on test prefixes, or
+  purge manually after benchmark campaigns. Also: anyone with write access
+  to the bucket can poison cache content — dedicate the bucket to the
+  cache, same account, no shared writers (chunk content checksums are on
+  the roadmap).
 
 ### Azure specifics
 
