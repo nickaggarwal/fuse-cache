@@ -149,6 +149,15 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 			}
 		}
 	}
+	// Holders publish IsChunked without enumerating Chunks, so derive the
+	// count from the size the same way the write path splits it. Without this
+	// a chunked file falls through to the whole-file fetch and fails: the
+	// parent object only exists as chunk_N blobs in the remote tiers.
+	for _, t := range byPath {
+		if t.isChunked && t.numChunks == 0 && t.size > 0 && cm.config.ChunkSize > 0 {
+			t.numChunks = (t.size + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		}
+	}
 	targets := make([]*warmupTarget, 0, len(byPath))
 	for _, t := range byPath {
 		targets = append(targets, t)

@@ -250,6 +250,31 @@ make k8s-devbox-deploy          # deploy the Helm chart
 make k8s-devbox-status / -delete
 ```
 
+### Dashboard (`tools/dashboard/`)
+
+Streamlit UI for monitoring and warm-targeting the cluster. Read-mostly; no
+server-side code — it consumes the existing coordinator/client HTTP APIs and
+the Prometheus `/metrics` text.
+
+```bash
+pip install -r tools/dashboard/requirements.txt
+streamlit run tools/dashboard/app.py
+```
+
+- `app.py` — 4 views: cluster overview, per-node cache (herd-control counters),
+  warm targeting (fan-out + single node), replicas & heat
+- `fuse_api.py` — HTTP client (`ApiResult`, never raises) + `select_warm_targets`,
+  a client-side mirror of `CoordinatorService.SelectWarmTargets` for dry-run preview
+- `metrics.py` — Prometheus text parser (no `prometheus_client` dep)
+- `test_dashboard.py` — stdlib `unittest`: `python3 -m unittest discover -s tools/dashboard`
+
+Config via sidebar with env defaults `FUSE_COORDINATOR_URL`, `FUSE_API_KEY`,
+`FUSE_NODE_ADDR`. The node-address override exists because peers register with
+`POD_IP:8081`, unreachable from outside the cluster — port-forward a client pod
+and point the override at it. Replica counts come from `/api/worldview`, not
+`/api/files/locations` (the latter returns one location per path). See
+`tools/dashboard/README.md`.
+
 ## Testing
 
 ```bash

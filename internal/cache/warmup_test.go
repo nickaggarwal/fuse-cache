@@ -78,6 +78,39 @@ func TestWarmPrefix_FullPullsWholeAndChunkedFiles(t *testing.T) {
 	}
 }
 
+// TestWarmPrefix_ChunkedWithoutChunkList reproduces what the coordinator
+// actually stores: publishFileLocation sets IsChunked but never enumerates
+// Chunks, so numChunks must be derived from the size. Before that fallback a
+// chunked file took the whole-file path and failed with BlobNotFound, since
+// the parent object exists only as chunk_N blobs.
+func TestWarmPrefix_ChunkedWithoutChunkList(t *testing.T) {
+	cm := evictTestManager(t, 1<<30)
+	cm.config.ChunkSize = 1000
+	ctx := context.Background()
+
+	// Only the chunks exist remotely — no parent object, as in production.
+	cm.cloudStorage.Write(ctx, chunkPathFor("/models/big.bin", 0), make([]byte, 1000))
+	cm.cloudStorage.Write(ctx, chunkPathFor("/models/big.bin", 1), make([]byte, 1000))
+	cm.cloudStorage.Write(ctx, chunkPathFor("/models/big.bin", 2), make([]byte, 500))
+
+	cm.config.Coordinator = &warmupCoordinator{locations: []*coordinator.FileLocation{
+		// IsChunked true, Chunks empty: exactly what publishFileLocation writes.
+		{FilePath: "/models/big.bin", PeerID: "p1", StorageTier: "nvme",
+			FileSize: 2500, IsChunked: true},
+	}}
+
+	res, err := cm.WarmPrefixOpts(ctx, "/models", WarmupOptions{Mode: "full", Source: "cloud-only"})
+	if err != nil {
+		t.Fatalf("WarmPrefixOpts: %v", err)
+	}
+	if res.Warmed != 1 || res.Failed != 0 {
+		t.Fatalf("result = %+v, want 1 warmed / 0 failed", res)
+	}
+	if _, ok := cm.LocalFilePath(ctx, "/models/big.bin"); !ok {
+		t.Fatal("big.bin not assembled locally from derived chunk count")
+	}
+}
+
 func TestWarmPrefix_MetadataModeAndHeadroomGuard(t *testing.T) {
 	cm := evictTestManager(t, 2000)
 	ctx := context.Background()
