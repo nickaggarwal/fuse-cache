@@ -119,10 +119,11 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	}
 
 	policy := &pb.CachePolicy{
-		CacheMode:    attrOr(attrs, "cacheMode", "readonly"),
-		Warmup:       attrOr(attrs, "warmup", "none"),
-		Pinned:       attrOr(attrs, "pinned", "false") == "true",
-		SourcePolicy: attrOr(attrs, "sourcePolicy", "peer-first"),
+		CacheMode:       attrOr(attrs, "cacheMode", "readonly"),
+		Warmup:          attrOr(attrs, "warmup", "none"),
+		WarmupBandwidth: attrOr(attrs, "warmupBandwidth", ""),
+		Pinned:          attrOr(attrs, "pinned", "false") == "true",
+		SourcePolicy:    attrOr(attrs, "sourcePolicy", "peer-first"),
 	}
 
 	readOnly := req.GetReadonly()

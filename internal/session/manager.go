@@ -12,10 +12,11 @@ import (
 
 // CachePolicy controls per-session cache behavior.
 type CachePolicy struct {
-	CacheMode    string // "readonly", "writeback", "writethrough"
-	Warmup       string // "none", "metadata", "full"
-	Pinned       bool   // prevent eviction while session active
-	SourcePolicy string // "peer-first", "cloud-first", "hybrid"
+	CacheMode       string // "readonly", "writeback", "writethrough"
+	Warmup          string // "none", "metadata", "full"
+	WarmupBandwidth string // "", "background", "max"
+	Pinned          bool   // prevent eviction while session active
+	SourcePolicy    string // "peer-first", "cloud-first", "hybrid"
 }
 
 // Session represents an active CSI volume mount session.
@@ -39,11 +40,14 @@ type Manager struct {
 }
 
 // WarmupRequest describes a newly created session whose cache policy asks for
-// warmup ("metadata" or "full").
+// warmup ("metadata" or "full"). Source carries the session's SourcePolicy
+// and Bandwidth its WarmupBandwidth so the warm strategy follows the policy.
 type WarmupRequest struct {
-	VolumeID string
-	RootPath string
-	Mode     string
+	VolumeID  string
+	RootPath  string
+	Mode      string
+	Source    string
+	Bandwidth string
 }
 
 // SetWarmupHook registers fn to run (in its own goroutine) when a session is
@@ -107,7 +111,10 @@ func (m *Manager) Create(_ context.Context, volumeID, rootPath string, readOnly 
 
 	if m.warmupHook != nil && policy.Warmup != "" && policy.Warmup != "none" {
 		hook := m.warmupHook
-		req := WarmupRequest{VolumeID: volumeID, RootPath: rootPath, Mode: policy.Warmup}
+		req := WarmupRequest{
+			VolumeID: volumeID, RootPath: rootPath, Mode: policy.Warmup,
+			Source: policy.SourcePolicy, Bandwidth: policy.WarmupBandwidth,
+		}
 		go hook(req)
 	}
 	// Return a copy, like Get/List, so callers never share the map-backed

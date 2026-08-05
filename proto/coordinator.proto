@@ -25,6 +25,9 @@ message PeerInfo {
   int64 used_space = 6;
   string status = 7;
   google.protobuf.Timestamp last_heartbeat = 8;
+  // Operator-assigned labels (e.g. pool=gpu, zone=a) used for targeted
+  // cache-warm fan-out and other node selection.
+  map<string, string> labels = 9;
 }
 
 message ChunkInfo {

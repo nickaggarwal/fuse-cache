@@ -25,6 +25,7 @@ message CachePolicy {
   string warmup = 2;         // none | metadata | full
   bool pinned = 3;
   string source_policy = 4;  // peer-first | cloud-first | hybrid
+  string warmup_bandwidth = 5; // "" | background | max
 }
 
 message CreateSessionRequest {

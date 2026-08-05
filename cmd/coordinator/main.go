@@ -597,6 +597,27 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 		writeJSONResponse(w, result)
 	})
 
+	// Cluster-wide declarative warmup: select peers by node IDs / labels /
+	// percentage and trigger an async prefix warm on each (the peer-side
+	// engine is the same one CSI warmup=full sessions use).
+	mux.HandleFunc("/api/warm", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req coordinator.WarmRequest
+		if err := parseJSONRequest(r, &req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		result, err := coordinatorService.WarmPeers(r.Context(), req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Warm fan-out failed: %v", err), http.StatusBadRequest)
+			return
+		}
+		writeJSONResponse(w, result)
+	})
+
 	// Get statistics endpoint
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

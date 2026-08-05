@@ -26,12 +26,52 @@ import (
 // room (headroom-guarded per file), and failures leave the session serving
 // normally through just-in-time pulls.
 
-const (
-	// warmupFileConcurrency bounds parallel file warms. Chunked files already
-	// fan out internally (chunkCompletionFetchWorkers), so this stays small
-	// to keep warmup a background citizen next to foreground reads.
-	warmupFileConcurrency = 2
-)
+// WarmupOptions selects what a warmup pass pulls and how hard it pulls.
+type WarmupOptions struct {
+	// Mode: "none"/"" (no-op), "metadata" (enumerate only), "full" (pull bytes).
+	Mode string
+	// Source picks the tier order for fetches: ""/"peer-first"/"hybrid" use
+	// the normal adaptive order (peers before cloud), "cloud-first" prefers
+	// cloud with peer fallback (spare the peers, e.g. pre-scale warm of many
+	// nodes at once), "cloud-only" never touches peers.
+	Source string
+	// Bandwidth: ""/"background" keeps warmup a background citizen (2 files
+	// x 4 chunk fetches); "max" saturates the NIC (4 files x 16 chunk
+	// fetches) for deliberate pre-deploy warms where warmup IS the workload.
+	Bandwidth string
+}
+
+// PrefixWarmer is implemented by cache managers that support declarative
+// warmup; the HTTP API asserts against it.
+type PrefixWarmer interface {
+	WarmPrefixOpts(ctx context.Context, prefix string, opts WarmupOptions) (*WarmupResult, error)
+}
+
+// warmupPlan resolves options into concrete fetch parameters. A nil order
+// means "use the adaptive per-chunk order" (peer-first).
+func warmupPlan(opts WarmupOptions) (order []CacheTier, fileConcurrency, chunkWorkers int, err error) {
+	switch strings.ToLower(strings.TrimSpace(opts.Source)) {
+	case "", "peer-first", "hybrid":
+		order = nil
+	case "cloud-first":
+		order = []CacheTier{TierCloud, TierPeer}
+	case "cloud-only":
+		order = []CacheTier{TierCloud}
+	default:
+		return nil, 0, 0, fmt.Errorf("unknown warmup source %q", opts.Source)
+	}
+	switch strings.ToLower(strings.TrimSpace(opts.Bandwidth)) {
+	case "", "background":
+		// Chunked files already fan out internally, so file concurrency
+		// stays small to keep warmup polite next to foreground reads.
+		fileConcurrency, chunkWorkers = 2, chunkCompletionFetchWorkers
+	case "max":
+		fileConcurrency, chunkWorkers = 4, 16
+	default:
+		return nil, 0, 0, fmt.Errorf("unknown warmup bandwidth %q", opts.Bandwidth)
+	}
+	return order, fileConcurrency, chunkWorkers, nil
+}
 
 // WarmupResult summarizes one WarmPrefix pass.
 type WarmupResult struct {
@@ -55,16 +95,25 @@ type warmupTarget struct {
 }
 
 // WarmPrefix prefetches every file the coordinator knows under prefix into
-// local NVMe. mode is the session CachePolicy warmup value: "none"/"" is a
-// no-op, "metadata" enumerates only, "full" pulls bytes.
+// local NVMe with default strategy (peer-first, background bandwidth). mode
+// is the session CachePolicy warmup value.
 func (cm *DefaultCacheManager) WarmPrefix(ctx context.Context, prefix, mode string) (*WarmupResult, error) {
-	mode = strings.ToLower(strings.TrimSpace(mode))
+	return cm.WarmPrefixOpts(ctx, prefix, WarmupOptions{Mode: mode})
+}
+
+// WarmPrefixOpts is WarmPrefix with an explicit strategy.
+func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string, opts WarmupOptions) (*WarmupResult, error) {
+	mode := strings.ToLower(strings.TrimSpace(opts.Mode))
 	res := &WarmupResult{Mode: mode}
 	if mode == "" || mode == "none" {
 		return res, nil
 	}
 	if mode != "metadata" && mode != "full" {
 		return res, fmt.Errorf("unknown warmup mode %q", mode)
+	}
+	order, fileConcurrency, chunkWorkers, err := warmupPlan(opts)
+	if err != nil {
+		return res, err
 	}
 	if cm.config.Coordinator == nil {
 		return res, fmt.Errorf("warmup needs a coordinator for enumeration")
@@ -115,7 +164,7 @@ func (cm *DefaultCacheManager) WarmPrefix(ctx context.Context, prefix, mode stri
 		mu sync.Mutex
 		wg sync.WaitGroup
 	)
-	sem := make(chan struct{}, warmupFileConcurrency)
+	sem := make(chan struct{}, fileConcurrency)
 	for _, t := range targets {
 		if ctx.Err() != nil {
 			break
@@ -126,7 +175,7 @@ func (cm *DefaultCacheManager) WarmPrefix(ctx context.Context, prefix, mode stri
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			outcome := cm.warmOneFile(ctx, t)
+			outcome := cm.warmOneFile(ctx, t, order, chunkWorkers)
 			mu.Lock()
 			switch outcome {
 			case warmOutcomeWarmed:
@@ -155,7 +204,7 @@ const (
 	warmOutcomeFailed
 )
 
-func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget) warmOutcome {
+func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget, order []CacheTier, chunkWorkers int) warmOutcome {
 	if _, whole := cm.LocalFilePath(ctx, t.path); whole {
 		return warmOutcomeAlreadyLocal
 	}
@@ -172,7 +221,7 @@ func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget)
 			return warmOutcomeSkipped
 		}
 		defer cm.endCompletion(t.path)
-		if err := cm.runChunkCompletion(ctx, t.path, t.numChunks, t.size); err != nil {
+		if err := cm.runChunkCompletionOpts(ctx, t.path, t.numChunks, t.size, order, chunkWorkers); err != nil {
 			cm.logger.Printf("Warmup of %s failed: %v", t.path, err)
 			return warmOutcomeFailed
 		}
@@ -180,7 +229,7 @@ func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget)
 	}
 
 	// Whole (unchunked) file: fetch from the remote tiers and land on NVMe.
-	if err := cm.fetchAndLandChunk(ctx, t.path); err != nil {
+	if err := cm.fetchAndLandChunkOrdered(ctx, t.path, order); err != nil {
 		cm.logger.Printf("Warmup of %s failed: %v", t.path, err)
 		return warmOutcomeFailed
 	}

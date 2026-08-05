@@ -118,3 +118,73 @@ func TestWarmPrefix_MetadataModeAndHeadroomGuard(t *testing.T) {
 		t.Fatalf("none mode = %+v err=%v, want empty no-op", res, err)
 	}
 }
+
+func TestWarmupPlan_StrategyResolution(t *testing.T) {
+	cases := []struct {
+		source, bandwidth string
+		wantOrder         []CacheTier // nil = adaptive
+		wantFiles, wantWk int
+		wantErr           bool
+	}{
+		{"", "", nil, 2, chunkCompletionFetchWorkers, false},
+		{"peer-first", "background", nil, 2, chunkCompletionFetchWorkers, false},
+		{"hybrid", "", nil, 2, chunkCompletionFetchWorkers, false},
+		{"cloud-first", "max", []CacheTier{TierCloud, TierPeer}, 4, 16, false},
+		{"cloud-only", "", []CacheTier{TierCloud}, 2, chunkCompletionFetchWorkers, false},
+		{"warp-speed", "", nil, 0, 0, true},
+		{"", "ludicrous", nil, 0, 0, true},
+	}
+	for _, tc := range cases {
+		order, files, wk, err := warmupPlan(WarmupOptions{Source: tc.source, Bandwidth: tc.bandwidth})
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("(%q,%q): want error", tc.source, tc.bandwidth)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("(%q,%q): %v", tc.source, tc.bandwidth, err)
+		}
+		if len(order) != len(tc.wantOrder) || files != tc.wantFiles || wk != tc.wantWk {
+			t.Fatalf("(%q,%q): order=%v files=%d workers=%d, want %v/%d/%d",
+				tc.source, tc.bandwidth, order, files, wk, tc.wantOrder, tc.wantFiles, tc.wantWk)
+		}
+		for i := range order {
+			if order[i] != tc.wantOrder[i] {
+				t.Fatalf("(%q,%q): order=%v, want %v", tc.source, tc.bandwidth, order, tc.wantOrder)
+			}
+		}
+	}
+}
+
+// TestWarmPrefixOpts_CloudOnlyNeverTouchesPeers: with source=cloud-only a
+// file that exists only on the peer tier must fail rather than fall back.
+func TestWarmPrefixOpts_CloudOnlyNeverTouchesPeers(t *testing.T) {
+	cm := evictTestManager(t, 1<<30)
+	ctx := context.Background()
+
+	// File exists ONLY on the peer tier.
+	cm.peerStorage.Write(ctx, "/m/peer-only.bin", make([]byte, 500))
+	coord := &warmupCoordinator{locations: []*coordinator.FileLocation{
+		{FilePath: "/m/peer-only.bin", PeerID: "p1", StorageTier: "nvme", FileSize: 500},
+	}}
+	cm.config.Coordinator = coord
+
+	res, err := cm.WarmPrefixOpts(ctx, "/m", WarmupOptions{Mode: "full", Source: "cloud-only"})
+	if err != nil {
+		t.Fatalf("WarmPrefixOpts: %v", err)
+	}
+	if res.Failed != 1 || res.Warmed != 0 {
+		t.Fatalf("cloud-only result = %+v, want 1 failed / 0 warmed", res)
+	}
+
+	// Default (peer-first) succeeds against the same layout.
+	res, err = cm.WarmPrefixOpts(ctx, "/m", WarmupOptions{Mode: "full", Bandwidth: "max"})
+	if err != nil {
+		t.Fatalf("default WarmPrefixOpts: %v", err)
+	}
+	cm.bgWg.Wait()
+	if res.Warmed != 1 || res.Failed != 0 {
+		t.Fatalf("peer-first result = %+v, want 1 warmed", res)
+	}
+}

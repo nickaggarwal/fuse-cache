@@ -137,6 +137,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	// Cache operations
 	router.HandleFunc("/api/cache", h.handleCache).Methods("GET")
 	router.HandleFunc("/api/cache/stats", h.handleCacheStats).Methods("GET")
+	router.HandleFunc("/api/cache/warm", h.handleCacheWarm).Methods("POST")
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
 	router.HandleFunc("/api/fs/restore", h.handleFSRestore).Methods("POST")
 

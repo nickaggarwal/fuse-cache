@@ -404,11 +404,22 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   10-min hot window. `fuse_replica_reconcile_heat_boosts_total` metric.
 - `internal/cache/warmup.go` + session warmup hook — declarative warmup
   (Fluid pattern): CSI volumeAttribute `warmup: full` triggers
-  `WarmPrefix` on first session create — enumerate the subtree via
+  `WarmPrefixOpts` on first session create — enumerate the subtree via
   coordinator `ListFileLocations`, then pull each file whole onto NVMe
   (chunked files reuse `runChunkCompletion`, unchunked `fetchAndLandChunk`;
-  2 files in parallel, headroom-guarded, never evicts). `warmup: metadata`
-  enumerates only. Warmed nodes publish themselves as holders.
+  headroom-guarded, never evicts). `warmup: metadata` enumerates only.
+  Warmed nodes publish themselves as holders. **Strategy** via
+  `WarmupOptions`: `Source` (peer-first default / cloud-first / cloud-only
+  tier order) and `Bandwidth` (background = 2 files x 4 chunk fetches, max
+  = 4 x 16). CSI attrs `warmupBandwidth` + `sourcePolicy` map onto it.
+- Warm targeting without pods: client `POST /api/cache/warm`
+  {prefix,mode,source,bandwidth,async} (`internal/api/warm.go`);
+  coordinator `POST /api/warm` fans out to peers selected by
+  `nodes`/`labels`/`percentage` (`internal/coordinator/warm.go`,
+  intersection semantics, ID-sorted ceil for percentage; forwards
+  `api_key` as X-API-Key). Peer labels: `PeerInfo.Labels`, set via client
+  `-peer-labels` / `FUSE_PEER_LABELS`, carried in the register proto
+  (`make proto` now includes agent.proto).
 - `internal/nodeinit/` + `cmd/node-init/` — best-local-disk discovery:
   /proc/mounts + sysfs classification (nvme/ssd/disk/unknown), scoring
   (class dominates > log2 free space > micro-benchmark of top-3 finalists;

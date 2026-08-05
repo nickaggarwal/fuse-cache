@@ -71,6 +71,7 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 	if req.Policy != nil {
 		policy.CacheMode = req.Policy.CacheMode
 		policy.Warmup = req.Policy.Warmup
+		policy.WarmupBandwidth = req.Policy.WarmupBandwidth
 		policy.Pinned = req.Policy.Pinned
 		policy.SourcePolicy = req.Policy.SourcePolicy
 	}
@@ -128,10 +129,11 @@ func sessionToProto(sess *session.Session) *pb.SessionInfo {
 		HostPath: sess.HostPath,
 		ReadOnly: sess.ReadOnly,
 		Policy: &pb.CachePolicy{
-			CacheMode:    sess.Policy.CacheMode,
-			Warmup:       sess.Policy.Warmup,
-			Pinned:       sess.Policy.Pinned,
-			SourcePolicy: sess.Policy.SourcePolicy,
+			CacheMode:       sess.Policy.CacheMode,
+			Warmup:          sess.Policy.Warmup,
+			WarmupBandwidth: sess.Policy.WarmupBandwidth,
+			Pinned:          sess.Policy.Pinned,
+			SourcePolicy:    sess.Policy.SourcePolicy,
 		},
 		RefCount:      sess.RefCount,
 		CreatedAtUnix: sess.CreatedAt.Unix(),

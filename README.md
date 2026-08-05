@@ -39,9 +39,32 @@ AKS and EKS.
      volumeAttributes:
        rootPath: /models/llama-70b
        cacheMode: readonly
-       warmup: full        # none | metadata | full
-       pinned: "true"      # exempt from eviction while mounted
+       warmup: full             # none | metadata | full
+       warmupBandwidth: max     # background (default) | max
+       sourcePolicy: cloud-first  # also steers the warm fetch tier order
+       pinned: "true"           # exempt from eviction while mounted
    ```
+
+   Warming can also be driven without pods, targeted by **node, label, or
+   percentage**. Every client exposes `POST /api/cache/warm` (exact node +
+   model targeting), and the coordinator fans out across the fleet:
+
+   ```bash
+   # Warm one node (sync; returns the WarmupResult):
+   curl -X POST http://<node>:8081/api/cache/warm \
+     -d '{"prefix":"/models/llama-70b","source":"cloud-only","bandwidth":"max"}'
+
+   # Warm 50% of the pool=gpu nodes via the coordinator (async on each node):
+   curl -X POST http://coordinator:8080/api/warm \
+     -d '{"prefix":"/models/llama-70b","labels":{"pool":"gpu"},"percentage":50,
+          "source":"cloud-first","bandwidth":"max"}'
+   ```
+
+   Nodes get labels from the client's `-peer-labels pool=gpu,zone=a` flag
+   (or `FUSE_PEER_LABELS`). Strategy knobs: `source` = `peer-first`
+   (default) | `cloud-first` | `cloud-only` (spare the peers when warming
+   many nodes at once); `bandwidth` = `background` (default, polite) |
+   `max` (saturate the NIC: 4 files x 16 chunk streams per node).
 
 5. **node-init**: per-node disk bootstrap — discovers the best local disk,
    formats/mounts raw NVMe when needed, publishes the cache dir + byte

@@ -97,6 +97,7 @@ func main() {
 		reconcileTarget      = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
 		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
 		reconcileMaxTarget   = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
+		peerLabelsFlag       = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -512,8 +513,11 @@ func main() {
 	// prefetches its subtree into local NVMe (warmup=metadata enumerates only).
 	if sessMgr != nil {
 		sessMgr.SetWarmupHook(func(req session.WarmupRequest) {
-			logger.Printf("Session warmup starting: volume=%s root=%s mode=%s", req.VolumeID, req.RootPath, req.Mode)
-			res, err := cacheManager.WarmPrefix(ctx, req.RootPath, req.Mode)
+			logger.Printf("Session warmup starting: volume=%s root=%s mode=%s source=%s bandwidth=%s",
+				req.VolumeID, req.RootPath, req.Mode, req.Source, req.Bandwidth)
+			res, err := cacheManager.WarmPrefixOpts(ctx, req.RootPath, cache.WarmupOptions{
+				Mode: req.Mode, Source: req.Source, Bandwidth: req.Bandwidth,
+			})
 			if err != nil {
 				logger.Printf("Session warmup for volume %s failed: %v", req.VolumeID, err)
 				return
@@ -545,7 +549,11 @@ func main() {
 
 	// Register this peer with the coordinator
 	if coordClient != nil {
-		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, cacheManager, logger)
+		peerLabelsRaw := *peerLabelsFlag
+		if v := os.Getenv("FUSE_PEER_LABELS"); v != "" {
+			peerLabelsRaw = v
+		}
+		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, parsePeerLabels(peerLabelsRaw, logger), cacheManager, logger)
 	}
 
 	// Create API handler
@@ -685,7 +693,29 @@ func waitForNodeInitConfig(path string, wait time.Duration, logger *log.Logger) 
 	}
 }
 
-func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, cm cache.CacheManager, logger *log.Logger) {
+// parsePeerLabels turns "pool=gpu,zone=a" into a label map; malformed pairs
+// are skipped with a warning. Empty input returns nil.
+func parsePeerLabels(raw string, logger *log.Logger) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	labels := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok || strings.TrimSpace(k) == "" {
+			logger.Printf("WARNING: skipping malformed peer label %q (want key=value)", pair)
+			continue
+		}
+		labels[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return labels
+}
+
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()
 	availableSpace := capacity - used
 	usedSpace := used
@@ -704,6 +734,7 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		AvailableSpace: availableSpace,
 		UsedSpace:      usedSpace,
 		Status:         "active",
+		Labels:         labels,
 	}
 
 	// Keep retrying registration until success or shutdown.

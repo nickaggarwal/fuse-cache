@@ -52,6 +52,10 @@ type PeerInfo struct {
 	NetworkProbeBytes  int64     `json:"network_probe_bytes,omitempty"`
 	NetworkProbeTarget string    `json:"network_probe_target,omitempty"`
 	NetworkProbedAt    time.Time `json:"network_probed_at,omitempty"`
+	// Labels are operator-assigned node labels (e.g. pool=gpu) used for
+	// targeted cache-warm fan-out and other selection. Set at registration
+	// via the client's -peer-labels flag / FUSE_PEER_LABELS env.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // ChunkInfo represents a file chunk

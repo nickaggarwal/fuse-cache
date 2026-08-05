@@ -92,6 +92,7 @@ func peerInfoToProto(p *PeerInfo) *pb.PeerInfo {
 		UsedSpace:      p.UsedSpace,
 		Status:         p.Status,
 		LastHeartbeat:  timestamppb.New(p.LastHeartbeat),
+		Labels:         p.Labels,
 	}
 }
 
@@ -109,6 +110,7 @@ func peerInfoFromProto(p *pb.PeerInfo) *PeerInfo {
 		UsedSpace:      p.UsedSpace,
 		Status:         p.Status,
 		LastHeartbeat:  lastHB,
+		Labels:         p.Labels,
 	}
 }
 

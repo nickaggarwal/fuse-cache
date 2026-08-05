@@ -124,6 +124,13 @@ func (cm *DefaultCacheManager) endCompletion(filePath string) {
 // republishes the location. Fails soft everywhere: fetched chunks stay on
 // NVMe for the next attempt.
 func (cm *DefaultCacheManager) runChunkCompletion(ctx context.Context, filePath string, numChunks, size int64) error {
+	return cm.runChunkCompletionOpts(ctx, filePath, numChunks, size, nil, chunkCompletionFetchWorkers)
+}
+
+// runChunkCompletionOpts is runChunkCompletion with an explicit tier order
+// (nil = adaptive peer-first) and fetch-worker count, used by warmup
+// strategies (cloud-only source, max bandwidth).
+func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, filePath string, numChunks, size int64, order []CacheTier, workers int) error {
 	ns, ok := cm.nvmeStorage.(*NVMeStorage)
 	if !ok {
 		return nil
@@ -145,7 +152,7 @@ func (cm *DefaultCacheManager) runChunkCompletion(ctx context.Context, filePath 
 	}
 
 	if len(missing) > 0 {
-		if err := cm.fetchMissingChunks(ctx, filePath, missing); err != nil {
+		if err := cm.fetchMissingChunks(ctx, filePath, missing, order, workers); err != nil {
 			return err
 		}
 	}
@@ -229,10 +236,13 @@ func (cm *DefaultCacheManager) runChunkCompletion(ctx context.Context, filePath 
 	return nil
 }
 
-// fetchMissingChunks pulls the given chunk indices from remote tiers (peer
-// first, busy-aware, cloud fallback) and lands them on NVMe.
-func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath string, missing []int64) error {
-	workers := chunkCompletionFetchWorkers
+// fetchMissingChunks pulls the given chunk indices from remote tiers (order
+// nil = adaptive peer-first, busy-aware, cloud fallback) and lands them on
+// NVMe.
+func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath string, missing []int64, order []CacheTier, workers int) error {
+	if workers <= 0 {
+		workers = chunkCompletionFetchWorkers
+	}
 	if workers > len(missing) {
 		workers = len(missing)
 	}
@@ -255,7 +265,7 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 					errCh <- ctx.Err()
 					return
 				}
-				errCh <- cm.fetchAndLandChunk(ctx, chunkPathFor(filePath, idx))
+				errCh <- cm.fetchAndLandChunkOrdered(ctx, chunkPathFor(filePath, idx), order)
 			}
 		}()
 	}
@@ -271,8 +281,17 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 }
 
 func (cm *DefaultCacheManager) fetchAndLandChunk(ctx context.Context, chunkPath string) error {
+	return cm.fetchAndLandChunkOrdered(ctx, chunkPath, nil)
+}
+
+// fetchAndLandChunkOrdered fetches any path (chunk or whole file) from the
+// given tier order (nil = adaptive) and lands it on NVMe.
+func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chunkPath string, order []CacheTier) error {
+	if order == nil {
+		order = cm.remoteReadOrder(chunkPath)
+	}
 	var lastErr error
-	for _, tier := range cm.remoteReadOrder(chunkPath) {
+	for _, tier := range order {
 		entry, _, err := cm.getFromRemoteTierWithBusyRetry(ctx, chunkPath, tier)
 		if err != nil {
 			lastErr = err
