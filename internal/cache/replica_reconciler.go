@@ -108,17 +108,20 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 	}
 	cm.herdStats.reconcileRuns.Add(1)
 
-	target := cm.reconcileTarget()
 	budget := cm.config.ReplicaReconcileMaxPerRun
 	if budget <= 0 {
 		budget = defaultReconcileMaxPerRun
 	}
 
-	for _, cand := range cm.hotLocalObjects(time.Now()) {
+	now := time.Now()
+	cm.readerHeat.sweep(now.Add(-reconcileHotWindow))
+	for _, cand := range cm.hotLocalObjects(now) {
 		if budget <= 0 || ctx.Err() != nil {
 			return
 		}
 
+		// Heat-proportional target: burst demand raises R per file.
+		target := cm.reconcileTargetFor(cand.path, now)
 		holders, err := cm.replicaHolders(ctx, cand.path)
 		if err != nil {
 			continue // coordinator hiccup: try again next pass

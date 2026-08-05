@@ -41,6 +41,7 @@ type herdControlStats struct {
 	reconcileRuns         atomic.Int64
 	reconcileReplications atomic.Int64
 	reconcileSkippedBusy  atomic.Int64
+	reconcileHeatBoosts   atomic.Int64
 	// Ordered chunk fallback: busy-peer retries attempted / recovered
 	// (each hit is a cloud round-trip avoided).
 	busyChunkRetries   atomic.Int64
@@ -58,6 +59,7 @@ type HerdControlSnapshot struct {
 	ReconcileRunsTotal         int64
 	ReconcileReplicationsTotal int64
 	ReconcileSkippedBusyTotal  int64
+	ReconcileHeatBoostsTotal   int64
 	BusyChunkRetriesTotal      int64
 	BusyChunkRetryHitsTotal    int64
 }
@@ -74,6 +76,7 @@ func (cm *DefaultCacheManager) HerdControlSnapshot() HerdControlSnapshot {
 		ReconcileRunsTotal:         cm.herdStats.reconcileRuns.Load(),
 		ReconcileReplicationsTotal: cm.herdStats.reconcileReplications.Load(),
 		ReconcileSkippedBusyTotal:  cm.herdStats.reconcileSkippedBusy.Load(),
+		ReconcileHeatBoostsTotal:   cm.herdStats.reconcileHeatBoosts.Load(),
 		BusyChunkRetriesTotal:      cm.herdStats.busyChunkRetries.Load(),
 		BusyChunkRetryHitsTotal:    cm.herdStats.busyChunkRetryHits.Load(),
 	}

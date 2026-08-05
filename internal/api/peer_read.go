@@ -49,6 +49,12 @@ func (h *Handler) handlePeerRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Heat tracking mirrors the gRPC serve path: distinct remote readers
+	// raise the file's replica target in the reconciler.
+	if observer, ok := h.cacheManager.(cache.RemoteReadObserver); ok {
+		observer.NoteRemoteReader(clean, r.RemoteAddr)
+	}
+
 	lcs, ok := h.cacheManager.(localChunkServer)
 	if !ok {
 		http.Error(w, "peer read not supported", http.StatusNotImplemented)

@@ -31,10 +31,29 @@ type Session struct {
 
 // Manager tracks active CSI mount sessions on this node.
 type Manager struct {
-	mu       sync.Mutex
-	sessions map[string]*Session // keyed by VolumeID
-	fuseRoot string              // e.g. "/host/mnt/fuse"
-	logger   *log.Logger
+	mu         sync.Mutex
+	sessions   map[string]*Session // keyed by VolumeID
+	fuseRoot   string              // e.g. "/host/mnt/fuse"
+	logger     *log.Logger
+	warmupHook func(WarmupRequest)
+}
+
+// WarmupRequest describes a newly created session whose cache policy asks for
+// warmup ("metadata" or "full").
+type WarmupRequest struct {
+	VolumeID string
+	RootPath string
+	Mode     string
+}
+
+// SetWarmupHook registers fn to run (in its own goroutine) when a session is
+// first created with Policy.Warmup other than ""/"none". Refcount bumps on an
+// existing session do not re-trigger it — the subtree is already warming or
+// warm. Set before the agent server starts accepting sessions.
+func (m *Manager) SetWarmupHook(fn func(WarmupRequest)) {
+	m.mu.Lock()
+	m.warmupHook = fn
+	m.mu.Unlock()
 }
 
 // NewManager creates a session manager. fuseRoot is the host path where the
@@ -83,8 +102,14 @@ func (m *Manager) Create(_ context.Context, volumeID, rootPath string, readOnly 
 		CreatedAt: time.Now(),
 	}
 	m.sessions[volumeID] = sess
-	m.logger.Printf("Session created: volume=%s root=%s host=%s readonly=%t pinned=%t",
-		volumeID, rootPath, hostPath, readOnly, policy.Pinned)
+	m.logger.Printf("Session created: volume=%s root=%s host=%s readonly=%t pinned=%t warmup=%s",
+		volumeID, rootPath, hostPath, readOnly, policy.Pinned, policy.Warmup)
+
+	if m.warmupHook != nil && policy.Warmup != "" && policy.Warmup != "none" {
+		hook := m.warmupHook
+		req := WarmupRequest{VolumeID: volumeID, RootPath: rootPath, Mode: policy.Warmup}
+		go hook(req)
+	}
 	// Return a copy, like Get/List, so callers never share the map-backed
 	// struct whose RefCount mutates under the manager mutex.
 	cp := *sess

@@ -397,6 +397,18 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   (default 3) via `PeerStorage.ReplicateTo` (excludes existing holders,
   staggered, busy-aware, ≤8 ops/pass, busy cluster aborts the pass).
   Cold-replica decay is deliberately delegated to LRU eviction.
+- `internal/cache/reader_heat.go` — heat-proportional replication: peer-serve
+  paths (gRPC + HTTP) record distinct remote readers per parent file; the
+  reconciler raises its per-file target (base + readers/2, capped by
+  `-replica-reconcile-max-target`, default 8) and the boost decays with the
+  10-min hot window. `fuse_replica_reconcile_heat_boosts_total` metric.
+- `internal/cache/warmup.go` + session warmup hook — declarative warmup
+  (Fluid pattern): CSI volumeAttribute `warmup: full` triggers
+  `WarmPrefix` on first session create — enumerate the subtree via
+  coordinator `ListFileLocations`, then pull each file whole onto NVMe
+  (chunked files reuse `runChunkCompletion`, unchunked `fetchAndLandChunk`;
+  2 files in parallel, headroom-guarded, never evicts). `warmup: metadata`
+  enumerates only. Warmed nodes publish themselves as holders.
 - `internal/nodeinit/` + `cmd/node-init/` — best-local-disk discovery:
   /proc/mounts + sysfs classification (nvme/ssd/disk/unknown), scoring
   (class dominates > log2 free space > micro-benchmark of top-3 finalists;

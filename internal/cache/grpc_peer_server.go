@@ -12,6 +12,7 @@ import (
 	pb "fuse-client/internal/pb"
 
 	"google.golang.org/grpc/codes"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -74,6 +75,14 @@ func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService
 		return errPeerServeBusy
 	}
 	defer release()
+
+	// Heat tracking: the requester's address identifies a distinct remote
+	// reader; the reconciler scales the file's replica target on this.
+	if observer, ok := s.cacheManager.(RemoteReadObserver); ok {
+		if p, pok := grpcpeer.FromContext(stream.Context()); pok && p.Addr != nil {
+			observer.NoteRemoteReader(req.Path, p.Addr.String())
+		}
+	}
 
 	if resolver, ok := s.cacheManager.(localPathResolver); ok {
 		if localPath, ok := resolver.LocalFilePath(stream.Context(), req.Path); ok {

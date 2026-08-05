@@ -276,6 +276,10 @@ type CacheConfig struct {
 	// pass so reconciliation itself cannot stampede. <=0 uses a default.
 	ReplicaReconcileMaxPerRun int
 
+	// ReplicaReconcileMaxTarget caps the heat-boosted per-file replica target
+	// (see reader_heat.go). <=0 uses a default of 8.
+	ReplicaReconcileMaxTarget int
+
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
@@ -306,6 +310,7 @@ type DefaultCacheManager struct {
 	hedgeLimiter     chan struct{}
 	peerServeGate    *peerServeGate
 	herdStats        herdControlStats
+	readerHeat       readerHeat
 	chunkAds         *chunkAdvertiser
 	chunkPromoteGate chan struct{}
 	tierPerf         *tierPerfTracker

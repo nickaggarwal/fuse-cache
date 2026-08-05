@@ -462,3 +462,62 @@ func TestReconcile_BudgetCapsWork(t *testing.T) {
 		t.Fatalf("total replications = %d, want exactly 1 (budget)", total)
 	}
 }
+
+// TestReconcile_HeatBoostRaisesTarget: an object satisfied at the base target
+// gains replicas once distinct remote readers push its heat-boosted target up
+// (Kraken's lesson: fixed R starves swarms under reader bursts).
+func TestReconcile_HeatBoostRaisesTarget(t *testing.T) {
+	okAddr, okCM, stop := startHerdPeer(t, 8, nil)
+	defer stop()
+
+	coord := newLeaseCoordinator()
+	coord.herdCoordinator.peers = []*coordinator.PeerInfo{
+		{ID: "ok1", Status: "active", GRPCAddress: okAddr},
+	}
+
+	cm := newLeasedTestManager(coord)
+	cm.config.NVMePath = t.TempDir()
+	cm.config.ReplicaReconcileTarget = 1 // satisfied by the local holder alone
+
+	ps := newHerdPeerStorage(t, coord)
+	defer ps.Close()
+	cm.peerStorage = ps
+
+	payload := []byte("hot swarm object")
+	path := "/swarm.bin"
+	if err := cm.nvmeStorage.Write(context.Background(), path, payload); err != nil {
+		t.Fatalf("seed nvme: %v", err)
+	}
+	cm.mu.Lock()
+	cm.entries[path] = &CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe}
+	cm.mu.Unlock()
+	coord.locations[path] = []*coordinator.FileLocation{
+		{FilePath: path, PeerID: "local-node", StorageTier: "nvme"},
+	}
+
+	// No heat: base target 1 is satisfied, nothing replicates.
+	cm.reconcileReplicasOnce(context.Background())
+	okCM.mu.RLock()
+	_, present := okCM.entries[path]
+	okCM.mu.RUnlock()
+	if present {
+		t.Fatal("satisfied object replicated without heat")
+	}
+
+	// Two distinct remote readers -> target 2 -> deficit 1 -> replicate.
+	cm.NoteRemoteReader(path, "10.0.0.1:9999")
+	cm.NoteRemoteReader(path, "10.0.0.2:9999")
+	cm.reconcileReplicasOnce(context.Background())
+
+	okCM.mu.RLock()
+	_, present = okCM.entries[path]
+	okCM.mu.RUnlock()
+	if !present {
+		t.Fatal("heat-boosted object was not replicated")
+	}
+	snap := cm.HerdControlSnapshot()
+	if snap.ReconcileHeatBoostsTotal == 0 || snap.ReconcileReplicationsTotal != 1 {
+		t.Fatalf("heatBoosts=%d replications=%d, want >0 and 1",
+			snap.ReconcileHeatBoostsTotal, snap.ReconcileReplicationsTotal)
+	}
+}

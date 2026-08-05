@@ -91,6 +91,34 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 	})
 }
 
+// tryStartCompletion claims the in-flight slot for filePath, sharing the same
+// guard maybeScheduleChunkCompletion uses so a warmup pass and a scheduled
+// completion pass can never assemble the same parent concurrently. Callers
+// that get true must call endCompletion. Unlike the scheduler it ignores the
+// cooldown: explicit warmup demand should retry a recently-failed parent.
+func (cm *DefaultCacheManager) tryStartCompletion(filePath string) bool {
+	st := &cm.chunkCompletion
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.inFlight == nil {
+		st.inFlight = make(map[string]struct{})
+		st.lastAttempt = make(map[string]time.Time)
+	}
+	if _, running := st.inFlight[filePath]; running {
+		return false
+	}
+	st.inFlight[filePath] = struct{}{}
+	st.lastAttempt[filePath] = time.Now()
+	return true
+}
+
+func (cm *DefaultCacheManager) endCompletion(filePath string) {
+	st := &cm.chunkCompletion
+	st.mu.Lock()
+	delete(st.inFlight, filePath)
+	st.mu.Unlock()
+}
+
 // runChunkCompletion fetches missing chunks, assembles the whole parent on
 // NVMe, swaps accounting from per-chunk files to the whole file, and
 // republishes the location. Fails soft everywhere: fetched chunks stay on

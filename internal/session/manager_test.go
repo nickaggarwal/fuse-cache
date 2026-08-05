@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func tempFuseRoot(t *testing.T) string {
@@ -243,5 +244,40 @@ func TestCreateSubdir(t *testing.T) {
 	}
 	if sess.HostPath != filepath.Join(root, "models/llama") {
 		t.Errorf("HostPath = %q, want %q", sess.HostPath, filepath.Join(root, "models/llama"))
+	}
+}
+
+// TestManager_WarmupHookFiresOncePerVolume: the hook fires on first creation
+// of a warmup-enabled session, not on refcount bumps or warmup=none sessions.
+func TestManager_WarmupHookFiresOncePerVolume(t *testing.T) {
+	m := NewManager(t.TempDir())
+	fired := make(chan WarmupRequest, 4)
+	m.SetWarmupHook(func(r WarmupRequest) { fired <- r })
+
+	ctx := context.Background()
+	policy := CachePolicy{Warmup: "full", Pinned: true}
+	if _, err := m.Create(ctx, "vol-1", "/models/llama", true, policy); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	select {
+	case req := <-fired:
+		if req.VolumeID != "vol-1" || req.RootPath != "/models/llama" || req.Mode != "full" {
+			t.Fatalf("hook got %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("warmup hook never fired")
+	}
+
+	// Refcount bump and warmup=none sessions must not fire.
+	if _, err := m.Create(ctx, "vol-1", "/models/llama", true, policy); err != nil {
+		t.Fatalf("refcount create: %v", err)
+	}
+	if _, err := m.Create(ctx, "vol-2", "/scratch", false, CachePolicy{Warmup: "none"}); err != nil {
+		t.Fatalf("create vol-2: %v", err)
+	}
+	select {
+	case req := <-fired:
+		t.Fatalf("unexpected extra hook firing: %+v", req)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

@@ -27,7 +27,22 @@ AKS and EKS.
      directory buckets), Azure Blob (incl. premium block blob), GCS; chunk
      reads use ranged parallel GETs with no HEAD round-trip
 4. **CSI subsystem**: CSI node plugin + agent gRPC + session manager for
-   mounting cache subtrees into pods with refcounting and pinning.
+   mounting cache subtrees into pods with refcounting, pinning, and
+   **declarative warmup**: a volume mounted with `warmup: full` prefetches
+   its whole subtree into local NVMe in the background (headroom-guarded,
+   peer-first) so first reads run at local speed — the Fluid/NetEase
+   pattern for model cold starts. Example inline volume:
+
+   ```yaml
+   csi:
+     driver: fuse.csi.storage.io
+     volumeAttributes:
+       rootPath: /models/llama-70b
+       cacheMode: readonly
+       warmup: full        # none | metadata | full
+       pinned: "true"      # exempt from eviction while mounted
+   ```
+
 5. **node-init**: per-node disk bootstrap — discovers the best local disk,
    formats/mounts raw NVMe when needed, publishes the cache dir + byte
    budget the client adopts (cloud-agnostic DaemonSet).

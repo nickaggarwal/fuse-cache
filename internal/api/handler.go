@@ -827,6 +827,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_chunk_advertise_published_total %d\n", hc.AdvertisePublishedTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_runs_total %d\n", hc.ReconcileRunsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_replications_total %d\n", hc.ReconcileReplicationsTotal)
+	fmt.Fprintf(w, "fuse_replica_reconcile_heat_boosts_total %d\n", hc.ReconcileHeatBoostsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)

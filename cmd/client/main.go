@@ -96,6 +96,7 @@ func main() {
 		reconcileIntervalSec = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
 		reconcileTarget      = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
 		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
+		reconcileMaxTarget   = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -234,6 +235,7 @@ func main() {
 		ReplicaReconcileInterval:   time.Duration(*reconcileIntervalSec) * time.Second,
 		ReplicaReconcileTarget:     *reconcileTarget,
 		ReplicaReconcileMaxPerRun:  *reconcileMaxPerRun,
+		ReplicaReconcileMaxTarget:  *reconcileMaxTarget,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -504,6 +506,21 @@ func main() {
 	cacheManager, err := cache.NewCacheManager(cacheConfig)
 	if err != nil {
 		logger.Fatalf("Failed to create cache manager: %v", err)
+	}
+
+	// Declarative warmup: a CSI session mounted with cachePolicy warmup=full
+	// prefetches its subtree into local NVMe (warmup=metadata enumerates only).
+	if sessMgr != nil {
+		sessMgr.SetWarmupHook(func(req session.WarmupRequest) {
+			logger.Printf("Session warmup starting: volume=%s root=%s mode=%s", req.VolumeID, req.RootPath, req.Mode)
+			res, err := cacheManager.WarmPrefix(ctx, req.RootPath, req.Mode)
+			if err != nil {
+				logger.Printf("Session warmup for volume %s failed: %v", req.VolumeID, err)
+				return
+			}
+			logger.Printf("Session warmup done: volume=%s root=%s mode=%s files=%d warmed=%d already_local=%d skipped=%d failed=%d bytes=%d",
+				req.VolumeID, req.RootPath, res.Mode, res.Files, res.Warmed, res.AlreadyLocal, res.Skipped, res.Failed, res.Bytes)
+		})
 	}
 
 	// Start peer gRPC server
