@@ -43,6 +43,18 @@ client:
   fuseMountContainerPath: /host/mnt/fuse
   mountPrepareRetries: 10
   mountPrepareRetryDelaySeconds: 2
+  # Peer labels for warm targeting (coordinator POST /api/warm labels=...).
+  #
+  # peerLabelsFromNode imports keys off each node's own Node object, so one
+  # DaemonSet labels every nodepool correctly. Format: comma-separated node
+  # label keys, each optionally renamed "peerKey=nodeKey". Setting it also
+  # creates a ServiceAccount + ClusterRole granting get on nodes.
+  #   AKS: pool=agentpool     EKS: pool=eks.amazonaws.com/nodegroup
+  #   GKE: pool=cloud.google.com/gke-nodepool
+  # Empty disables the lookup and the RBAC.
+  peerLabelsFromNode: "pool=agentpool,zone=topology.kubernetes.io/zone"
+  # Static fallback labels, same "k=v,k=v" form. Node-derived keys win.
+  peerLabels: ""
 
 # node-init discovers the best local disk on every node (NVMe > SSD >
 # ephemeral > HDD by media class, free space, and a micro-benchmark),

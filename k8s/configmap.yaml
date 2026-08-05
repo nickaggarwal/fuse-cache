@@ -9,3 +9,6 @@ data:
   NVME_CACHE_PATH: "/mnt/nvme/cache"
   FUSE_MOUNT_PATH: "/host/mnt/fuse"
   CHUNK_SIZE_MB: "4"
+  # Node label keys imported as peer labels, "peerKey=nodeKey" to rename.
+  # AKS: agentpool. EKS: eks.amazonaws.com/nodegroup. GKE: cloud.google.com/gke-nodepool.
+  PEER_LABELS_FROM_NODE: "pool=agentpool,zone=topology.kubernetes.io/zone"

@@ -130,3 +130,17 @@ package-lock.json
 
 # Mock files (if using gomock)
 mocks/ 
+
+# Stray root-level binaries from `go build` without -o bin/ (the three
+# binaries share names with cmd/ subdirs, so they land here by default).
+/client
+/coordinator
+/csi-driver
+/node-init
+
+# Python bytecode from the Streamlit dashboard
+__pycache__/
+*.pyc
+
+# Claude Code local session state
+.claude/

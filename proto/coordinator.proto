@@ -45,6 +45,9 @@ message FileLocation {
   google.protobuf.Timestamp last_accessed = 6;
   bool is_chunked = 7;
   repeated ChunkInfo chunks = 8;
+  // Stride the file was written with. 0 = unknown (pre-field metadata);
+  // readers fall back to their configured chunk size.
+  int64 chunk_size = 9;
 }
 
 message RegisterPeerRequest {

@@ -176,6 +176,14 @@ func TestWatermarkEviction_TriggersAboveHighWatermark(t *testing.T) {
 // TestWatermarkEviction_IdleBelowWatermark: no work under the band.
 func TestWatermarkEviction_IdleBelowWatermark(t *testing.T) {
 	cm := evictTestManager(t, 100_000)
+	// nvmePressurePct takes the max of budget usage and real device usage
+	// (statfs on NVMePath), so a developer machine whose disk is over the
+	// high watermark makes the premise of this test unreachable — the
+	// evictor correctly runs, on device pressure it cannot control. Skip
+	// rather than fail: the assertion below is about budget pressure.
+	if p := cm.nvmePressurePct(); p >= watermarkHighPct {
+		t.Skipf("host filesystem at %d%% is already over the %d%% watermark", p, watermarkHighPct)
+	}
 	seedNVMe(t, cm, "/small.bin", 1000, true, time.Hour)
 
 	cm.runWatermarkEviction(context.Background())

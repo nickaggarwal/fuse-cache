@@ -47,6 +47,9 @@ type Handler struct {
 	peerID       string
 	apiKey       string
 	logger       *log.Logger
+	// warmJobs tracks async /api/cache/warm passes so callers can poll them.
+	// Zero value is usable; the map is created on first start.
+	warmJobs warmJobs
 }
 
 type fsSnapshotRequest struct {
@@ -123,9 +126,12 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	// Apply auth middleware
 	router.Use(h.authMiddleware)
 
-	// File operations
-	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
+	// File operations. The /size route must be registered BEFORE the greedy
+	// {path:.*} catch-all: mux matches in registration order, so the catch-all
+	// otherwise swallows the /size suffix into the path variable and the size
+	// endpoint is unreachable.
 	router.HandleFunc("/api/files/{path:.*}/size", h.handleFileSize).Methods("GET")
+	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
 
 	// Peer operations
 	router.HandleFunc("/api/peer/read", h.handlePeerRead).Methods("GET")
@@ -138,6 +144,8 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache", h.handleCache).Methods("GET")
 	router.HandleFunc("/api/cache/stats", h.handleCacheStats).Methods("GET")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarm).Methods("POST")
+	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
+	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
 	router.HandleFunc("/api/fs/restore", h.handleFSRestore).Methods("POST")
 
@@ -813,6 +821,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_peer_serve_accepted_total %d\n", pl.ServeAcceptedTotal)
 	fmt.Fprintf(w, "fuse_peer_serve_rejected_total %d\n", pl.ServeRejectedTotal)
 	fmt.Fprintf(w, "fuse_peer_fetch_busy_skips_total %d\n", pl.FetchBusySkips)
+	fmt.Fprintf(w, "fuse_peer_fetch_miss_skips_total %d\n", pl.FetchMissSkips)
 	fmt.Fprintf(w, "fuse_peer_fetch_jitter_retries_total %d\n", pl.FetchJitterRetries)
 	fmt.Fprintf(w, "fuse_peer_replication_busy_skips_total %d\n", pl.ReplicationBusySkips)
 	fmt.Fprintf(w, "fuse_peer_replication_staggers_total %d\n", pl.ReplicationStaggers)

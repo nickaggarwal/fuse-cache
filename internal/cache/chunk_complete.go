@@ -124,13 +124,27 @@ func (cm *DefaultCacheManager) endCompletion(filePath string) {
 // republishes the location. Fails soft everywhere: fetched chunks stay on
 // NVMe for the next attempt.
 func (cm *DefaultCacheManager) runChunkCompletion(ctx context.Context, filePath string, numChunks, size int64) error {
-	return cm.runChunkCompletionOpts(ctx, filePath, numChunks, size, nil, chunkCompletionFetchWorkers)
+	return cm.runChunkCompletionOpts(ctx, filePath, numChunks, size, nil, chunkCompletionFetchWorkers, nil)
+}
+
+// chunkProgress reports sub-file movement during a chunk-completion pass.
+// Both fields are optional; a nil *chunkProgress reports nothing. Callbacks
+// run on fetch-worker goroutines, so they must be cheap and non-blocking.
+type chunkProgress struct {
+	// Plan fires once, before any fetch, with the number of chunks this pass
+	// actually has to pull. Chunks already on NVMe are excluded, so a caller
+	// summing Plan across files gets a total that Landed can reach exactly.
+	Plan func(toFetch int64)
+	// Landed fires once per successfully landed chunk, with its byte count.
+	Landed func(bytes int64)
 }
 
 // runChunkCompletionOpts is runChunkCompletion with an explicit tier order
 // (nil = adaptive peer-first) and fetch-worker count, used by warmup
-// strategies (cloud-only source, max bandwidth).
-func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, filePath string, numChunks, size int64, order []CacheTier, workers int) error {
+// strategies (cloud-only source, max bandwidth). prog, when non-nil, reports
+// sub-file movement so a warm of one very large file shows progress before
+// the whole file lands.
+func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, filePath string, numChunks, size int64, order []CacheTier, workers int, prog *chunkProgress) error {
 	ns, ok := cm.nvmeStorage.(*NVMeStorage)
 	if !ok {
 		return nil
@@ -151,8 +165,19 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 		}
 	}
 
+	// Announce the plan before fetching: a caller that only learns the chunk
+	// count as chunks land can never show a denominator, and the headroom
+	// guard above may abort before any fetch happens.
+	if prog != nil && prog.Plan != nil {
+		prog.Plan(int64(len(missing)))
+	}
+
 	if len(missing) > 0 {
-		if err := cm.fetchMissingChunks(ctx, filePath, missing, order, workers); err != nil {
+		var onChunk func(int64)
+		if prog != nil {
+			onChunk = prog.Landed
+		}
+		if err := cm.fetchMissingChunks(ctx, filePath, missing, order, workers, onChunk); err != nil {
 			return err
 		}
 	}
@@ -163,6 +188,10 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	if err != nil {
 		return err
 	}
+	// Chunk 0's length is the stride the file was written with (every chunk
+	// but the last is full width). Capture it here so the assembled whole
+	// file can be re-sliced for peer serves on the same boundaries.
+	var chunkSize int64
 	for i := int64(0); i < numChunks; i++ {
 		localPath, ok := cm.LocalFilePath(ctx, chunkPathFor(filePath, i))
 		if !ok {
@@ -174,11 +203,15 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 			w.Abort()
 			return err
 		}
+		before := w.BytesWritten()
 		_, cerr := io.Copy(w, f)
 		f.Close()
 		if cerr != nil {
 			w.Abort()
 			return cerr
+		}
+		if i == 0 {
+			chunkSize = w.BytesWritten() - before
 		}
 	}
 	if w.BytesWritten() != size {
@@ -195,10 +228,14 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	if parent, ok := cm.entries[filePath]; ok && parent != nil {
 		parent.Tier = TierNVMe
 		parent.LastAccessed = now
+		if parent.ChunkSize <= 0 {
+			parent.ChunkSize = chunkSize
+		}
 	} else {
 		cm.entries[filePath] = &CacheEntry{
 			FilePath: filePath, StoragePath: filePath, Size: size,
 			LastAccessed: now, Tier: TierNVMe, IsChunked: true, NumChunks: numChunks,
+			ChunkSize: chunkSize,
 		}
 	}
 	cm.nvmeUsed += size
@@ -228,7 +265,7 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	cm.goBackground(func() {
 		cm.publishFileLocation(cm.shutdownCtx, &CacheEntry{
 			FilePath: filePath, StoragePath: filePath, Size: size,
-			IsChunked: true, NumChunks: numChunks,
+			IsChunked: true, NumChunks: numChunks, ChunkSize: chunkSize,
 		}, TierNVMe)
 	})
 	cm.logger.Printf("Chunk completion assembled %s (%d chunks, %d fetched, %d bytes)",
@@ -238,8 +275,10 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 
 // fetchMissingChunks pulls the given chunk indices from remote tiers (order
 // nil = adaptive peer-first, busy-aware, cloud fallback) and lands them on
-// NVMe.
-func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath string, missing []int64, order []CacheTier, workers int) error {
+// NVMe. onChunk, when non-nil, is called once per landed chunk with its byte
+// count; it runs on a fetch worker goroutine, so it must be cheap and
+// non-blocking.
+func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath string, missing []int64, order []CacheTier, workers int, onChunk func(bytes int64)) error {
 	if workers <= 0 {
 		workers = chunkCompletionFetchWorkers
 	}
@@ -265,7 +304,11 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 					errCh <- ctx.Err()
 					return
 				}
-				errCh <- cm.fetchAndLandChunkOrdered(ctx, chunkPathFor(filePath, idx), order)
+				n, err := cm.fetchAndLandChunkOrdered(ctx, chunkPathFor(filePath, idx), order)
+				if err == nil && onChunk != nil {
+					onChunk(n)
+				}
+				errCh <- err
 			}
 		}()
 	}
@@ -281,29 +324,39 @@ func (cm *DefaultCacheManager) fetchMissingChunks(ctx context.Context, filePath 
 }
 
 func (cm *DefaultCacheManager) fetchAndLandChunk(ctx context.Context, chunkPath string) error {
-	return cm.fetchAndLandChunkOrdered(ctx, chunkPath, nil)
+	_, err := cm.fetchAndLandChunkOrdered(ctx, chunkPath, nil)
+	return err
 }
 
 // fetchAndLandChunkOrdered fetches any path (chunk or whole file) from the
-// given tier order (nil = adaptive) and lands it on NVMe.
-func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chunkPath string, order []CacheTier) error {
+// given tier order (nil = adaptive) and lands it on NVMe. It returns the
+// number of bytes landed so callers can report progress at chunk granularity
+// rather than only at file boundaries.
+func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chunkPath string, order []CacheTier) (int64, error) {
 	if order == nil {
 		order = cm.remoteReadOrder(chunkPath)
 	}
 	var lastErr error
 	for _, tier := range order {
-		entry, _, err := cm.getFromRemoteTierWithBusyRetry(ctx, chunkPath, tier)
+		tierStart := time.Now()
+		entry, servedTier, err := cm.getFromRemoteTierWithBusyRetry(ctx, chunkPath, tier)
 		if err != nil {
+			cm.metrics.RecordMiss(tier)
 			lastErr = err
 			continue
 		}
+		// Warm and chunk-completion traffic is real tier traffic: without
+		// these the cloud/peer counters read zero through a whole warm, and
+		// every dashboard built on them under-reports.
+		cm.metrics.RecordHit(servedTier)
+		cm.metrics.RecordTierRead(servedTier, int64(len(entry.Data)), time.Since(tierStart))
 		landed := &CacheEntry{
 			FilePath: chunkPath, StoragePath: chunkPath,
 			Size: int64(len(entry.Data)), LastAccessed: time.Now(),
 			Tier: TierNVMe, Data: entry.Data,
 		}
 		if err := cm.putToNVMeWithEviction(ctx, landed); err != nil {
-			return err
+			return 0, err
 		}
 		meta := *landed
 		meta.Data = nil
@@ -311,12 +364,13 @@ func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chu
 		cm.entries[chunkPath] = &meta
 		cm.mu.Unlock()
 		cm.metrics.RecordWrite(landed.Size)
-		return nil
+		cm.advertisePromoted(chunkPath)
+		return landed.Size, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no remote tier served %s", chunkPath)
 	}
-	return lastErr
+	return 0, lastErr
 }
 
 func chunkPathFor(filePath string, idx int64) string {

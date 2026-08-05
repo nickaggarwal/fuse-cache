@@ -1,3 +1,33 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fuse-client
+  namespace: fuse-system
+---
+# The downward API cannot expose node labels, so the client reads its own Node
+# object to derive peer labels (-peer-labels-from-node). Get on nodes only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fuse-client-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fuse-client-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: fuse-client
+    namespace: fuse-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fuse-client-node-reader
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -14,6 +44,7 @@ spec:
       labels:
         app: client
     spec:
+      serviceAccountName: fuse-client
       hostPID: true
       nodeSelector:
         agentpool: userpool
@@ -139,6 +170,14 @@ spec:
             - "$(CHUNK_SIZE_MB)"
             - "-cloud-provider"
             - "azure"
+            # Peer labels come from the node itself, not a literal here: a
+            # hardcoded pool= makes every peer in a multi-nodepool cluster
+            # advertise the same pool, and label-based warm targeting then
+            # silently hits the wrong nodes. agentpool is the AKS key; use
+            # eks.amazonaws.com/nodegroup on EKS, cloud.google.com/gke-nodepool
+            # on GKE. Missing keys are simply not published.
+            - "-peer-labels-from-node"
+            - "$(PEER_LABELS_FROM_NODE)"
           envFrom:
             - configMapRef:
                 name: fuse-config

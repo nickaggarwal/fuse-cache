@@ -1,3 +1,35 @@
+{{- if .Values.client.peerLabelsFromNode }}
+# The downward API cannot expose node labels, so the client reads its own Node
+# object to derive peer labels. Get on nodes, nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fuse-client
+  namespace: {{ include "fuse-cache.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-fuse-client-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-fuse-client-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: fuse-client
+    namespace: {{ include "fuse-cache.namespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-fuse-client-node-reader
+---
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -14,6 +46,9 @@ spec:
       labels:
         app: client
     spec:
+      {{- if .Values.client.peerLabelsFromNode }}
+      serviceAccountName: fuse-client
+      {{- end }}
       hostPID: true
       nodeSelector:
         {{- toYaml .Values.client.nodeSelector | nindent 8 }}
@@ -163,6 +198,18 @@ spec:
             - "$(CHUNK_SIZE_MB)"
             - "-cloud-provider"
             - "{{ .Values.client.cloudProvider }}"
+            {{- if .Values.client.peerLabelsFromNode }}
+            # Peer labels derived from this node's own labels. Hardcoding
+            # pool= makes every peer in a multi-nodepool cluster advertise the
+            # same pool, and label-based warm targeting then hits the wrong
+            # nodes. Requires the RBAC below (get on nodes).
+            - "-peer-labels-from-node"
+            - "{{ .Values.client.peerLabelsFromNode }}"
+            {{- end }}
+            {{- if .Values.client.peerLabels }}
+            - "-peer-labels"
+            - "{{ .Values.client.peerLabels }}"
+            {{- end }}
             - "-s3-bucket"
             - "$(S3_BUCKET)"
             - "-s3-region"

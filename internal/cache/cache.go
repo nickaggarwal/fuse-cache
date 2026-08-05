@@ -50,7 +50,14 @@ type CacheEntry struct {
 	Data         []byte
 	IsChunked    bool
 	NumChunks    int64
-	Checksum     string
+	// ChunkSize is the stride the file was actually written with. Readers must
+	// use this rather than their own -chunk-size flag: the two differ whenever
+	// a file outlives a config change, and computing chunk offsets from the
+	// wrong stride yields short reads, truncated whole-file responses, and
+	// out-of-range slices. Zero means "unknown" (legacy metadata) — callers
+	// fall back to the configured size via effectiveChunkSize.
+	ChunkSize int64
+	Checksum  string
 	// PersistedToCloud is set once the background write-through confirms the
 	// object is durable in the cloud tier. Eviction must not delete NVMe
 	// bytes whose only copy is local — that turns cache pressure into data
@@ -757,20 +764,22 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 	if err != nil || chunkIndex < 0 {
 		return "", 0, 0, false
 	}
-	chunkSize := cm.config.ChunkSize
-	if chunkSize <= 0 {
-		return "", 0, 0, false
-	}
-
 	cm.mu.RLock()
 	entry, hasParent := cm.entries[parent]
 	var size int64
 	var chunked bool
+	var chunkSize int64
 	if hasParent && entry != nil {
 		size = entry.Size
 		chunked = entry.IsChunked
+		// Serve the byte range the file was written with, not the range our
+		// own flag implies — otherwise this node hands peers mis-aligned data.
+		chunkSize = cm.effectiveChunkSize(entry)
 	}
 	cm.mu.RUnlock()
+	if chunkSize <= 0 {
+		return "", 0, 0, false
+	}
 	if !hasParent || !chunked || size <= 0 {
 		return "", 0, 0, false
 	}
@@ -1037,6 +1046,7 @@ func (cm *DefaultCacheManager) getChunked(ctx context.Context, entry *CacheEntry
 	if localEntry, err := cm.getFromTierNoVerify(ctx, entry.FilePath, TierNVMe); err == nil {
 		localEntry.IsChunked = true
 		localEntry.NumChunks = entry.NumChunks
+		localEntry.ChunkSize = entry.ChunkSize
 		localEntry.Size = entry.Size
 		return localEntry, nil
 	}
@@ -1060,6 +1070,7 @@ func (cm *DefaultCacheManager) getChunked(ctx context.Context, entry *CacheEntry
 		Data:         allData,
 		IsChunked:    true,
 		NumChunks:    entry.NumChunks,
+		ChunkSize:    entry.ChunkSize,
 	}, nil
 }
 
@@ -1067,6 +1078,7 @@ func (cm *DefaultCacheManager) getChunkedLocal(ctx context.Context, entry *Cache
 	if localEntry, err := cm.getFromTierNoVerify(ctx, entry.FilePath, TierNVMe); err == nil {
 		localEntry.IsChunked = true
 		localEntry.NumChunks = entry.NumChunks
+		localEntry.ChunkSize = entry.ChunkSize
 		localEntry.Size = entry.Size
 		return localEntry, nil
 	}
@@ -1090,6 +1102,7 @@ func (cm *DefaultCacheManager) getChunkedLocal(ctx context.Context, entry *Cache
 		Data:         allData,
 		IsChunked:    true,
 		NumChunks:    entry.NumChunks,
+		ChunkSize:    entry.ChunkSize,
 	}, nil
 }
 
@@ -1102,9 +1115,11 @@ func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w i
 	cm.mu.RLock()
 	var isChunked bool
 	var numChunks int64
+	var wantSize int64
 	if entry, ok := cm.entries[filePath]; ok && entry != nil {
 		isChunked = entry.IsChunked
 		numChunks = entry.NumChunks
+		wantSize = entry.Size
 	}
 	cm.mu.RUnlock()
 
@@ -1121,6 +1136,13 @@ func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w i
 			if err != nil {
 				return total, fmt.Errorf("failed to write chunk %d: %v", i, err)
 			}
+		}
+		// A wrong chunk count (stale metadata, or a stride mismatch on legacy
+		// files) yields a short body with no error, which callers cannot
+		// distinguish from a correct one. Fail loudly instead.
+		if wantSize > 0 && total != wantSize {
+			return total, fmt.Errorf("short read for %s: assembled %d bytes from %d chunks, want %d",
+				filePath, total, numChunks, wantSize)
 		}
 		cm.metrics.RecordHit(TierNVMe)
 		return total, nil
@@ -1325,6 +1347,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 		Tier:         TierNVMe,
 		IsChunked:    true,
 		NumChunks:    numChunks,
+		ChunkSize:    cm.config.ChunkSize,
 	}
 	cm.mu.Lock()
 	cm.entries[filePath] = meta
@@ -1388,9 +1411,11 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 
 	numChunks := int64(0)
 	isChunked := false
+	chunkSize := int64(0)
 	if size > cm.config.ChunkSize {
 		isChunked = true
-		numChunks = (size + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		numChunks = chunkCountFor(size, cm.config.ChunkSize)
+		chunkSize = cm.config.ChunkSize
 	}
 
 	entry := &CacheEntry{
@@ -1401,6 +1426,7 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 		Tier:         TierNVMe,
 		IsChunked:    isChunked,
 		NumChunks:    numChunks,
+		ChunkSize:    chunkSize,
 	}
 
 	cm.mu.Lock()
@@ -1665,9 +1691,15 @@ func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRef
 		if loc == nil || loc.FilePath == "" {
 			continue
 		}
+		chunkSize := loc.ChunkSize
+		if chunkSize <= 0 {
+			chunkSize = cm.config.ChunkSize
+		}
 		numChunks := int64(0)
-		if loc.IsChunked && cm.config.ChunkSize > 0 && loc.FileSize > 0 {
-			numChunks = (loc.FileSize + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		if loc.IsChunked {
+			numChunks = chunkCountFor(loc.FileSize, chunkSize)
+		} else {
+			chunkSize = 0
 		}
 		remote = append(remote, &CacheEntry{
 			FilePath:     loc.FilePath,
@@ -1677,6 +1709,7 @@ func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRef
 			Tier:         tierFromStorageTier(loc.StorageTier),
 			IsChunked:    loc.IsChunked,
 			NumChunks:    numChunks,
+			ChunkSize:    chunkSize,
 		})
 	}
 
@@ -1803,15 +1836,16 @@ func (cm *DefaultCacheManager) evictionSafe(ctx context.Context, key string, ent
 	// evicting the local copy against it silently loses the local write
 	// (mountpoint-s3 revalidates cached content by etag for the same
 	// reason; size is the check every backend already exposes).
-	if entry != nil && entry.IsChunked && entry.NumChunks > 0 && cm.config.ChunkSize > 0 {
+	if entry != nil && entry.IsChunked && entry.NumChunks > 0 && cm.effectiveChunkSize(entry) > 0 {
 		// Chunked parents persist as chunk objects: probe first chunk for
 		// existence and the last chunk for exact expected size.
 		if !cm.cloudStorage.Exists(ctx, chunkPathFor(key, 0)) {
 			return false
 		}
+		chunkSize := cm.effectiveChunkSize(entry)
 		lastIdx := entry.NumChunks - 1
-		wantLast := entry.Size - lastIdx*cm.config.ChunkSize
-		if wantLast <= 0 || wantLast > cm.config.ChunkSize {
+		wantLast := entry.Size - lastIdx*chunkSize
+		if wantLast <= 0 || wantLast > chunkSize {
 			// Size/chunk-count metadata disagrees; do not trust the probe.
 			return false
 		}
@@ -1999,6 +2033,11 @@ func (cm *DefaultCacheManager) publishFileLocation(ctx context.Context, entry *C
 		LastAccessed: time.Now(),
 		IsChunked:    entry.IsChunked,
 	}
+	// Carry the stride so peers that pull this file address its chunks the way
+	// it was written, regardless of their own -chunk-size.
+	if entry.IsChunked {
+		location.ChunkSize = cm.effectiveChunkSize(entry)
+	}
 	if err := cm.config.Coordinator.UpdateFileLocation(ctx, location); err != nil {
 		cm.logger.Printf("Failed to publish metadata for %s: %v", entry.FilePath, err)
 	}
@@ -2138,11 +2177,16 @@ func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	offset := chunkIndex * cm.config.ChunkSize
+	// Slice the whole local file with the parent's own stride so the chunk we
+	// synthesize matches what every other holder calls chunk N.
+	chunkSize := cm.effectiveChunkSize(parentMeta)
+	if chunkSize <= 0 {
+		return nil, os.ErrNotExist
+	}
+	offset := chunkIndex * chunkSize
 	if offset >= parentMeta.Size {
 		return nil, io.EOF
 	}
-	chunkSize := cm.config.ChunkSize
 	if remaining := parentMeta.Size - offset; remaining < chunkSize {
 		chunkSize = remaining
 	}
@@ -2277,6 +2321,9 @@ func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEn
 	cm.entries[entry.FilePath] = newEntry
 	cm.mu.Unlock()
 	cm.touchEntries(entry.FilePath)
+	// These bytes came from a peer or the cloud and are now servable locally:
+	// join the swarm so the next requester can pull them from here.
+	cm.advertisePromoted(entry.FilePath)
 }
 
 func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry) error {
@@ -2318,6 +2365,7 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 
 	entry.IsChunked = true
 	entry.NumChunks = numChunks
+	entry.ChunkSize = cm.config.ChunkSize
 	entry.Size = dataLen
 	entry.Tier = TierNVMe
 	// Drop full payload after chunking to avoid retaining large buffers in memory.
@@ -2336,6 +2384,46 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 
 // ReadRange reads a byte range from a file without loading an entire chunked file
 // into memory.
+// effectiveChunkSize returns the stride to use when addressing entry's chunks:
+// the size the file was written with when known, else this node's configured
+// size. Legacy metadata predates CacheEntry.ChunkSize, so the fallback stays.
+func (cm *DefaultCacheManager) effectiveChunkSize(entry *CacheEntry) int64 {
+	if entry != nil && entry.ChunkSize > 0 {
+		return entry.ChunkSize
+	}
+	return cm.config.ChunkSize
+}
+
+// chunkCountFor derives the chunk count from a file size and stride the same
+// way putChunked splits it. Holders publish IsChunked without enumerating
+// chunks, so readers reconstruct the count instead of trusting a stale one.
+func chunkCountFor(size, chunkSize int64) int64 {
+	if size <= 0 || chunkSize <= 0 {
+		return 0
+	}
+	return (size + chunkSize - 1) / chunkSize
+}
+
+// clampChunkSlice bounds [from,to) to a valid sub-slice of a chunk of length
+// n. Both ends are clamped: a wrong chunk-size stride (see effectiveChunkSize)
+// can push from past the end of the chunk, and slicing on that panics in the
+// FUSE read goroutine, which unmounts the node rather than failing one read.
+func clampChunkSlice(from, to, n int64) (int64, int64) {
+	if from < 0 {
+		from = 0
+	}
+	if from > n {
+		from = n
+	}
+	if to > n {
+		to = n
+	}
+	if to < from {
+		to = from
+	}
+	return from, to
+}
+
 func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error) {
 	started := time.Now()
 	if size <= 0 {
@@ -2345,7 +2433,6 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	cm.mu.RLock()
 	entry, hasMeta := cm.entries[filePath]
 	isChunked := hasMeta && entry.IsChunked
-	chunkSize := cm.config.ChunkSize
 	cm.mu.RUnlock()
 	if !isChunked {
 		if resolved, ok := cm.resolveChunkedEntry(ctx, filePath); ok {
@@ -2354,6 +2441,10 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 			isChunked = true
 		}
 	}
+	// Address chunks with the stride the file was written with, not this
+	// node's flag — they differ across a -chunk-size change and the wrong
+	// stride silently mis-slices every chunk boundary.
+	chunkSize := cm.effectiveChunkSize(entry)
 
 	if !isChunked {
 		got, err := cm.Get(ctx, filePath)
@@ -2508,15 +2599,12 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		if end < chunkEnd {
 			to = end - chunkOffset
 		}
-		if from < 0 {
-			from = 0
-		}
-		if to < from {
-			to = from
-		}
-		if to > int64(len(chunkData)) {
-			to = int64(len(chunkData))
-		}
+		// from must be clamped as well as to: when the file was written with a
+		// different chunk size than this reader is configured for, chunkOffset
+		// is computed from the wrong stride and from can land past the end of
+		// the chunk. Slicing on that panics inside the FUSE read goroutine and
+		// takes the whole daemon (and the node's mount) down.
+		from, to = clampChunkSlice(from, to, int64(len(chunkData)))
 		nvmeWallBytes, peerWallBytes, cloudWallBytes := readWallTierBytes(chunkTiers[0], to-from)
 		dur := time.Since(started)
 		cm.metrics.RecordReadWall(to-from, dur, nvmeWallBytes, peerWallBytes, cloudWallBytes)
@@ -2545,15 +2633,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 			to = end - chunkOffset
 		}
 
-		if from < 0 {
-			from = 0
-		}
-		if to < from {
-			to = from
-		}
-		if to > int64(len(chunkData)) {
-			to = int64(len(chunkData))
-		}
+		from, to = clampChunkSlice(from, to, int64(len(chunkData)))
 		sliceLen := to - from
 		switch chunkTiers[pos] {
 		case TierNVMe:
@@ -2593,9 +2673,10 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 		if entry == nil || entry.FilePath != filePath || !entry.IsChunked {
 			continue
 		}
+		chunkSize := cm.effectiveChunkSize(entry)
 		numChunks := entry.NumChunks
-		if numChunks <= 0 && cm.config.ChunkSize > 0 && entry.Size > 0 {
-			numChunks = (entry.Size + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		if numChunks <= 0 {
+			numChunks = chunkCountFor(entry.Size, chunkSize)
 		}
 		resolved := &CacheEntry{
 			FilePath:     filePath,
@@ -2605,6 +2686,7 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 			Tier:         tierFromStorageTier(cacheTierToStorageTier(entry.Tier)),
 			IsChunked:    true,
 			NumChunks:    numChunks,
+			ChunkSize:    chunkSize,
 		}
 		cm.mu.RUnlock()
 		cm.mu.Lock()
@@ -2629,9 +2711,11 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 		if loc == nil || !loc.IsChunked {
 			continue
 		}
-		numChunks := int64(0)
-		if cm.config.ChunkSize > 0 && loc.FileSize > 0 {
-			numChunks = (loc.FileSize + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		// Prefer the stride the holder published; fall back to ours only for
+		// metadata written before FileLocation carried it.
+		chunkSize := loc.ChunkSize
+		if chunkSize <= 0 {
+			chunkSize = cm.config.ChunkSize
 		}
 		resolved := &CacheEntry{
 			FilePath:     filePath,
@@ -2640,7 +2724,8 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 			LastAccessed: loc.LastAccessed,
 			Tier:         tierFromStorageTier(loc.StorageTier),
 			IsChunked:    true,
-			NumChunks:    numChunks,
+			NumChunks:    chunkCountFor(loc.FileSize, chunkSize),
+			ChunkSize:    chunkSize,
 		}
 		cm.mu.Lock()
 		cm.entries[filePath] = resolved

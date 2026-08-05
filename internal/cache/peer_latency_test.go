@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -157,5 +158,86 @@ func TestPeerPairLatencies_SnapshotSortedAndPopulated(t *testing.T) {
 	}
 	if pairs[0].Samples != 4 || pairs[0].LatencyMs <= 0 {
 		t.Fatalf("alpha pair not populated: %+v", pairs[0])
+	}
+}
+
+// TestReadPeerData_MissDoesNotPoisonSuccessEWMA is the regression test for the
+// stargz-test finding: every pair reported success_ratio ~= 0 with 47-140
+// samples, so pairScore (success/latencyMs) was ~0 for all peers and the
+// latency ordering never took effect. The cause was that traversal probes
+// holders in order — most attempts miss by construction — and misses were
+// folded into the success EWMA.
+func TestReadPeerData_MissDoesNotPoisonSuccessEWMA(t *testing.T) {
+	holderAddr, _, stopHolder := startHerdPeer(t, 8, map[string][]byte{"/held.bin": []byte("payload")})
+	defer stopHolder()
+	// An empty peer: reachable and healthy, just doesn't have the object.
+	emptyAddr, _, stopEmpty := startHerdPeer(t, 8, nil)
+	defer stopEmpty()
+
+	coord := &herdCoordinator{}
+	ps := newHerdPeerStorage(t, coord)
+	defer ps.Close()
+
+	holder := &coordinator.PeerInfo{ID: "holder", GRPCAddress: holderAddr, Status: "active"}
+	empty := &coordinator.PeerInfo{ID: "empty", GRPCAddress: emptyAddr, Status: "active"}
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		if _, err := ps.readPeerData(ctx, empty, "/held.bin"); err == nil {
+			t.Fatal("read from non-holder should fail")
+		} else if !isPeerMiss(err) {
+			t.Fatalf("non-holder error not classified as a miss: %v", err)
+		}
+		if _, err := ps.readPeerData(ctx, holder, "/held.bin"); err != nil {
+			t.Fatalf("read from holder: %v", err)
+		}
+	}
+
+	// The empty peer answered every request correctly, so it has no network
+	// signal at all — not a run of recorded failures.
+	if _, _, ok := ps.pairLatency.measured("empty"); ok {
+		t.Fatal("misses must not accumulate samples for the peer")
+	}
+	if got := ps.missSkipsTotal.Load(); got != 5 {
+		t.Fatalf("missSkipsTotal = %d, want 5", got)
+	}
+
+	_, success, ok := ps.pairLatency.measured("holder")
+	if !ok {
+		t.Fatal("holder should have trusted samples after 5 reads")
+	}
+	if success < 0.99 {
+		t.Fatalf("holder success = %.4f, want ~1.0 (the live bug drove this to ~0)", success)
+	}
+
+	// With the holder scoring on real signal and the empty peer falling back
+	// to the neutral prior, traversal must still order sensibly.
+	if ps.pairScore(holder) <= 0 {
+		t.Fatalf("holder pairScore = %.6f, want > 0", ps.pairScore(holder))
+	}
+}
+
+// TestReadPeerData_TransferFailureStillRecorded guards the other side of the
+// classification: a genuine transport failure must still lower the pair's
+// success ratio, or the EWMA stops routing around bad links.
+func TestReadPeerData_TransferFailureStillRecorded(t *testing.T) {
+	coord := &herdCoordinator{}
+	ps := newHerdPeerStorage(t, coord)
+	defer ps.Close()
+
+	// Port 1 on loopback: dial fails, which is a real failure, not a miss.
+	dead := &coordinator.PeerInfo{ID: "dead", GRPCAddress: "127.0.0.1:1", Status: "active"}
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		if _, err := ps.readPeerData(ctx, dead, "/x.bin"); err == nil {
+			t.Fatal("read from dead peer should fail")
+		}
+	}
+	_, success, ok := ps.pairLatency.measured("dead")
+	if !ok {
+		t.Fatal("failures should still accumulate samples")
+	}
+	if success > 0.01 {
+		t.Fatalf("dead peer success = %.4f, want ~0", success)
 	}
 }

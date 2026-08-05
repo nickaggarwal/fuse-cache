@@ -75,6 +75,10 @@ type FileLocation struct {
 	LastAccessed time.Time   `json:"last_accessed"`
 	IsChunked    bool        `json:"is_chunked"`
 	Chunks       []ChunkInfo `json:"chunks,omitempty"`
+	// ChunkSize is the stride the file was written with. 0 means unknown
+	// (metadata published before this field existed); readers then fall back
+	// to their own configured chunk size.
+	ChunkSize int64 `json:"chunk_size,omitempty"`
 }
 
 // Ensure CoordinatorService implements the Coordinator interface

@@ -219,6 +219,8 @@ chars, so tests use `/tmp`, not `t.TempDir()`.
 | | `grpc_server.go` / `grpc_client.go` | gRPC transport for the same `Coordinator` interface (default path; `GRPCCoordinatorClient` falls back to HTTP for endpoints not yet on gRPC) |
 | | `manifest.go` | Cache-warming manifest: `BuildManifest` enumerates known file locations; `/api/fs/snapshot` writes it, `/api/fs/restore` rehydrates peer NVMe from cloud. Replaces the old snapshot/restore scheme. |
 | `internal/api/` | `handler.go` | Client HTTP API: file CRUD, peer ops, cache stats, health, snapshot/restore, Prometheus `/metrics`. Auth middleware, upload limits, path validation |
+| | `warm.go` | `POST /api/cache/warm` + the async warm-job registry behind `GET /api/cache/warm[/{id}]` |
+| `internal/nodelabels/` | `nodelabels.go` | Reads this pod's Node object to derive peer labels (`-peer-labels-from-node`); advisory, no client-go |
 | `internal/fuse/` | `filesystem.go` | FUSE filesystem (bazil backend): Dir/File nodes backed by CacheManager |
 | | `gofuse_backend.go` | Alternative FUSE backend on `hanwen/go-fuse/v2` (`-fuse-backend gofuse`); supports passthrough + writeback tuning |
 | `internal/fusemetrics/` | `metrics.go` | Atomic counters for the go-fuse write path, surfaced via `/metrics` |
@@ -354,6 +356,8 @@ Environment variables: `POD_IP` / `NODE_NAME` (Kubernetes downward API),
 - `GET /api/peers` — peer list (via coordinator)
 - `GET /api/cache` — cache entries
 - `GET /api/cache/stats` — cache stats
+- `POST /api/cache/warm` — warm a prefix on this node (`async` ⇒ 202 + `job_id`)
+- `GET /api/cache/warm` — list async warm jobs; `GET /api/cache/warm/{id}` — one job's live progress
 - `POST /api/fs/snapshot` — build a cache-warming manifest of known files
 - `POST /api/fs/restore` — rehydrate peer NVMe caches from cloud using a manifest
 - `GET /metrics` — Prometheus metrics (incl. go-fuse write-path counters)
@@ -407,7 +411,13 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
 - `internal/cache/peer_latency.go` — per-(node→peer) EWMA latency/success
   from real transfers; traversal reorders on it once a pair has ≥3 samples
   (beats the coordinator's single-target netprobe). Exposed at
-  `/api/peers/latency` + `fuse_peer_pair_*` metrics.
+  `/api/peers/latency` + `fuse_peer_pair_*` metrics. **Only real transfers
+  feed it**: busy (503/`RESOURCE_EXHAUSTED`) and miss (404/`NOT_FOUND`) are
+  both excluded. Recording misses drove `success_ratio` to ~0 on every pair
+  live — traversal probes holders in order, so most attempts miss by
+  construction, and `pairScore` (`success/latencyMs`) collapsed for everyone.
+  Misses are counted separately as `fuse_peer_fetch_miss_skips_total`, which
+  is a staleness signal for coordinator location metadata.
 - `internal/coordinator/fetch_lease*.go` — advisory short-TTL leases
   (`/api/fetch-lease`; etcd key `/fuse/inflight/<key>` with lease-backed
   expiry; in-memory map fallback). `internal/cache/origin_lease.go` gates
@@ -441,10 +451,31 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   {prefix,mode,source,bandwidth,async} (`internal/api/warm.go`);
   coordinator `POST /api/warm` fans out to peers selected by
   `nodes`/`labels`/`percentage` (`internal/coordinator/warm.go`,
-  intersection semantics, ID-sorted ceil for percentage; forwards
-  `api_key` as X-API-Key). Peer labels: `PeerInfo.Labels`, set via client
-  `-peer-labels` / `FUSE_PEER_LABELS`, carried in the register proto
-  (`make proto` now includes agent.proto).
+  intersection semantics; percentage takes an ID-sorted ceil starting at an
+  FNV-1a-of-prefix offset so different prefixes rotate across the cluster;
+  peers silent for >75s are dropped ahead of the 90s etcd lease; forwards
+  `api_key` as X-API-Key and returns each peer's `job_id`). Peer labels:
+  `PeerInfo.Labels`, set via client `-peer-labels` / `FUSE_PEER_LABELS`,
+  carried in the register proto (`make proto` now includes agent.proto).
+- `internal/nodelabels/` — peer labels derived from the pod's own Kubernetes
+  Node object (`-peer-labels-from-node pool=agentpool,...`), because the
+  downward API can't expose node labels and a hardcoded `pool=` mislabels
+  every node in a multi-nodepool cluster. Raw in-cluster REST GET with the
+  projected SA token (no client-go); advisory — failures fall back to
+  `-peer-labels`. Manifests/chart add a `fuse-client` SA + ClusterRole with
+  `get` on nodes only.
+- Async warm observability: an async warm mints a job ID; the daemon tracks
+  it (`warmJobs` on `api.Handler`, last 32 finished) and
+  `WarmupOptions.OnProgress` feeds counters into it. Poll
+  `GET /api/cache/warm/{id}`; the dashboard's warm page lists and polls them.
+  Progress is **chunk-level**, not just per-file: `chunkProgress{Plan,Landed}`
+  threads through `runChunkCompletionOpts` → `fetchMissingChunks`, so warming
+  one huge file reports movement instead of sitting at 0/1 until it lands.
+  `Plan` counts only chunks the pass must fetch (already-local chunks
+  excluded, so a resumed warm still reaches its denominator).
+  `WarmupProgress.InFlightBytes` covers files still open and is backed out
+  when the file's bytes move into `Bytes`. Per-chunk locking is skipped when
+  `OnProgress` is nil.
 - `internal/nodeinit/` + `cmd/node-init/` — best-local-disk discovery:
   /proc/mounts + sysfs classification (nvme/ssd/disk/unknown), scoring
   (class dominates > log2 free space > micro-benchmark of top-3 finalists;
@@ -459,6 +490,11 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
 
 - Busy (`RESOURCE_EXHAUSTED`/503) is admission control, NOT failure: don't
   reconnect-retry the same node, don't record it in perf trackers.
+- Miss (`NOT_FOUND`/404) is stale routing, NOT failure: same treatment —
+  no reconnect-retry, no transport fallback (both read the same local cache),
+  and never in the latency EWMA. Peer errors have three classes, not two;
+  `isPeerBusy` / `isPeerMiss` / everything-else. Anything new on the peer
+  serve path must return a *typed* miss, or it silently becomes "failure".
 - All coordination is advisory — reads must succeed with the coordinator
   down; correctness never depends on leases/advertisement/reconciler.
 - Jitter everything that could synchronize (`sleepWithJitter`, crypto/rand).

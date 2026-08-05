@@ -86,6 +86,7 @@ type PeerLoadSnapshot struct {
 	ServeAcceptedTotal   int64
 	ServeRejectedTotal   int64
 	FetchBusySkips       int64
+	FetchMissSkips       int64
 	FetchJitterRetries   int64
 	ReplicationBusySkips int64
 	ReplicationStaggers  int64
@@ -115,6 +116,7 @@ func (cm *DefaultCacheManager) PeerLoadSnapshot() PeerLoadSnapshot {
 	}
 	if ps, ok := cm.peerStorage.(*PeerStorage); ok {
 		snap.FetchBusySkips = ps.busySkipsTotal.Load()
+		snap.FetchMissSkips = ps.missSkipsTotal.Load()
 		snap.FetchJitterRetries = ps.jitterRetriesTotal.Load()
 		snap.ReplicationBusySkips = ps.replBusySkipsTotal.Load()
 		snap.ReplicationStaggers = ps.replStaggersTotal.Load()

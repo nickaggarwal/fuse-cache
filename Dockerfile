@@ -9,6 +9,11 @@ ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
 COPY go.mod go.sum ./
+# go.mod replaces hanwen/go-fuse with the local fork, so `go mod download`
+# needs that tree present — copying it after the download step fails the
+# build outright. Only the fork's module files are copied here so the
+# download layer still caches independently of its sources.
+COPY third_party/go-fuse-local/go.mod third_party/go-fuse-local/go.sum ./third_party/go-fuse-local/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod download

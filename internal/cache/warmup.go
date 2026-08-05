@@ -39,6 +39,34 @@ type WarmupOptions struct {
 	// x 4 chunk fetches); "max" saturates the NIC (4 files x 16 chunk
 	// fetches) for deliberate pre-deploy warms where warmup IS the workload.
 	Bandwidth string
+	// OnProgress, when set, is called after each file finishes AND after each
+	// chunk of a chunked file lands, with a snapshot of the counters so far.
+	// A 100 GB warm is otherwise opaque until it ends, and a warm of one very
+	// large file shows no movement at all without chunk granularity.
+	// Called from a worker goroutine: keep it cheap and non-blocking.
+	OnProgress func(WarmupProgress)
+}
+
+// WarmupProgress is a mid-flight snapshot of a warmup pass.
+type WarmupProgress struct {
+	Files        int   `json:"files"` // distinct files found under the prefix
+	Done         int   `json:"done"`  // files whose outcome is decided
+	Warmed       int   `json:"warmed"`
+	AlreadyLocal int   `json:"already_local"`
+	Skipped      int   `json:"skipped"`
+	Failed       int   `json:"failed"`
+	Bytes        int64 `json:"bytes"`
+	// Chunks/ChunksDone track sub-file movement for chunked targets, so a
+	// single multi-GB file reports progress instead of sitting at 0/1 until
+	// it lands. Chunks counts only the chunks this pass has to fetch (chunks
+	// already on NVMe are not counted), and both are 0 for a prefix whose
+	// files are all unchunked.
+	Chunks     int64 `json:"chunks"`
+	ChunksDone int64 `json:"chunks_done"`
+	// InFlightBytes is bytes landed for files still in progress. Bytes only
+	// moves when a whole file completes; adding this makes the byte counter
+	// advance continuously during a large file.
+	InFlightBytes int64 `json:"in_flight_bytes"`
 }
 
 // PrefixWarmer is implemented by cache managers that support declarative
@@ -73,15 +101,16 @@ func warmupPlan(opts WarmupOptions) (order []CacheTier, fileConcurrency, chunkWo
 	return order, fileConcurrency, chunkWorkers, nil
 }
 
-// WarmupResult summarizes one WarmPrefix pass.
+// WarmupResult summarizes one WarmPrefix pass. Field names are snake_case on
+// the wire to match every other API payload in this codebase.
 type WarmupResult struct {
-	Mode         string
-	Files        int   // distinct files found under the prefix
-	Warmed       int   // files newly made local
-	AlreadyLocal int   // files already whole on NVMe
-	Skipped      int   // headroom guard or already being assembled
-	Failed       int   // fetch/assembly errors
-	Bytes        int64 // bytes newly landed
+	Mode         string `json:"mode"`
+	Files        int    `json:"files"`         // distinct files found under the prefix
+	Warmed       int    `json:"warmed"`        // files newly made local
+	AlreadyLocal int    `json:"already_local"` // files already whole on NVMe
+	Skipped      int    `json:"skipped"`       // headroom guard or already being assembled
+	Failed       int    `json:"failed"`        // fetch/assembly errors
+	Bytes        int64  `json:"bytes"`         // bytes newly landed
 }
 
 // warmupTarget is one file to warm, aggregated across its coordinator
@@ -92,6 +121,9 @@ type warmupTarget struct {
 	size      int64
 	isChunked bool
 	numChunks int64
+	// chunkSize is the stride the holder wrote the file with; 0 until a
+	// location supplies it, then the configured size is used as the fallback.
+	chunkSize int64
 }
 
 // WarmPrefix prefetches every file the coordinator knows under prefix into
@@ -147,15 +179,27 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 			if n := int64(len(loc.Chunks)); n > t.numChunks {
 				t.numChunks = n
 			}
+			if loc.ChunkSize > 0 {
+				t.chunkSize = loc.ChunkSize
+			}
 		}
 	}
 	// Holders publish IsChunked without enumerating Chunks, so derive the
 	// count from the size the same way the write path splits it. Without this
 	// a chunked file falls through to the whole-file fetch and fails: the
-	// parent object only exists as chunk_N blobs in the remote tiers.
+	// parent object only exists as chunk_N blobs in the remote tiers. Use the
+	// holder's stride when it published one — deriving the count from our own
+	// -chunk-size warms the wrong number of chunks for files written under a
+	// different setting.
 	for _, t := range byPath {
-		if t.isChunked && t.numChunks == 0 && t.size > 0 && cm.config.ChunkSize > 0 {
-			t.numChunks = (t.size + cm.config.ChunkSize - 1) / cm.config.ChunkSize
+		if !t.isChunked {
+			continue
+		}
+		if t.chunkSize <= 0 {
+			t.chunkSize = cm.config.ChunkSize
+		}
+		if t.numChunks == 0 {
+			t.numChunks = chunkCountFor(t.size, t.chunkSize)
 		}
 	}
 	targets := make([]*warmupTarget, 0, len(byPath))
@@ -166,13 +210,36 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 	res.Files = len(targets)
 
 	if mode == "metadata" || len(targets) == 0 {
+		if opts.OnProgress != nil {
+			opts.OnProgress(WarmupProgress{Files: res.Files, Done: res.Files})
+		}
 		return res, nil
 	}
 
 	var (
 		mu sync.Mutex
 		wg sync.WaitGroup
+		// Chunk-level counters, guarded by the same mutex as res so every
+		// emitted snapshot is internally consistent.
+		chunksPlanned int64
+		chunksDone    int64
+		inFlightBytes int64
 	)
+	// snapshotLocked builds a progress snapshot; callers must hold mu.
+	snapshotLocked := func() WarmupProgress {
+		return WarmupProgress{
+			Files: res.Files, Done: res.Warmed + res.AlreadyLocal + res.Skipped + res.Failed,
+			Warmed: res.Warmed, AlreadyLocal: res.AlreadyLocal,
+			Skipped: res.Skipped, Failed: res.Failed, Bytes: res.Bytes,
+			Chunks: chunksPlanned, ChunksDone: chunksDone, InFlightBytes: inFlightBytes,
+		}
+	}
+	emit := func(snap WarmupProgress) {
+		if opts.OnProgress != nil {
+			opts.OnProgress(snap)
+		}
+	}
+
 	sem := make(chan struct{}, fileConcurrency)
 	for _, t := range targets {
 		if ctx.Err() != nil {
@@ -184,8 +251,38 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			outcome := cm.warmOneFile(ctx, t, order, chunkWorkers)
+
+			// fileBytes is this file's contribution to inFlightBytes; it is
+			// backed out when the file finishes, since a warmed file's bytes
+			// move into res.Bytes and an abandoned file's never arrive.
+			var fileBytes int64
+			prog := &chunkProgress{
+				Plan: func(toFetch int64) {
+					mu.Lock()
+					chunksPlanned += toFetch
+					snap := snapshotLocked()
+					mu.Unlock()
+					emit(snap)
+				},
+				Landed: func(n int64) {
+					mu.Lock()
+					chunksDone++
+					fileBytes += n
+					inFlightBytes += n
+					snap := snapshotLocked()
+					mu.Unlock()
+					emit(snap)
+				},
+			}
+			if opts.OnProgress == nil {
+				// No consumer: skip the per-chunk lock/emit entirely rather
+				// than paying for counters nobody reads.
+				prog = nil
+			}
+
+			outcome := cm.warmOneFile(ctx, t, order, chunkWorkers, prog)
 			mu.Lock()
+			inFlightBytes -= fileBytes
 			switch outcome {
 			case warmOutcomeWarmed:
 				res.Warmed++
@@ -197,7 +294,9 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 			case warmOutcomeFailed:
 				res.Failed++
 			}
+			snap := snapshotLocked()
 			mu.Unlock()
+			emit(snap)
 		}()
 	}
 	wg.Wait()
@@ -213,7 +312,7 @@ const (
 	warmOutcomeFailed
 )
 
-func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget, order []CacheTier, chunkWorkers int) warmOutcome {
+func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget, order []CacheTier, chunkWorkers int, prog *chunkProgress) warmOutcome {
 	if _, whole := cm.LocalFilePath(ctx, t.path); whole {
 		return warmOutcomeAlreadyLocal
 	}
@@ -230,7 +329,7 @@ func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget,
 			return warmOutcomeSkipped
 		}
 		defer cm.endCompletion(t.path)
-		if err := cm.runChunkCompletionOpts(ctx, t.path, t.numChunks, t.size, order, chunkWorkers); err != nil {
+		if err := cm.runChunkCompletionOpts(ctx, t.path, t.numChunks, t.size, order, chunkWorkers, prog); err != nil {
 			cm.logger.Printf("Warmup of %s failed: %v", t.path, err)
 			return warmOutcomeFailed
 		}
@@ -238,7 +337,7 @@ func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget,
 	}
 
 	// Whole (unchunked) file: fetch from the remote tiers and land on NVMe.
-	if err := cm.fetchAndLandChunkOrdered(ctx, t.path, order); err != nil {
+	if _, err := cm.fetchAndLandChunkOrdered(ctx, t.path, order); err != nil {
 		cm.logger.Printf("Warmup of %s failed: %v", t.path, err)
 		return warmOutcomeFailed
 	}

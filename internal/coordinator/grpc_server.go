@@ -132,6 +132,7 @@ func fileLocationToProto(fl *FileLocation) *pb.FileLocation {
 		LastAccessed: timestamppb.New(fl.LastAccessed),
 		IsChunked:    fl.IsChunked,
 		Chunks:       chunks,
+		ChunkSize:    fl.ChunkSize,
 	}
 }
 
@@ -157,6 +158,7 @@ func fileLocationFromProto(fl *pb.FileLocation) *FileLocation {
 		LastAccessed: lastAccessed,
 		IsChunked:    fl.IsChunked,
 		Chunks:       chunks,
+		ChunkSize:    fl.ChunkSize,
 	}
 }
 

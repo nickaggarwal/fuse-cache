@@ -108,7 +108,11 @@ func (s *PeerGRPCServer) ReadFile(req *pb.ReadFileRequest, stream pb.PeerService
 
 	entry, err := s.getForPeerRPC(stream.Context(), req.Path)
 	if err != nil {
-		return fmt.Errorf("file not found: %v", err)
+		// NOT_FOUND, not a bare error: the requester distinguishes "this
+		// holder doesn't have it" from "the transfer failed". A miss is
+		// routing information, not a network fault, so it must not poison
+		// the requester's pairwise success EWMA.
+		return status.Errorf(codes.NotFound, "file not found: %v", err)
 	}
 
 	buf := entry.Data

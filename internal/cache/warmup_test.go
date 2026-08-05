@@ -7,6 +7,7 @@ package cache
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"fuse-client/internal/coordinator"
@@ -219,5 +220,128 @@ func TestWarmPrefixOpts_CloudOnlyNeverTouchesPeers(t *testing.T) {
 	cm.bgWg.Wait()
 	if res.Warmed != 1 || res.Failed != 0 {
 		t.Fatalf("peer-first result = %+v, want 1 warmed", res)
+	}
+}
+
+// TestWarmPrefixOpts_ChunkLevelProgress covers the case per-file progress
+// cannot report: a prefix holding one very large chunked file. With only
+// file-boundary callbacks the job sits at Done=0 for the entire transfer and
+// then jumps to 1, so an operator cannot tell a slow warm from a hung one.
+func TestWarmPrefixOpts_ChunkLevelProgress(t *testing.T) {
+	cm := evictTestManager(t, 1<<30)
+	cm.config.ChunkSize = 1000
+	ctx := context.Background()
+
+	const numChunks = 8
+	for i := int64(0); i < numChunks; i++ {
+		cm.cloudStorage.Write(ctx, chunkPathFor("/models/huge.bin", i), make([]byte, 1000))
+	}
+	coord := &warmupCoordinator{locations: []*coordinator.FileLocation{
+		{FilePath: "/models/huge.bin", PeerID: "p1", StorageTier: "cloud",
+			FileSize: numChunks * 1000, IsChunked: true, ChunkSize: 1000},
+	}}
+	cm.config.Coordinator = coord
+
+	var (
+		mu    sync.Mutex
+		snaps []WarmupProgress
+	)
+	res, err := cm.WarmPrefixOpts(ctx, "/models", WarmupOptions{
+		Mode: "full",
+		OnProgress: func(p WarmupProgress) {
+			mu.Lock()
+			snaps = append(snaps, p)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("WarmPrefixOpts: %v", err)
+	}
+	cm.bgWg.Wait()
+	if res.Warmed != 1 {
+		t.Fatalf("result = %+v, want 1 warmed", res)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Plan + one per chunk + the file-completion callback.
+	if len(snaps) < numChunks+1 {
+		t.Fatalf("got %d progress callbacks, want > %d (one per chunk)", len(snaps), numChunks)
+	}
+
+	// The whole point: movement while the single file is still incomplete.
+	var midFlight int
+	for _, s := range snaps {
+		if s.Done == 0 && s.ChunksDone > 0 {
+			midFlight++
+		}
+	}
+	if midFlight == 0 {
+		t.Fatal("no progress reported before the file completed — chunk granularity not working")
+	}
+
+	// Counters must be monotonic and land exactly on the planned total.
+	var prev int64
+	for i, s := range snaps {
+		if s.ChunksDone < prev {
+			t.Fatalf("snapshot %d went backwards: %d after %d", i, s.ChunksDone, prev)
+		}
+		prev = s.ChunksDone
+	}
+	final := snaps[len(snaps)-1]
+	if final.Chunks != numChunks || final.ChunksDone != numChunks {
+		t.Fatalf("final chunks = %d/%d, want %d/%d",
+			final.ChunksDone, final.Chunks, numChunks, numChunks)
+	}
+	// In-flight bytes are backed out once the file's bytes move into Bytes,
+	// so the two must never double-count at the end.
+	if final.InFlightBytes != 0 {
+		t.Fatalf("final in_flight_bytes = %d, want 0", final.InFlightBytes)
+	}
+	if final.Bytes != numChunks*1000 {
+		t.Fatalf("final bytes = %d, want %d", final.Bytes, numChunks*1000)
+	}
+}
+
+// TestWarmPrefixOpts_AlreadyLocalChunksNotCounted keeps the denominator
+// honest on a resumed warm: chunks already on NVMe are not fetched, so
+// counting them would leave ChunksDone permanently short of Chunks.
+func TestWarmPrefixOpts_AlreadyLocalChunksNotCounted(t *testing.T) {
+	cm := evictTestManager(t, 1<<30)
+	cm.config.ChunkSize = 1000
+	ctx := context.Background()
+
+	const numChunks = 4
+	for i := int64(0); i < numChunks; i++ {
+		cm.cloudStorage.Write(ctx, chunkPathFor("/models/part.bin", i), make([]byte, 1000))
+	}
+	// Half the file already landed in an earlier, interrupted pass.
+	for i := int64(0); i < 2; i++ {
+		cm.nvmeStorage.Write(ctx, chunkPathFor("/models/part.bin", i), make([]byte, 1000))
+	}
+	cm.config.Coordinator = &warmupCoordinator{locations: []*coordinator.FileLocation{
+		{FilePath: "/models/part.bin", PeerID: "p1", StorageTier: "cloud",
+			FileSize: numChunks * 1000, IsChunked: true, ChunkSize: 1000},
+	}}
+
+	var last WarmupProgress
+	var mu sync.Mutex
+	if _, err := cm.WarmPrefixOpts(ctx, "/models", WarmupOptions{
+		Mode: "full",
+		OnProgress: func(p WarmupProgress) {
+			mu.Lock()
+			last = p
+			mu.Unlock()
+		},
+	}); err != nil {
+		t.Fatalf("WarmPrefixOpts: %v", err)
+	}
+	cm.bgWg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if last.Chunks != 2 || last.ChunksDone != 2 {
+		t.Fatalf("chunks = %d/%d, want 2/2 (only the missing half is fetched)",
+			last.ChunksDone, last.Chunks)
 	}
 }

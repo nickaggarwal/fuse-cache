@@ -231,6 +231,46 @@ def peer_capacity(peer: Peer) -> int:
     return peer.available_space + peer.used_space
 
 
+def render_warm_counters(counters: Dict[str, Any]) -> None:
+    """Six-metric grid shared by WarmupResult and WarmupProgress (both
+    snake_case since internal/cache/warmup.go grew json tags)."""
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Files found", as_int(counters.get("files")))
+    r2.metric("Warmed", as_int(counters.get("warmed")))
+    r3.metric("Bytes landed", human_bytes(counters.get("bytes")))
+    r4, r5, r6 = st.columns(3)
+    r4.metric("Already local", as_int(counters.get("already_local")))
+    r5.metric("Skipped", as_int(counters.get("skipped")))
+    r6.metric("Failed", as_int(counters.get("failed")))
+
+
+def warm_job_row(job: Dict[str, Any]) -> Dict[str, Any]:
+    """One row of the async warm-job table."""
+    prog = job.get("progress") or {}
+    files = as_int(prog.get("files"))
+    done = as_int(prog.get("done"))
+    chunks = as_int(prog.get("chunks"))
+    chunks_done = as_int(prog.get("chunks_done"))
+    started = parse_go_time(job.get("started_at") or "")
+    updated = parse_go_time(job.get("updated_at") or "")
+    elapsed = (updated - started).total_seconds() if started and updated else 0.0
+    return {
+        "job": job.get("id", ""),
+        "prefix": job.get("prefix", ""),
+        "mode": job.get("mode", ""),
+        "status": job.get("status", ""),
+        "progress": f"{done}/{files}" if files else str(done),
+        # Chunk counters move during a single large file, where files stays 0/1.
+        "chunks": f"{chunks_done}/{chunks}" if chunks else "-",
+        "warmed": as_int(prog.get("warmed")),
+        "failed": as_int(prog.get("failed")),
+        # Landed bytes = completed files plus partial progress on open ones.
+        "bytes": human_bytes(as_int(prog.get("bytes")) + as_int(prog.get("in_flight_bytes"))),
+        "elapsed": f"{elapsed:.0f}s",
+        "error": (job.get("error") or "")[:60],
+    }
+
+
 # --------------------------------------------------------------------------
 # chart primitives (HTML/CSS marks; thin, gapped, direct-labeled)
 # --------------------------------------------------------------------------
@@ -768,7 +808,11 @@ elif page == "Warm targeting":
         if bad_labels:
             st.warning("Ignoring malformed label(s): " + ", ".join(f"`{b}`" for b in bad_labels))
 
-        targets = select_warm_targets(peers, sel_nodes, labels, percentage)
+        # The prefix is the coordinator's rotation key, so the dry run only
+        # matches the real fan-out when it is passed through.
+        targets = select_warm_targets(
+            peers, sel_nodes, labels, percentage, rotation_key=prefix.strip()
+        )
 
         st.markdown("**Dry run** — peers this selector resolves to right now")
         if not peers:
@@ -797,9 +841,11 @@ elif page == "Warm targeting":
             st.error("Selector matches no active peers — the coordinator would return 400.")
 
         st.caption(
-            "Selection mirrors CoordinatorService.SelectWarmTargets: active only, "
-            "ID filter, all labels must match, ID-sorted, then ceil(n x pct/100) "
-            "off the head (min 1)."
+            "Selection mirrors CoordinatorService.SelectWarmTargets: active and "
+            "recently-heartbeating only, ID filter, all labels must match, "
+            "ID-sorted, then ceil(n x pct/100) (min 1) starting at a "
+            "prefix-derived offset — so different prefixes rotate across the "
+            "cluster instead of always hitting the lowest IDs."
         )
 
         fire = st.button(
@@ -830,6 +876,19 @@ elif page == "Warm targeting":
                 m3.metric("Failed", len(failed))
                 if accepted:
                     st.success("Accepted: " + ", ".join(f"`{a}`" for a in accepted))
+                jobs = body.get("jobs") or {}
+                if jobs:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"peer": k, "job": v} for k, v in sorted(jobs.items())]
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Poll a job on the single-node panel, or directly: "
+                        "GET http://<peer>/api/cache/warm/<job>."
+                    )
                 if failed:
                     st.error("Failed peers")
                     st.dataframe(
@@ -840,8 +899,9 @@ elif page == "Warm targeting":
                         hide_index=True,
                     )
                 st.caption(
-                    "Peer-side warms run async — watch fuse_cache_* and "
-                    "fuse_nvme_used_bytes on the Per-node cache page."
+                    "Peer-side warms run async — poll the job IDs above, or "
+                    "watch fuse_cache_* and fuse_nvme_used_bytes on the "
+                    "Per-node cache page."
                 )
 
     with single_col:
@@ -897,18 +957,63 @@ elif page == "Warm targeting":
                             f"mode={body.get('mode')} source={body.get('source') or 'peer-first'} "
                             f"bandwidth={body.get('bandwidth') or 'background'}"
                         )
+                        if body.get("job_id"):
+                            st.session_state["warm_job_id"] = body["job_id"]
+                            st.caption(
+                                f"Job `{body['job_id']}` — poll it below."
+                            )
                     else:
-                        # cache.WarmupResult has no json tags -> Go field names.
-                        r1, r2, r3 = st.columns(3)
-                        r1.metric("Files found", as_int(body.get("Files")))
-                        r2.metric("Warmed", as_int(body.get("Warmed")))
-                        r3.metric("Bytes landed", human_bytes(body.get("Bytes")))
-                        r4, r5, r6 = st.columns(3)
-                        r4.metric("Already local", as_int(body.get("AlreadyLocal")))
-                        r5.metric("Skipped", as_int(body.get("Skipped")))
-                        r6.metric("Failed", as_int(body.get("Failed")))
-                        st.caption(f"Mode: {body.get('Mode', '-')}")
+                        render_warm_counters(body)
                     st.json(body)
+
+            st.divider()
+            st.markdown("**Async warm jobs on this node**")
+            st.caption(
+                "GET /api/cache/warm on the daemon. Progress updates once per "
+                "file completed, so a single huge file moves only at the end."
+            )
+            if st.button("Refresh jobs", key="warm_jobs_refresh"):
+                pass  # Streamlit reruns the script; the fetch below is live.
+            jobs_res = fc.warm_jobs(node_addr(node))
+            if not jobs_res.ok:
+                st.error(f"Could not list warm jobs — {jobs_res.error}")
+            else:
+                jobs = (jobs_res.data or {}).get("jobs") or []
+                if not jobs:
+                    st.info("No warm jobs on this node yet.")
+                else:
+                    st.dataframe(
+                        pd.DataFrame([warm_job_row(j) for j in jobs]),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    ids = [j.get("id", "") for j in jobs]
+                    default = st.session_state.get("warm_job_id")
+                    idx = ids.index(default) if default in ids else 0
+                    chosen = st.selectbox(
+                        "Job detail", ids, index=idx, key="warm_job_pick"
+                    )
+                    job = next((j for j in jobs if j.get("id") == chosen), None)
+                    if job:
+                        prog = job.get("progress") or {}
+                        files = as_int(prog.get("files"))
+                        done = as_int(prog.get("done"))
+                        if files:
+                            st.progress(min(done / files, 1.0), text=f"{done}/{files} files")
+                        # A warm of one huge file sits at 0/1 files for its
+                        # whole duration; the chunk bar is the only thing that
+                        # moves, so show it whenever chunks are being fetched.
+                        chunks = as_int(prog.get("chunks"))
+                        if chunks:
+                            chunks_done = as_int(prog.get("chunks_done"))
+                            st.progress(
+                                min(chunks_done / chunks, 1.0),
+                                text=f"{chunks_done}/{chunks} chunks",
+                            )
+                        render_warm_counters(prog)
+                        if job.get("error"):
+                            st.error(job["error"])
+                        st.json(job)
 
 # --------------------------------------------------------------------------
 # 4. Replicas & heat

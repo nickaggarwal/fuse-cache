@@ -12,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fuse_api import Peer, select_warm_targets  # noqa: E402
+from fuse_api import Peer, select_warm_targets, warm_rotation_offset  # noqa: E402
 from metrics import MetricSet, parse  # noqa: E402
 
 
@@ -165,6 +165,41 @@ class TestSelectWarmTargets(unittest.TestCase):
         first = self.ids(percentage=50)
         for _ in range(5):
             self.assertEqual(self.ids(percentage=50), first)
+
+    def test_rotation_key_spreads_selection_and_stays_stable(self):
+        keys = [f"/models/{c}" for c in "abcdef"]
+        seen = set()
+        for key in keys:
+            picked = tuple(self.ids(percentage=50, rotation_key=key))
+            self.assertEqual(len(picked), 2)
+            self.assertEqual(picked, tuple(self.ids(percentage=50, rotation_key=key)))
+            seen.add(picked)
+        self.assertGreater(len(seen), 1, f"no rotation across prefixes: {seen}")
+
+    def test_stale_heartbeat_peers_are_dropped(self):
+        from datetime import datetime, timedelta, timezone
+
+        def stamp(age_seconds):
+            when = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+            return when.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        fresh = Peer(id="fresh", status="active", last_heartbeat=stamp(5))
+        stale = Peer(id="stale", status="active", last_heartbeat=stamp(600))
+        unknown = Peer(id="unknown", status="active", last_heartbeat="")
+        got = [p.id for p in select_warm_targets([fresh, stale, unknown])]
+        self.assertEqual(got, ["fresh", "unknown"])
+
+
+class TestWarmRotationOffset(unittest.TestCase):
+    """warm_rotation_offset must match Go's warmRotationOffset (FNV-1a)."""
+
+    def test_matches_fnv1a_32(self):
+        # hash/fnv FNV-1a 32-bit of "abc" is 0x1a47e90b.
+        self.assertEqual(warm_rotation_offset("abc", 2**32), 0x1A47E90B)
+
+    def test_empty_key_and_empty_ring_return_zero(self):
+        self.assertEqual(warm_rotation_offset("", 5), 0)
+        self.assertEqual(warm_rotation_offset("x", 0), 0)
 
 
 class TestPeerParsing(unittest.TestCase):

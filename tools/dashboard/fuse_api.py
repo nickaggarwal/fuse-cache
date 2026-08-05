@@ -22,7 +22,9 @@ Client (internal/api/handler.go SetupRoutes, default :8081)
                                       nvme_capacity + CacheMetrics.Snapshot()
   GET  /api/cache                  -> []cache.CacheEntry (Go field names, no json tags)
   GET  /api/peers/latency          -> {peer_id, pairs: []PeerPairLatency}
-  POST /api/cache/warm             -> cache.WarmupResult (Go field names) | 202 {started:true,...}
+  POST /api/cache/warm             -> cache.WarmupResult | 202 {started,job_id,status_url}
+  GET  /api/cache/warm             -> {peer_id, jobs: []warmJob} (newest first)
+  GET  /api/cache/warm/{id}        -> warmJob (status + live progress counters)
 
 The coordinator has NO auth middleware; the client's authMiddleware exempts
 /api/health, /metrics and /api/netprobe and requires X-API-Key elsewhere when
@@ -34,7 +36,13 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+# Mirrors warmPeerStaleAfter in internal/coordinator/warm.go: peers past this
+# many seconds without a heartbeat are dropped from warm selection, well
+# before the 90s etcd lease flips their status to inactive.
+WARM_PEER_STALE_AFTER_SECONDS = 75.0
 
 try:
     import requests
@@ -100,6 +108,31 @@ class Peer:
     @property
     def label_str(self) -> str:
         return ", ".join(f"{k}={v}" for k, v in sorted(self.labels.items()))
+
+    def heartbeat_age_seconds(self) -> float:
+        """Seconds since last_heartbeat; 0.0 when it is missing or unparseable.
+
+        0.0 rather than infinity on purpose: an unreadable timestamp must not
+        make a live peer look dead in the dry run.
+        """
+        raw = (self.last_heartbeat or "").strip()
+        if not raw:
+            return 0.0
+        # Go emits RFC3339 with a "Z"; fromisoformat wants an explicit offset,
+        # and only handles up to 6 fractional digits.
+        text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        if "." in text:
+            head, _, tail = text.partition(".")
+            digits = "".join(c for c in tail if c.isdigit())[:6]
+            rest = tail[len(digits):].lstrip("0123456789")
+            text = f"{head}.{digits}{rest}" if digits else head + rest
+        try:
+            stamp = datetime.fromisoformat(text)
+        except ValueError:
+            return 0.0
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
 
 
 def _err_text(resp: Any) -> str:
@@ -303,9 +336,9 @@ class FuseClient:
     ) -> ApiResult:
         """POST /api/cache/warm on one client daemon.
 
-        async=True -> 202 {"started":true,...}; sync -> cache.WarmupResult,
-        which has NO json tags: {"Mode","Files","Warmed","AlreadyLocal",
-        "Skipped","Failed","Bytes"}.
+        async=True -> 202 {"started":true,"job_id":...,"status_url":...};
+        poll it with warm_job(). sync -> cache.WarmupResult, snake_case:
+        {"mode","files","warmed","already_local","skipped","failed","bytes"}.
         """
         body: Dict[str, Any] = {"prefix": prefix, "mode": mode, "async": bool(async_)}
         if source:
@@ -322,6 +355,21 @@ class FuseClient:
             timeout=(3.0, read_timeout),
         )
 
+    def warm_job(self, address: str, job_id: str) -> ApiResult:
+        """GET /api/cache/warm/{id} — one async warm's live progress.
+
+        -> {"id","prefix","mode","status":running|done|failed,"started_at",
+            "updated_at","ended_at","progress":{files,done,warmed,
+            already_local,skipped,failed,bytes},"result","error"}.
+        """
+        return self._request(
+            "GET", f"{self.peer_base_url(address)}/api/cache/warm/{job_id}"
+        )
+
+    def warm_jobs(self, address: str) -> ApiResult:
+        """GET /api/cache/warm -> {"peer_id","jobs":[...]}, newest first."""
+        return self._request("GET", f"{self.peer_base_url(address)}/api/cache/warm")
+
 
 def _short(exc: Exception) -> str:
     text = str(exc)
@@ -331,20 +379,37 @@ def _short(exc: Exception) -> str:
 # ---- selector preview (mirrors CoordinatorService.SelectWarmTargets) ------
 
 
+def warm_rotation_offset(key: str, n: int) -> int:
+    """Mirror of warmRotationOffset (FNV-1a 32-bit mod n)."""
+    if n <= 0 or not key:
+        return 0
+    h = 2166136261
+    for byte in key.encode("utf-8"):
+        h ^= byte
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h % n
+
+
 def select_warm_targets(
     peers: List[Peer],
     nodes: Optional[List[str]] = None,
     labels: Optional[Dict[str, str]] = None,
     percentage: int = 0,
+    rotation_key: str = "",
 ) -> List[Peer]:
     """Client-side dry run of internal/coordinator/warm.go SelectWarmTargets.
 
     Same semantics, in order:
       1. active peers only (Status == "active")
-      2. ID filter, if any node IDs were given
-      3. every requested label must match exactly (labelsMatch)
-      4. sort by ID
-      5. if 0 < pct < 100: take ceil(n*pct/100), min 1, off the sorted head
+      2. drop peers whose last heartbeat is older than WARM_PEER_STALE_AFTER
+      3. ID filter, if any node IDs were given
+      4. every requested label must match exactly (labelsMatch)
+      5. sort by ID
+      6. if 0 < pct < 100: take ceil(n*pct/100), min 1, starting at the
+         rotation_key-derived offset in the sorted ring (empty key = head)
+
+    rotation_key is the warm prefix on the Go side, so pass the prefix to
+    preview the nodes an actual fan-out would pick.
     """
     want_ids = set(nodes or [])
     want_labels = {k: v for k, v in (labels or {}).items()}
@@ -352,6 +417,8 @@ def select_warm_targets(
     out: List[Peer] = []
     for p in peers:
         if p is None or p.status != "active":
+            continue
+        if p.heartbeat_age_seconds() > WARM_PEER_STALE_AFTER_SECONDS:
             continue
         if want_ids and p.id not in want_ids:
             continue
@@ -363,6 +430,9 @@ def select_warm_targets(
 
     pct = int(percentage or 0)
     if 0 < pct < 100 and out:
-        n = math.ceil(len(out) * pct / 100.0)
-        out = out[: max(1, n)]
+        n = max(1, math.ceil(len(out) * pct / 100.0))
+        start = warm_rotation_offset(rotation_key, len(out))
+        picked = [out[(start + i) % len(out)] for i in range(n)]
+        picked.sort(key=lambda p: p.id)
+        out = picked
     return out

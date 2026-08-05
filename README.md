@@ -61,10 +61,19 @@ AKS and EKS.
    ```
 
    Nodes get labels from the client's `-peer-labels pool=gpu,zone=a` flag
-   (or `FUSE_PEER_LABELS`). Strategy knobs: `source` = `peer-first`
-   (default) | `cloud-first` | `cloud-only` (spare the peers when warming
-   many nodes at once); `bandwidth` = `background` (default, polite) |
-   `max` (saturate the NIC: 4 files x 16 chunk streams per node).
+   (or `FUSE_PEER_LABELS`), or — better on a multi-nodepool cluster —
+   from their own Kubernetes Node object via
+   `-peer-labels-from-node pool=agentpool,zone=topology.kubernetes.io/zone`
+   (needs RBAC `get` on nodes; the chart creates it). Strategy knobs:
+   `source` = `peer-first` (default) | `cloud-first` | `cloud-only` (spare
+   the peers when warming many nodes at once); `bandwidth` = `background`
+   (default, polite) | `max` (saturate the NIC: 4 files x 16 chunk streams
+   per node).
+
+   An async warm returns a `job_id`; poll
+   `GET http://<node>:8081/api/cache/warm/<job_id>` for live counters, or
+   `GET /api/cache/warm` for the node's recent jobs. The coordinator's
+   fan-out response maps each peer to its job ID.
 
 5. **node-init**: per-node disk bootstrap — discovers the best local disk,
    formats/mounts raw NVMe when needed, publishes the cache dir + byte

@@ -111,6 +111,14 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 // via chunkAds). Split from promotion so a chunk landed by a streaming (tee)
 // promotion still grows the swarm without a second payload write.
 func (cm *DefaultCacheManager) advertiseChunkParent(ctx context.Context, filePath string) {
+	cm.advertiseHolder(ctx, filePath, true)
+}
+
+// advertiseHolder publishes this node as a holder of filePath, coalesced per
+// path via chunkAds. forceChunked marks the record chunked even when this node
+// only holds part of it — the caller landed a chunk, so the parent is chunked
+// by construction whether or not we have local metadata saying so.
+func (cm *DefaultCacheManager) advertiseHolder(ctx context.Context, filePath string, forceChunked bool) {
 	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
 		return
 	}
@@ -125,8 +133,10 @@ func (cm *DefaultCacheManager) advertiseChunkParent(ctx context.Context, filePat
 	parentEntry := cm.entries[filePath]
 	cm.mu.RUnlock()
 	size := int64(0)
+	isChunked := forceChunked
 	if parentEntry != nil {
 		size = parentEntry.Size
+		isChunked = isChunked || parentEntry.IsChunked
 	}
 	location := &coordinator.FileLocation{
 		FilePath:     filePath,
@@ -135,7 +145,12 @@ func (cm *DefaultCacheManager) advertiseChunkParent(ctx context.Context, filePat
 		StoragePath:  filePath,
 		FileSize:     size,
 		LastAccessed: time.Now(),
-		IsChunked:    true,
+		IsChunked:    isChunked,
+	}
+	if isChunked {
+		// Advertise the stride too: a swarm member that joins mid-transfer
+		// must address chunks the same way the rest of the swarm does.
+		location.ChunkSize = cm.effectiveChunkSize(parentEntry)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -144,6 +159,25 @@ func (cm *DefaultCacheManager) advertiseChunkParent(ctx context.Context, filePat
 		return
 	}
 	cm.herdStats.advertisePublished.Add(1)
+}
+
+// advertisePromoted grows the swarm for bytes landed outside ReadRange. The
+// range-read hook (maybeAdvertiseFetchedChunk) only fires on FUSE range reads;
+// whole-file HTTP GETs, warmup, and chunk completion all land remote bytes on
+// NVMe through other paths and used to stay invisible as holders — which is
+// exactly backwards, since bulk distribution is what Phase 3 is for. Runs in
+// the background: the caller's read has already succeeded.
+func (cm *DefaultCacheManager) advertisePromoted(filePath string) {
+	if !cm.config.FastChunkAdvertise || cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
+		return
+	}
+	target, chunked := parentFilePathFromChunkPath(filePath)
+	if !chunked {
+		target = filePath
+	}
+	cm.goBackground(func() {
+		cm.advertiseHolder(cm.shutdownCtx, target, chunked)
+	})
 }
 
 // maybeAdvertiseFetchedChunk schedules background promote+advertise for a

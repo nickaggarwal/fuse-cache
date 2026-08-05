@@ -83,6 +83,10 @@ type PeerStorage struct {
 
 	// Thundering-herd control counters (exposed via PeerLoadSnapshot).
 	busySkipsTotal     atomic.Int64
+	// missSkipsTotal counts holder attempts that returned "not held". High
+	// values relative to reads mean the coordinator's location metadata is
+	// stale; they are deliberately kept out of the pairwise latency EWMA.
+	missSkipsTotal atomic.Int64
 	jitterRetriesTotal atomic.Int64
 	replBusySkipsTotal atomic.Int64
 	replStaggersTotal  atomic.Int64
@@ -110,6 +114,39 @@ func isPeerBusy(err error) bool {
 		return true
 	}
 	return status.Code(err) == codes.ResourceExhausted
+}
+
+// peerMissError marks "this holder does not have the object" (gRPC NOT_FOUND
+// or raw HTTP 404) as distinct from a transfer failure. A miss is routing
+// information — the coordinator's holder list was stale, or the object was
+// evicted — not evidence that the network path to that peer is bad.
+type peerMissError struct {
+	addr string
+	path string
+}
+
+func (e *peerMissError) Error() string {
+	return fmt.Sprintf("peer %s: %s not held", e.addr, e.path)
+}
+
+// isPeerMiss reports whether err means the peer simply doesn't hold the object.
+//
+// This distinction is load-bearing for peer_latency.go. Traversal asks every
+// candidate holder in turn and stops at the first hit, so on a cluster with R
+// replicas and N peers, most attempts are misses by construction. Folding
+// those into the pairwise success EWMA drives success toward 0 for *every*
+// peer, which collapses pairScore (success/latencyMs) to ~0 across the board
+// and makes the latency ordering a no-op — observed live on stargz-test as
+// success_ratio ≈ 0 with 47-140 samples per pair.
+func isPeerMiss(err error) bool {
+	if err == nil {
+		return false
+	}
+	var miss *peerMissError
+	if errors.As(err, &miss) {
+		return true
+	}
+	return status.Code(err) == codes.NotFound
 }
 
 // isPeerUnreachable reports whether err is a connection-establishment
@@ -938,13 +975,30 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 
 // readPeerData reads a path from one peer, preferring the raw HTTP transport
 // (with sendfile on the serving side) when enabled, and falling back to the
-// gRPC path on any raw error. Every completed attempt (success or failure)
-// feeds the pairwise latency tracker; busy rejections do not, since they are
-// admission control rather than network signal.
+// gRPC path on any raw error.
+//
+// Only attempts that actually exercised the transfer path feed the pairwise
+// latency tracker. Two outcomes are excluded because neither says anything
+// about the network path to that peer:
+//   - busy (503 / RESOURCE_EXHAUSTED) is admission control;
+//   - miss (404 / NOT_FOUND) is a stale holder list.
+//
+// Recording misses is what drove success_ratio to ~0 on every pair in the
+// stargz-test cluster: traversal probes holders in order and most attempts
+// miss by construction, so the EWMA measured replica placement rather than
+// link health, and pairScore ranked every peer equally near zero.
 func (ps *PeerStorage) readPeerData(ctx context.Context, peer *coordinator.PeerInfo, path string) ([]byte, error) {
 	start := time.Now()
 	data, err := ps.readPeerDataInner(ctx, peer, path)
-	if peer != nil && !isPeerBusy(err) && ctx.Err() == nil {
+	if peer == nil || ctx.Err() != nil {
+		return data, err
+	}
+	switch {
+	case isPeerBusy(err):
+		// Admission control, not network signal.
+	case isPeerMiss(err):
+		ps.missSkipsTotal.Add(1)
+	default:
 		ps.pairLatency.record(peer.ID, time.Since(start), err == nil)
 	}
 	return data, err
@@ -966,6 +1020,12 @@ func (ps *PeerStorage) readPeerDataInner(ctx context.Context, peer *coordinator.
 		// registry entry, dead pod). The gRPC port on the same address is just
 		// as dead — falling through would pay the connect timeout twice.
 		if isPeerUnreachable(err) {
+			return nil, err
+		}
+		// A definitive 404 answers the question: both transports consult the
+		// same local cache, so retrying over gRPC would miss identically and
+		// only add a round trip to a path that is already the common case.
+		if isPeerMiss(err) {
 			return nil, err
 		}
 		// Fall through to gRPC on any other raw-transport error.
@@ -1019,6 +1079,9 @@ func (ps *PeerStorage) readFromPeerRaw(ctx context.Context, httpAddr, path strin
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return nil, &peerBusyError{addr: httpAddr}
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, &peerMissError{addr: httpAddr, path: path}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("peer raw read %s: status %d", httpAddr, resp.StatusCode)
@@ -1121,6 +1184,11 @@ func (ps *PeerStorage) readFromPeer(ctx context.Context, grpcAddr, path string) 
 	// shedding load. Do not evict/reconnect-retry — surface busy to the caller
 	// so it fails over to another holder.
 	if isPeerBusy(err) {
+		return nil, err
+	}
+	// A miss is a definitive answer from a healthy connection. Evicting and
+	// redialing would pay a reconnect for every stale holder entry.
+	if isPeerMiss(err) {
 		return nil, err
 	}
 

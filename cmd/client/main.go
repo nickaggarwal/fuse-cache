@@ -24,6 +24,7 @@ import (
 	"fuse-client/internal/coordinator"
 	fusefs "fuse-client/internal/fuse"
 	"fuse-client/internal/nodeinit"
+	"fuse-client/internal/nodelabels"
 	pb "fuse-client/internal/pb"
 	"fuse-client/internal/session"
 
@@ -98,6 +99,7 @@ func main() {
 		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
 		reconcileMaxTarget   = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
 		peerLabelsFlag       = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
+		peerLabelsFromNode   = flag.String("peer-labels-from-node", "", "Comma-separated node label keys to import as peer labels, each optionally renamed peerKey=nodeKey (e.g. pool=agentpool,topology.kubernetes.io/zone); needs NODE_NAME and RBAC get on nodes. FUSE_PEER_LABELS_FROM_NODE env overrides; imported keys win over -peer-labels")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
 
@@ -509,6 +511,15 @@ func main() {
 		logger.Fatalf("Failed to create cache manager: %v", err)
 	}
 
+	// The herd-control features are opt-in and their counters read 0 whether
+	// they are disabled or enabled-but-never-triggered. Log the effective
+	// state so "0" is never ambiguous when reading /metrics.
+	logger.Printf("Herd control: fetch_lease=%s fast_chunk_advertise=%s replica_reconciler=%s peer_serve_max_inflight=%d",
+		enabledState(cacheConfig.FetchLeaseEnabled),
+		enabledState(cacheConfig.FastChunkAdvertise),
+		intervalState(cacheConfig.ReplicaReconcileInterval),
+		cacheConfig.PeerServeMaxInflight)
+
 	// Declarative warmup: a CSI session mounted with cachePolicy warmup=full
 	// prefetches its subtree into local NVMe (warmup=metadata enumerates only).
 	if sessMgr != nil {
@@ -553,7 +564,12 @@ func main() {
 		if v := os.Getenv("FUSE_PEER_LABELS"); v != "" {
 			peerLabelsRaw = v
 		}
-		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, parsePeerLabels(peerLabelsRaw, logger), cacheManager, logger)
+		fromNode := *peerLabelsFromNode
+		if v := os.Getenv("FUSE_PEER_LABELS_FROM_NODE"); v != "" {
+			fromNode = v
+		}
+		labels := resolvePeerLabels(ctx, peerLabelsRaw, fromNode, logger)
+		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
 	}
 
 	// Create API handler
@@ -712,6 +728,42 @@ func parsePeerLabels(raw string, logger *log.Logger) map[string]string {
 	if len(labels) == 0 {
 		return nil
 	}
+	return labels
+}
+
+// resolvePeerLabels merges the static -peer-labels with labels read off this
+// node's Kubernetes Node object. Hardcoding pool/zone in a DaemonSet is wrong
+// the moment a cluster has more than one nodepool — every peer then advertises
+// the same pool and label-based warm targeting silently hits the wrong nodes.
+// The node lookup is advisory: any failure logs and leaves the static labels
+// in place.
+func resolvePeerLabels(ctx context.Context, static, fromNode string, logger *log.Logger) map[string]string {
+	labels := parsePeerLabels(static, logger)
+	keys, rename := nodelabels.ParseSpec(fromNode)
+	if len(keys) == 0 {
+		return labels
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	discovered, err := nodelabels.Fetch(lookupCtx, nodelabels.Config{
+		NodeName: os.Getenv("NODE_NAME"), Keys: keys, Rename: rename,
+	})
+	if err != nil {
+		logger.Printf("WARNING: could not read node labels %q: %v (using -peer-labels only)", fromNode, err)
+		return labels
+	}
+	if len(discovered) == 0 {
+		logger.Printf("Node labels %q matched nothing on node %q", fromNode, os.Getenv("NODE_NAME"))
+		return labels
+	}
+	if labels == nil {
+		labels = make(map[string]string, len(discovered))
+	}
+	// Node-derived values win: they describe reality, the flag is a default.
+	for k, v := range discovered {
+		labels[k] = v
+	}
+	logger.Printf("Peer labels from node %s: %v", os.Getenv("NODE_NAME"), discovered)
 	return labels
 }
 
@@ -1032,6 +1084,20 @@ func (b *bazilFuseBackend) Serve(ctx context.Context) error {
 
 func (b *bazilFuseBackend) Unmount(mountPoint string) error {
 	return b.fs.Unmount(mountPoint)
+}
+
+func enabledState(on bool) string {
+	if on {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func intervalState(d time.Duration) string {
+	if d <= 0 {
+		return "disabled"
+	}
+	return d.String()
 }
 
 func normalizeFuseBackend(value string) string {
