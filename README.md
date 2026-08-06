@@ -193,12 +193,7 @@ curl -s localhost:8081/metrics | grep -E 'fuse_tier|fuse_cache_(peer|cloud|nvme)
 
 That split distinguishes disk limits from FUSE-path limits from peer/cloud
 bottlenecks from cache-budget regressions in one pass. For a live cluster,
-`tools/dashboard/` is a Streamlit UI over these same endpoints:
-
-```bash
-pip install -r tools/dashboard/requirements.txt
-streamlit run tools/dashboard/app.py
-```
+the [Streamlit UI](#streamlit-ui) puts these same endpoints behind a browser.
 
 Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
 `[CACHE]`, `[CSI]`, `[AGENT]`.
@@ -364,22 +359,9 @@ authority and local/peer tiers are pure accelerators:
 
 ### Measuring (applies to every mode)
 
-Benchmarks that stay comparable across builds:
-
-```bash
-./scripts/ops/benchmark-fuse-scenario.sh <namespace> <size-mb> [writer-class-substr] [reader-class-substr]
-```
-
-records size, node classes, write/read throughput, per-tier contribution,
-cache state, CPU/network snapshots, and git commit + image tags.
-
-When performance moves unexpectedly: enable the Prometheus endpoint and
-Grafana dashboard ConfigMap, then read the split — go-fuse write vs sync
-phase, peer/cloud/NVMe source contribution, range-cache bytes and prefetch
-reservations, `fuse_chunk_completion_*`, `fuse_busy_chunk_retry_*`,
-`eviction_skipped_unpersisted`, heap and goroutines. That distinguishes disk
-limits from FUSE-path limits from peer/cloud bottlenecks from cache-budget
-regressions in one pass.
+Use `scripts/ops/benchmark-fuse-scenario.sh` for numbers that stay comparable
+across builds — see [Benchmarking](#benchmarking). When performance moves
+unexpectedly, read the metric split in [Debugging](#debugging).
 
 ## Project Structure
 
@@ -428,49 +410,52 @@ Cross-compile the client from macOS with `GOOS=linux go build ./cmd/client`.
 
 ## Usage
 
-### Starting the Coordinator
+For a multi-node local setup use `make dev-start` (see [Quick
+Start](#quick-start)) rather than launching clients by hand — it wires the
+gRPC ports and peering that the examples below omit.
+
+### Coordinator
 
 ```bash
-./bin/coordinator -port 8080
+./bin/coordinator -port 8080 -grpc-port 9080
 ```
 
-Options:
-- `-port`: HTTP server port (default: 8080)
-- `-help`: Show help
+| Flag | Default | Notes |
+|---|---|---|
+| `-port` | `8080` | HTTP |
+| `-grpc-port` | `9080` | gRPC — the default client transport |
+| `-etcd-endpoints` | *(empty)* | Empty ⇒ in-memory store (single-node / local dev) |
+| `-etcd-prefix` | `/fuse` | Key prefix |
+| `-etcd-peer-lease-ttl` | | Peer lease TTL |
 
-### Starting a Client
+### Client
 
 ```bash
-./bin/client -mount /tmp/fuse-client -nvme /tmp/nvme-cache -coordinator localhost:8080 -port 8081
+./bin/client -mount /tmp/fuse-client -nvme /tmp/nvme-cache \
+  -coordinator-grpc localhost:9080 -port 8081 -grpc-port 9081
 ```
 
-Options:
-- `-mount`: Mount point for FUSE filesystem (default: /tmp/fuse-client)
-- `-nvme`: Path for NVME cache storage (default: /tmp/nvme-cache)
-- `-coordinator`: Coordinator address (default: localhost:8080)
-- `-port`: Port for peer API server (default: 8081)
-- `-peer-id`: Peer ID (auto-generated if not provided)
-- `-cloud-provider`: Cloud storage provider: s3, azure, or gcp (default: s3)
-- `-s3-bucket`: S3 bucket name (default: fuse-client-cache)
-- `-s3-region`: S3 region (default: us-east-1)
-- `-azure-account`: Azure storage account name
-- `-azure-key`: Azure storage account key
-- `-azure-container`: Azure blob container name (default: fuse-cache)
-- `-gcp-bucket`: GCP Cloud Storage bucket name (default: fuse-client-cache)
-- `-help`: Show help
+| Flag | Default | Notes |
+|---|---|---|
+| `-mount` | `/tmp/fuse-client` | FUSE mount point |
+| `-nvme` | `/tmp/nvme-cache` | NVMe cache directory |
+| `-fuse-backend` | `bazil` | `bazil` or `gofuse`; the chart deploys `gofuse` |
+| `-coordinator-grpc` | `localhost:9080` | Default transport |
+| `-coordinator` | `localhost:8080` | HTTP fallback |
+| `-port` / `-grpc-port` | `8081` / `9081` | Peer API |
+| `-peer-id` | auto | |
+| `-cloud-provider` | `s3` | `s3`, `azure`, or `gcp` |
+| `-nvme-max-gb` | `10` | Cache capacity |
+| `-chunk-size` | `8` | MB |
+| `-peer-labels` | | `pool=gpu,zone=a`, for warm targeting |
+| `-enable-agent-server` | `true` | CSI agent gRPC server |
 
-### Running Multiple Clients
-
-```bash
-# Client 1
-./bin/client -mount /tmp/fuse-client1 -nvme /tmp/nvme-cache1 -port 8081
-
-# Client 2
-./bin/client -mount /tmp/fuse-client2 -nvme /tmp/nvme-cache2 -port 8082
-
-# Client 3
-./bin/client -mount /tmp/fuse-client3 -nvme /tmp/nvme-cache3 -port 8083
-```
+`./bin/client -help` prints the full set. Other flag families: `-s3-*` /
+`-azure-*` / `-gcp-*` (per-provider credentials and transfer concurrency),
+`-range-*` / `-hybrid-*` / `-peer-read-*` (large-file read parallelism,
+prefetch, peer/cloud hedging), `-mount-retries` / `-mount-retry-delay-sec`
+(FUSE mount recovery), `-node-init-config` / `-node-init-host-root` (adopt
+node-init's discovered disk).
 
 ## API Endpoints
 
@@ -583,33 +568,34 @@ Azure sizing note from 2026-05-12:
    - After restart, eviction HEAD-probes cloud before trusting an entry as
      evictable
 
-## Benchmark Mode
+## Benchmarking
 
-Use the benchmark wrapper when you want a reproducible artifact rather than an ad hoc terminal capture:
+Use the wrapper rather than an ad hoc terminal capture — it produces a
+comparable artifact:
 
 ```bash
 ./scripts/ops/benchmark-fuse-scenario.sh <namespace> <size-mb> [writer-class-substr] [reader-class-substr]
-```
 
-Example:
-
-```bash
+# e.g.
 ./scripts/ops/benchmark-fuse-scenario.sh fuse-system-aztest 5120 Standard_L64s_v3 Standard_NC24ads_A100_v4
 ```
 
-The script appends a CSV row to `/tmp/fuse-benchmark-results.csv` with:
+It appends a CSV row to `/tmp/fuse-benchmark-results.csv` capturing file size,
+writer/reader node classes, write and read throughput, per-tier read
+contribution, peer and cloud object-path throughput, go-fuse write/sync/flush
+timing, range-cache and prefetch state after the read, Go heap and goroutine
+snapshots, node and pod CPU from `kubectl top`, coordinator peer network
+telemetry, and the git commit + image tags.
 
-- file size
-- writer node class and reader node class
-- write and read throughput
-- peer/cloud/NVMe read contribution
-- peer and cloud object-path throughput
-- go-fuse write phase, sync phase, and flush timing
-- range-cache / prefetch state after the read
-- Go heap / goroutine snapshots
-- node and pod CPU snapshots from `kubectl top`
-- coordinator-reported peer network telemetry
-- git commit and image tags
+Two conventions that keep rows comparable: pin writer and reader to explicit
+node classes instead of whichever pods get scheduled, and record the git SHA
+(the script does this for you). Peer and cloud speeds come from per-tier
+metric deltas on the reader pod (`/api/cache/stats`); object speed is the
+script's end-to-end `READ_MBPS_APPROX`.
+
+Headline results are in [Highlights](#highlights-validated-aug-2026) and the
+per-mode sections above. Full run history — including the Feb–Mar 2026 AKS/EKS
+matrix — lives in `docs/` and the CSV artifacts rather than here.
 
 ## Dashboard
 
@@ -625,16 +611,26 @@ monitoring:
       grafana_dashboard: "1"
 ```
 
-The `FUSE Cache Overview` dashboard now includes:
+The `FUSE Cache Overview` dashboard covers hot local read and overall write
+throughput, per-tier read contribution and source share, chunk fetch latency
+by tier, go-fuse write vs sync vs flush time, runtime memory / range-cache
+bytes / prefetch reservation, and goroutines with in-flight prefetch.
 
-- hot local read throughput
-- overall write throughput
-- peer/cloud/NVMe read contribution
-- read source share
-- chunk fetch latency by tier
-- go-fuse write phase vs sync vs flush time
-- runtime memory, range cache bytes, and prefetch reservation
-- goroutines and in-flight prefetch
+### Streamlit UI
+
+`tools/dashboard/` is a read-mostly Python UI over the same coordinator and
+client HTTP APIs — cluster overview, per-node cache counters, warm targeting
+(fan-out and single-node), replicas and heat. No server-side component.
+
+```bash
+pip install -r tools/dashboard/requirements.txt
+streamlit run tools/dashboard/app.py
+```
+
+Configure via the sidebar or `FUSE_COORDINATOR_URL`, `FUSE_API_KEY`,
+`FUSE_NODE_ADDR`. The node-address override exists because peers register as
+`POD_IP:8081`, which is unreachable from outside the cluster — port-forward a
+client pod and point the override at it. See `tools/dashboard/README.md`.
 
 ## Configuration
 
@@ -712,7 +708,12 @@ Default cache sizes:
 - GCP support uses the AWS S3 SDK against `storage.googleapis.com` (S3 interoperability mode)
 - `github.com/gorilla/mux` - HTTP router
 - `github.com/sirupsen/logrus` - Logging
-- `google.golang.org/grpc` - gRPC (for future use)
+- `google.golang.org/grpc` + `google.golang.org/protobuf` - the default
+  transport for coordinator, peer, and CSI-agent traffic (HTTP remains as
+  fallback); stubs generated into `internal/pb/`
+- `go.etcd.io/etcd/client/v3` - coordinator state; optional, in-memory
+  fallback when `-etcd-endpoints` is empty
+- `github.com/container-storage-interface/spec` - CSI API
 - `helm.sh/helm/v3` - Kubernetes package manager for deployment templates
 
 ## Security
@@ -723,78 +724,20 @@ Default cache sizes:
 
 ## Monitoring
 
-- Health checks on all endpoints
-- Peer heartbeat monitoring
-- Cache statistics and metrics
-- Coordinator provides system-wide statistics
-- Prometheus scrape endpoint on clients: `GET /metrics`
-- Read-path throughput breakdown metrics:
-  - `fuse_cache_peer_read_bytes_total`, `fuse_cache_peer_read_seconds_total`, `fuse_cache_peer_read_mbps`
-  - `fuse_cache_cloud_read_bytes_total`, `fuse_cache_cloud_read_seconds_total`, `fuse_cache_cloud_read_mbps`
-  - `fuse_cache_nvme_read_bytes_total`, `fuse_cache_nvme_read_seconds_total`, `fuse_cache_nvme_read_mbps`
+Clients expose Prometheus metrics at `GET /metrics` (no auth) and richer
+JSON at `GET /api/cache/stats`; the coordinator serves cluster-wide
+`GET /api/stats`. Every service has `GET /api/health`, and peers heartbeat
+into the coordinator's TTL-leased registry.
 
-## Benchmark Matrix
+Read-path throughput breaks down per tier, each as a bytes/seconds/mbps
+triple:
 
-Benchmark fields captured:
-- Cloud test type
-- Machine types
-- Results (write/read)
-- Peer speed, cloud speed, object speed
-- Net start at test start (writer/reader)
-- CPU start at test start (writer/reader/coordinator)
-- Git SHA used for run
+```
+fuse_cache_{peer,cloud,nvme}_read_{bytes_total,seconds_total,mbps}
+```
 
-Notes:
-- `Peer speed` / `Cloud speed` are computed from per-tier metric deltas on the reader pod (`/api/cache/stats`).
-- `Object speed` is end-to-end read throughput from benchmark script output (`READ_MBPS_APPROX`).
-- `Net start` comes from coordinator peer telemetry (`/api/peers` -> `network_speed_mbps`).
-- `CPU start` comes from `kubectl top pod` snapshot taken just before each run.
-- Historical rows keep `N/A` where older runs did not capture that field.
-
-### Latest E2E (2026-02-28, EKS `fuse-system-awstest`)
-
-| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
-|---|---|---|---|---:|---:|---:|---:|---:|---|---|
-| 2026-02-28 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read.sh` 1GB | `681 / 1211` | `335.5` | `0.0` | `1211` | `1012.6 / 996.0` | `44m / 2m / 1m` | `87bcb18` |
-| 2026-02-28 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read.sh` 5GB | `196 / 1225` | `351.1` | `0.0` | `1225` | `1004.1 / 921.6` | `87m / 1m / 1m` | `87bcb18` |
-| 2026-02-28 | `s3-standard` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `664 / 1203` | `336.6` | `0.0` | `1203` | `848.7 / 809.8` | `172m / 1m / 1m` | `87bcb18` |
-| 2026-02-28 | `s3express` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | `test-smart-read-s3-profile.sh` 1GB | `670 / 1221` | `340.2` | `0.0` | `1221` | `816.4 / 787.4` | `166m / 1m / 1m` | `87bcb18` |
-
-### Latest E2E (2026-02-28, AKS `fuse-system-aztest`)
-
-| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
-|---|---|---|---|---:|---:|---:|---:|---:|---|---|
-| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 1GB | `277 / 473` | `16.2` | `0.0` | `473` | `0.0 / 0.0` | `1m / 1m / 1m` | `87bcb18` |
-| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_L64s_v3` reader | `test-smart-read.sh` 5GB | `267 / 561` | `21.6` | `0.0` | `561` | `0.0 / 0.0` | `98m / 1m / 1m` | `87bcb18` |
-| 2026-02-28 | `azure-blob(peer-first)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `275 / 518` | `17.6` | `0.0` | `518` | `0.0 / 0.0` | `633m / 1m / 1m` | `87bcb18` |
-| 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `264 / 545` | `N/A` | `N/A` | `545` | `N/A` | `N/A` | `5fa1f9c+` |
-| 2026-03-01 | `azure-blob(peer-first, nvme-max=48GB)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB | `270 / 648` | `N/A` | `N/A` | `648` | `N/A` | `N/A` | `5fa1f9c+` |
-| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 1GB | `298 / 550` | `N/A` | `N/A` | `550` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
-| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB | `288 / 671` | `N/A` | `N/A` | `671` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
-| 2026-03-02 | `azure-blob(hybrid-largefile, hedge=5ms)` | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-smart-read.sh` 5GB (profiled) | `276 / 551` | `150.2` | `80.1` | `551` | `N/A` | `N/A` | `hybridwall2-20260301-213635` |
-
-### Latest Cached Read (2026-03-01, AKS `fuse-system-aztest`)
-
-| Date | Machine Types | Scenario | Write MB/s | Cold Read MB/s | Cached Read MB/s | Notes | Git SHA |
-|---|---|---|---:|---:|---:|---|---|
-| 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 1GB | `282` | `436` | `2003` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
-| 2026-03-01 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 5GB | `262` | `622` | `2389` | `gofuse + passthrough; cached path served via range/kernel cache` | `5fa1f9c+` |
-| 2026-03-02 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 1GB | `274` | `751` | `2133` | `hybrid-largefile + wall metrics image` | `hybridwall2-20260301-213635` |
-| 2026-03-02 | `Standard_NC24ads_A100_v4` writer + `Standard_NC24ads_A100_v4` reader | `test-gofuse-cached-read-suite.sh` 5GB | `291` | `592` | `2530` | `hybrid-largefile + wall metrics image` | `hybridwall2-20260301-213635` |
-
-### Historical Scenarios
-
-| Date | Cloud Test Type | Machine Types | Scenario | Results (Write/Read MB/s) | Peer Speed MB/s | Cloud Speed MB/s | Object Speed MB/s | Net Start MB/s (W/R) | CPU Start (W/R/C) | Git SHA |
-|---|---|---|---|---:|---:|---:|---:|---:|---|---|
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Baseline before hotspot iteration, 1GB | `699 / 788` | `N/A` | `0.0` | `788` | `N/A` | `N/A` | `25f8711` |
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Baseline before hotspot iteration, 5GB | `339 / 887` | `N/A` | `0.0` | `887` | `N/A` | `N/A` | `25f8711` |
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration A (regression), 1GB | `703 / 634-646` | `N/A` | `0.0` | `634-646` | `N/A` | `N/A` | `WIP pre-5ddcd09` |
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration A (regression), 5GB | `203 / 838` | `N/A` | `0.0` | `838` | `N/A` | `N/A` | `WIP pre-5ddcd09` |
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration B (accepted), 1GB | `697 / 1201-1244` | `N/A` | `0.0` | `1201-1244` | `N/A` | `N/A` | `5ddcd09` |
-| 2026-02-24 | `peer-first(default)` | `i3en.6xlarge` writer + `i3en.6xlarge` reader | Hotspot Iteration B (accepted), 5GB | `206-219 / 1368-1395` | `N/A` | `0.0` | `1368-1395` | `N/A` | `N/A` | `5ddcd09` |
-| 2026-02-21 | `azure hybrid` | `2x A100 + 1x L64s_v3` | Azure cloud optimization, 5GB run #2 | `N/A / 420` | `145.8` | `274.5` | `420` | `N/A` | `N/A` | `rev 71 image fuse-cloudopt-20260221100456` |
-| 2026-02-21 | `gofuse cached-read` | `A100 writer + A100 reader` | go-fuse cold/cached suite, 1GB | `274 / cold 547, cached 2316` | `N/A` | `N/A` | `547 (cold)` | `N/A` | `N/A` | `rev 74 image gofuse-benchfix2-20260221-110935` |
-| 2026-02-21 | `gofuse cached-read` | `A100 writer + A100 reader` | go-fuse cold/cached suite, 5GB | `271 / cold 524, cached 2518` | `N/A` | `N/A` | `524 (cold)` | `N/A` | `N/A` | `rev 74 image gofuse-benchfix2-20260221-110935` |
+See [Debugging](#debugging) for which metrics answer which question, and
+[Dashboard](#dashboard) for the Grafana and Streamlit front ends.
 
 ## Future Enhancements
 
@@ -895,29 +838,15 @@ helm upgrade --install fuse-cache charts/fuse-cache \
 
 ### Local Kubernetes Dev Box (kind)
 
-Install required local tools (helm/kind/kubectl) if needed:
+The `make k8s-devbox-*` targets in [Quick Start](#kubernetes-locally) wrap
+`scripts/devbox/devbox.sh`, which you can also drive directly:
 
 ```bash
-./scripts/devbox/install-tools.sh all
-```
-
-Use the helper script:
-
-```bash
-./scripts/devbox/devbox.sh create   # create local kind cluster
-./scripts/devbox/devbox.sh deploy   # install Helm chart
-./scripts/devbox/devbox.sh status   # inspect resources
-./scripts/devbox/devbox.sh delete   # tear down cluster
-```
-
-Or use Make targets:
-
-```bash
-make k8s-devbox-install-tools
-make k8s-devbox-create
-make k8s-devbox-deploy
-make k8s-devbox-status
-make k8s-devbox-delete
+./scripts/devbox/install-tools.sh all   # helm/kind/kubectl, if needed
+./scripts/devbox/devbox.sh create       # create local kind cluster
+./scripts/devbox/devbox.sh deploy       # install Helm chart
+./scripts/devbox/devbox.sh status       # inspect resources
+./scripts/devbox/devbox.sh delete       # tear down cluster
 ```
 
 ## Ops Scripts
