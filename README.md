@@ -7,6 +7,202 @@ Validated as the storage layer for GPU/CPU pod checkpoint-restore
 ([pod-snapshotter](https://github.com/nickaggarwal/pod-snapshotter)) on both
 AKS and EKS.
 
+**New here?** Start with [Quick Start](#quick-start) — it gets a 3-node cluster
+running on your laptop in about two minutes. Then [Where Things
+Live](#where-things-live) for orientation and [Testing](#testing) before you
+open a PR. Everything below [Operating Modes](#operating-modes) is production
+reference material you can skip on a first pass.
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.21+ (`go.mod` says 1.21; the toolchain in use is newer and fine)
+- Linux for anything that mounts FUSE. macOS is fine for editing, building
+  most packages, and running the test suite — see [Developing on
+  macOS](#developing-on-macos).
+- No cloud account needed. The coordinator falls back to an in-memory store
+  when `-etcd-endpoints` is empty, and the cloud tier is optional for local work.
+
+### Run a 3-node cluster locally (Linux)
+
+```bash
+make build        # bin/coordinator, bin/client, bin/csi-driver, bin/node-init
+make dev-start    # coordinator + 3 clients, ports and peering wired up
+```
+
+That gives you:
+
+| Process | HTTP | gRPC | Mount | NVMe cache dir |
+|---|---|---|---|---|
+| coordinator | `:8080` | `:9080` | — | — |
+| client-1 | `:8081` | `:9081` | `/tmp/fuse-client1` | `/tmp/nvme-cache1` |
+| client-2 | `:8082` | `:9082` | `/tmp/fuse-client2` | `/tmp/nvme-cache2` |
+| client-3 | `:8083` | `:9083` | `/tmp/fuse-client3` | `/tmp/nvme-cache3` |
+
+Prove the tiers actually work — write on one node, read from another:
+
+```bash
+echo "hello from node 1" > /tmp/fuse-client1/greeting.txt   # Tier 1 write
+cat /tmp/fuse-client2/greeting.txt                          # Tier 2 peer fetch
+
+curl -s localhost:8081/api/cache/stats | jq      # what node 1 holds
+curl -s localhost:8080/api/peers | jq            # who the coordinator sees
+curl -s localhost:8081/metrics | grep fuse_tier  # adaptive tier scoring
+```
+
+Tear down with `make dev-stop` (kills the processes) and `make dev-cleanup`
+(removes the `/tmp` dirs).
+
+### Run a single client against real cloud storage
+
+```bash
+export AZURE_STORAGE_ACCOUNT=... AZURE_STORAGE_KEY=... AZURE_CONTAINER_NAME=fuse-cache
+./bin/coordinator -port 8080 -grpc-port 9080 &
+./bin/client -mount /tmp/fuse-client -nvme /tmp/nvme-cache \
+  -coordinator-grpc localhost:9080 -cloud-provider azure
+```
+
+Swap `-cloud-provider s3` or `gcp` and the matching env vars (see
+[Environment Variables](#environment-variables)). `./bin/client -help` prints
+the full flag set; the load-bearing ones are in [Usage](#usage).
+
+### Kubernetes, locally
+
+```bash
+make k8s-devbox-install-tools   # helm + kind + kubectl, if you need them
+make k8s-devbox-create          # kind cluster
+make k8s-devbox-deploy          # Helm chart into it
+make k8s-devbox-status
+make k8s-devbox-delete
+```
+
+## Where Things Live
+
+Orientation for "I want to change X — which file?"
+
+| You want to change… | Start in |
+|---|---|
+| How a read picks a tier, hedges, or falls back | `internal/cache/cache.go` (`readChunkDataFromTiers`), `tier_perf.go` |
+| Peer-to-peer transfer (client side) | `internal/cache/peer_storage.go` |
+| Peer-to-peer transfer (serve side) | `internal/cache/grpc_peer_server.go`, `internal/api/handler.go` |
+| Cloud backends | `internal/cache/{cloud,azure,gcp}_storage.go` — all implement `TierStorage` |
+| Eviction / NVMe budget | `internal/cache/nvme_storage.go`, the watermark evictor in `cache.go` |
+| Thundering-herd control | `peer_admission.go`, `origin_lease.go`, `replica_reconciler.go`, `chunk_advertise.go` |
+| Peer registry, file locations, etcd | `internal/coordinator/` (`coordinator.go`, `store.go`, `etcd_store.go`) |
+| The FUSE syscall layer | `internal/fuse/gofuse_backend.go` (default), `filesystem.go` (bazil) |
+| Kubernetes CSI / volume warmup | `internal/csidriver/`, `internal/agentserver/`, `internal/session/`, `internal/cache/warmup.go` |
+| An HTTP endpoint | `internal/api/handler.go`, `internal/api/warm.go` |
+| A Prometheus metric | `handlePromMetrics` in `internal/api/handler.go` |
+
+Three things that bite people who skip the conventions:
+
+1. **`internal/pb/` is generated.** Edit `proto/*.proto` and run `make proto`
+   (needs `protoc` plus `protoc-gen-go` / `protoc-gen-go-grpc` on `PATH`).
+2. **Peer errors have three classes, not two:** busy (`RESOURCE_EXHAUSTED` /
+   503, admission control), miss (`NOT_FOUND` / 404, stale routing), and real
+   failure. Only the third may feed a health EWMA — a scorer fed cache misses
+   measures replica placement, not health, and it fails *silently*. Anything
+   new on the peer serve path must return a **typed** miss or it becomes
+   "failure" by default. See `internal/cache/tier_miss.go`.
+3. **All coordination is advisory.** Reads must succeed with the coordinator
+   down. Correctness never depends on leases, advertisement, or the reconciler.
+
+`CLAUDE.md` has the full conventions list; `docs/SEMANTICS.md` covers
+filesystem semantics.
+
+## Testing
+
+```bash
+make test          # go test ./...
+make test-race     # go test -race ./...   (the concurrency suites are race-validated)
+make vet fmt lint
+```
+
+Run one test:
+
+```bash
+go test ./internal/session/ -run TestManager_RefCount -v
+go test -race ./internal/cache/ -run TestTierPerf -v
+```
+
+Coverage spans the cache tiers, coordinator (including gRPC and manifest),
+API handlers, and the CSI subsystem. Two rules worth knowing before you add
+a test:
+
+- **Don't race a wall-clock timer against real I/O.** A `time.Sleep(5ms)` to
+  "release after the first attempt" passes bare and fails roughly 1 run in 3
+  under `-race`, where a gRPC dial can outrun the timer. Key the handoff off
+  observed state — a counter, a channel — so the ordering is causal. See the
+  `rejected`-counter handoff in `peer_herd_test.go`.
+- **Peer tests use real in-process gRPC servers** (`startHerdPeer` in
+  `peer_herd_test.go`) rather than mocks, so they exercise the actual
+  transport and admission paths.
+
+The Python dashboard has its own stdlib-only suite:
+
+```bash
+python3 -m unittest discover -s tools/dashboard
+```
+
+### Developing on macOS
+
+`bazil.org/fuse` and `hanwen/go-fuse` are Linux-only, so a bare
+`go build ./...` fails on macOS with `undefined: mount` and friends. This is
+expected, not a broken checkout. What works:
+
+```bash
+# Everything except the FUSE layer — the packages you'll usually be editing
+go test ./internal/agentserver/ ./internal/api/ ./internal/cache/ \
+        ./internal/coordinator/ ./internal/csidriver/ ./internal/nodeinit/ \
+        ./internal/nodelabels/ ./internal/session/
+
+# Compile-check the Linux-only parts without running them
+GOOS=linux go build ./internal/... ./cmd/...
+```
+
+`cmd/coordinator`, `cmd/csi-driver`, and `cmd/node-init` build natively on
+macOS; only `cmd/client` (and `internal/fuse`) need Linux.
+
+Two other current warts, both pre-existing:
+
+- Five `tmp_s3probe*.go` files in the repo root each declare `package main`,
+  so the root package does not compile and `go test ./...` reports a failure
+  for it. They are leftover debugging probes; ignore the error or delete them.
+- Agent Unix socket paths must stay under 108 chars on macOS, which is why the
+  CSI tests use `/tmp` rather than `t.TempDir()`.
+
+## Debugging
+
+When behavior looks wrong, `GET /metrics` on any client is the fastest way in
+— it splits the read path by tier and phase:
+
+```bash
+curl -s localhost:8081/metrics | grep -E 'fuse_tier|fuse_cache_(peer|cloud|nvme)_read_mbps'
+```
+
+- `fuse_tier_{peer,cloud}_success_ratio` + `_misses_total` — adaptive tier
+  scoring. A success ratio near 0 with a high miss count means the *scorer* is
+  being poisoned; a low ratio with low misses means the tier is genuinely sick.
+- `fuse_cache_{peer,cloud,nvme}_read_mbps` — which tier actually served the
+  bytes.
+- `fuse_chunk_completion_*`, `fuse_busy_chunk_retry_*`,
+  `fuse_cache_evictions_total` — completion pass, herd control, and evictor
+  behavior. `GET /api/cache/stats` adds JSON-only fields the Prometheus
+  endpoint does not carry, notably `eviction_skipped_unpersisted`.
+
+That split distinguishes disk limits from FUSE-path limits from peer/cloud
+bottlenecks from cache-budget regressions in one pass. For a live cluster,
+`tools/dashboard/` is a Streamlit UI over these same endpoints:
+
+```bash
+pip install -r tools/dashboard/requirements.txt
+streamlit run tools/dashboard/app.py
+```
+
+Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
+`[CACHE]`, `[CSI]`, `[AGENT]`.
+
 ## Architecture
 
 1. **Coordinator** (3 replicas, stateless, etcd-backed): peer registry with
@@ -210,18 +406,25 @@ fuse-client/
 ├── scripts/
 │   ├── devbox/            # kind-based local cluster tooling
 │   └── ops/               # Deploy, repair, benchmark scripts
-└── docs/                  # Test plans, design notes
+├── tools/dashboard/       # Streamlit monitoring/warm-targeting UI (Python)
+├── proto/                 # Source of truth for internal/pb (run `make proto`)
+└── docs/                  # Test plans, design notes, filesystem semantics
 ```
+
+See [Where Things Live](#where-things-live) for a task-to-file map.
 
 ## Building
 
-```bash
-# Build coordinator
-go build -o bin/coordinator cmd/coordinator/main.go
+`make build` produces all four binaries into `bin/`. Individually:
 
-# Build client
-go build -o bin/client cmd/client/main.go
+```bash
+go build -o bin/coordinator ./cmd/coordinator
+go build -o bin/client      ./cmd/client        # Linux only
+go build -o bin/csi-driver  ./cmd/csi-driver
+go build -o bin/node-init   ./cmd/node-init
 ```
+
+Cross-compile the client from macOS with `GOOS=linux go build ./cmd/client`.
 
 ## Usage
 
@@ -604,11 +807,20 @@ Notes:
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make changes
-4. Add tests
-5. Submit a pull request
+1. Fork, branch, and make your change. [Where Things
+   Live](#where-things-live) maps subsystems to files.
+2. Add tests. `make test-race` must pass — this codebase is concurrent
+   throughout and a test that only passes without `-race` is not passing.
+3. Run `make fmt vet lint`.
+4. If you touched `proto/*.proto`, run `make proto` and commit the regenerated
+   `internal/pb/` alongside it.
+5. If you added an adaptive scorer, a metric, or anything on the peer serve
+   path, re-read the three conventions in [Where Things
+   Live](#where-things-live) — those are the ones that have actually caused
+   silent production bugs here.
+6. Open a PR describing what you measured, not just what you changed.
+   Performance claims in this repo are expected to come with numbers; see
+   `scripts/ops/benchmark-fuse-scenario.sh`.
 
 ## Kubernetes Dev Box & Helm Chart
 
