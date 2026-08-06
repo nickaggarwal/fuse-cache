@@ -818,6 +818,40 @@ func (cm *DefaultCacheManager) recordTierPerf(tier CacheTier, dur time.Duration,
 	cm.tierPerf.record(tier, dur, ok)
 }
 
+// recordTierOutcome folds a failed remote read into the tier tracker, but only
+// when the failure says something about the tier's health.
+//
+// Peer errors have three classes (see isPeerBusy / isPeerMiss), and the same
+// split applies to whole tiers:
+//   - busy: admission control. The data is provably there; the tier is fine.
+//   - miss: the tier does not hold the object. Routing information, and on a
+//     cold read the expected answer — every chunk misses the primary tier at
+//     least once by construction.
+//   - anything else: a real transport or provider failure, which is the only
+//     thing the EWMA should learn from.
+//
+// Recording the first two drove fuse_tier_peer_success_ratio to 0.0 live,
+// silently inverting tier order and pinning hedging on. Note that misses do
+// not update lastSampleAt either, which is deliberate: an idle tier should
+// age into its recovery floor and get re-probed rather than be held down by
+// a stream of misses that carry no health signal.
+func (cm *DefaultCacheManager) recordTierOutcome(tier CacheTier, start time.Time, err error) {
+	if err == nil {
+		cm.recordTierPerf(tier, time.Since(start), true)
+		return
+	}
+	if isPeerBusy(err) {
+		return
+	}
+	if isTierMiss(err) {
+		if cm.tierPerf != nil {
+			cm.tierPerf.recordMiss(tier)
+		}
+		return
+	}
+	cm.recordTierPerf(tier, time.Since(start), false)
+}
+
 func (cm *DefaultCacheManager) lookupFileSizeHint(filePath string) (int64, bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
@@ -2937,7 +2971,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, servedTier, nil
 	} else {
-		cm.recordTierPerf(primary, time.Since(tierStart), false)
+		cm.recordTierOutcome(primary, tierStart, err)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, primary, tierStart, err)
 	}
 	cm.metrics.RecordMiss(primary)
@@ -2956,7 +2990,7 @@ func (cm *DefaultCacheManager) readChunkDataFromTiers(
 		cm.traceChunkTotal(chunkPath, chunkIndex, chunkStart, nil)
 		return chunkData, servedTier, nil
 	} else {
-		cm.recordTierPerf(secondary, time.Since(tierStart), false)
+		cm.recordTierOutcome(secondary, tierStart, err)
 		cm.traceChunkAttempt(chunkPath, chunkIndex, secondary, tierStart, err)
 	}
 	cm.metrics.RecordMiss(secondary)
@@ -3321,6 +3355,13 @@ type TierPerfSnapshot struct {
 	CloudSuccess   float64
 	CloudSamples   int64
 	PrimaryTier    string
+	// PeerMisses/CloudMisses count reads a tier declined because it did not
+	// hold the object. These are deliberately excluded from the EWMAs above,
+	// which leaves a zero sample count ambiguous between "no traffic" and
+	// "all misses". Counting them separately keeps that distinction visible
+	// instead of trading one silent metric for another.
+	PeerMisses  int64
+	CloudMisses int64
 }
 
 func (cm *DefaultCacheManager) TierPerfSnapshot() TierPerfSnapshot {
@@ -3328,6 +3369,7 @@ func (cm *DefaultCacheManager) TierPerfSnapshot() TierPerfSnapshot {
 		return TierPerfSnapshot{PrimaryTier: "none"}
 	}
 	pl, ps, pn, cl, cs, cn := cm.tierPerf.snapshot()
+	peerMisses, cloudMisses := cm.tierPerf.missCounts()
 	primary := "none"
 	if pn >= tierPerfMinSamples && cn >= tierPerfMinSamples {
 		primary = cacheTierToStorageTier(cm.tierPerf.order()[0])
@@ -3340,6 +3382,8 @@ func (cm *DefaultCacheManager) TierPerfSnapshot() TierPerfSnapshot {
 		CloudSuccess:   cs,
 		CloudSamples:   cn,
 		PrimaryTier:    primary,
+		PeerMisses:     peerMisses,
+		CloudMisses:    cloudMisses,
 	}
 }
 

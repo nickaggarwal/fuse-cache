@@ -210,11 +210,25 @@ func TestPeerRead_JitteredRetryAfterAllBusy(t *testing.T) {
 	if !ok {
 		t.Fatal("gate acquire should succeed")
 	}
-	// Drain the gate shortly after the first (rejected) attempt.
+	// Drain the gate once the serve side has actually rejected an attempt.
+	// A fixed sleep here races the first dial: under -race the dial can take
+	// longer than the timer, the gate is already open when the request lands,
+	// the read succeeds on the first try, and busySkipsTotal stays 0. Keying
+	// off the observed rejection makes the ordering causal instead of timed.
+	drained := make(chan struct{})
 	go func() {
-		time.Sleep(5 * time.Millisecond)
-		release()
+		defer close(drained)
+		defer release()
+		deadline := time.Now().Add(5 * time.Second)
+		for cm.peerServeGate.rejected.Load() == 0 {
+			if time.Now().After(deadline) {
+				t.Error("serve gate never rejected an attempt")
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
 	}()
+	defer func() { <-drained }()
 
 	coord := &herdCoordinator{peers: []*coordinator.PeerInfo{
 		{ID: "only", Status: "active", GRPCAddress: addr},

@@ -805,9 +805,11 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
 	fmt.Fprintf(w, "fuse_tier_peer_success_ratio %.4f\n", tp.PeerSuccess)
 	fmt.Fprintf(w, "fuse_tier_peer_samples_total %d\n", tp.PeerSamples)
+	fmt.Fprintf(w, "fuse_tier_peer_misses_total %d\n", tp.PeerMisses)
 	fmt.Fprintf(w, "fuse_tier_cloud_read_latency_ms %.3f\n", tp.CloudLatencyMs)
 	fmt.Fprintf(w, "fuse_tier_cloud_success_ratio %.4f\n", tp.CloudSuccess)
 	fmt.Fprintf(w, "fuse_tier_cloud_samples_total %d\n", tp.CloudSamples)
+	fmt.Fprintf(w, "fuse_tier_cloud_misses_total %d\n", tp.CloudMisses)
 	peerPrimary := 0
 	if tp.PrimaryTier == "peer" {
 		peerPrimary = 1

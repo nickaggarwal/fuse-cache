@@ -418,6 +418,20 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   construction, and `pairScore` (`success/latencyMs`) collapsed for everyone.
   Misses are counted separately as `fuse_peer_fetch_miss_skips_total`, which
   is a staleness signal for coordinator location metadata.
+- `internal/cache/tier_miss.go` — the same three-class split one level up, for
+  the *tier* tracker (`tier_perf.go`). `recordTierOutcome` folds a remote read
+  into the peer-vs-cloud EWMA only when the failure says something about tier
+  health: busy is skipped, and a miss (`isTierMiss` = `isPeerMiss` or
+  `isCloudMiss`, the latter covering Azure `bloberror` + S3/GCP `awserr` 404s)
+  is counted but kept out of the EWMA. Recording misses here drove
+  `fuse_tier_peer_success_ratio` to 0.0 live, which **inverted `order()`** —
+  cloud (~121ms) tried ahead of peer (~13ms) — and pinned `shouldHedge()` on,
+  since `ewmaSuccess` never climbed back over `tierPerfReliableSuccess`. Both
+  silent. Every chunk misses the primary tier at least once on a cold read, so
+  this is the common case, not an edge case. Misses are exposed as
+  `fuse_tier_{peer,cloud}_misses_total` so a zero sample count can be told
+  apart from "all misses"; a miss also leaves `lastSampleAt` untouched, so an
+  idle tier still ages into its recovery floor and gets re-probed.
 - `internal/coordinator/fetch_lease*.go` — advisory short-TTL leases
   (`/api/fetch-lease`; etcd key `/fuse/inflight/<key>` with lease-backed
   expiry; in-memory map fallback). `internal/cache/origin_lease.go` gates
@@ -495,6 +509,16 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   and never in the latency EWMA. Peer errors have three classes, not two;
   `isPeerBusy` / `isPeerMiss` / everything-else. Anything new on the peer
   serve path must return a *typed* miss, or it silently becomes "failure".
+  The same three classes apply to whole tiers (`isTierMiss`), and the rule
+  generalizes: **every adaptive scorer must be fed only outcomes that carry
+  the signal it scores.** A health EWMA fed cache misses measures replica
+  placement, not health — and it fails silently, because a collapsed score
+  looks exactly like a genuinely bad link. When adding a scorer, ask what
+  each error class actually means to *that* metric.
+- Tests must not race wall-clock timers against real I/O. `time.Sleep(5ms)`
+  to "release after the first attempt" passes bare and fails ~1-in-3 under
+  `-race`, where a dial can outrun the timer. Key the handoff off observed
+  state (a counter, a channel) so the ordering is causal.
 - All coordination is advisory — reads must succeed with the coordinator
   down; correctness never depends on leases/advertisement/reconciler.
 - Jitter everything that could synchronize (`sleepWithJitter`, crypto/rand).

@@ -39,6 +39,10 @@ type tierStat struct {
 	ewmaSuccess   float64
 	samples       int64
 	lastSampleAt  time.Time
+	// misses counts reads this tier declined because it did not hold the
+	// object. Kept out of the EWMAs (see recordTierOutcome) but reported, so
+	// samples==0 can be told apart from "busy tier that never has anything".
+	misses int64
 }
 
 // tierPerfTracker tracks measured peer vs cloud read performance so the read
@@ -89,6 +93,16 @@ func (t *tierPerfTracker) record(tier CacheTier, latency time.Duration, ok bool)
 	}
 	s.samples++
 	s.lastSampleAt = time.Now()
+}
+
+// recordMiss counts a "tier does not hold this object" outcome without
+// touching the EWMAs or lastSampleAt.
+func (t *tierPerfTracker) recordMiss(tier CacheTier) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s := t.statFor(tier); s != nil {
+		s.misses++
+	}
 }
 
 // score returns a higher-is-better score for a tier: effective success divided
@@ -160,4 +174,11 @@ func (t *tierPerfTracker) snapshot() (peerLatencyMs, peerSuccess float64, peerSa
 	defer t.mu.RUnlock()
 	return t.peer.ewmaLatencyMs, t.peer.ewmaSuccess, t.peer.samples,
 		t.cloud.ewmaLatencyMs, t.cloud.ewmaSuccess, t.cloud.samples
+}
+
+// missCounts returns per-tier miss totals.
+func (t *tierPerfTracker) missCounts() (peer, cloud int64) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.peer.misses, t.cloud.misses
 }

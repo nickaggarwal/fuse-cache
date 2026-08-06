@@ -72,6 +72,8 @@ on a live cluster):
 | 10 | `WarmupResult` has no json tags | fixed — snake_case throughout |
 | 11 | No warm progress or status endpoint | fixed — job IDs + `GET /api/cache/warm[/{id}]`, fan-out returns `jobs`, dashboard polls them; progress is chunk-level |
 | 12 | Unexplained slow peer reads via `10.244.1.189` | root-caused — slow node is a 4-vCPU `Standard_D4as_v4` (expected); the investigation exposed a real EWMA bug (misses poisoned `success_ratio`), now fixed |
+| 13 | Same miss-poisoning defect in the **tier** EWMA | fixed — `tier_miss.go` + `recordTierOutcome`; misses were inverting peer/cloud order and pinning hedging on (found post-#12, on live `/metrics`) |
+| 14 | Flaky `TestPeerRead_JitteredRetryAfterAllBusy` | fixed — timed gate release replaced with a causal one; pre-existing, ~1-in-3 under `-race` |
 
 ### 1. `ReadRange` panics and kills the FUSE mount on a chunk-size mismatch — CRITICAL
 
@@ -324,6 +326,84 @@ Regression coverage in `peer_latency_test.go`: a peer that answers only misses
 accumulates no samples at all (rather than a run of recorded failures), while a
 genuinely unreachable peer still drives success to ~0 so the EWMA keeps routing
 around bad links.
+
+---
+
+### 13. The same miss-poisoning defect in the tier-level EWMA — found post-fix
+
+Found while reviewing live `/metrics` after the #12 fix shipped. #12 fixed the
+*pairwise* (node→peer) tracker; the *tier* tracker (peer-vs-cloud,
+`tier_perf.go`) had the identical defect and was untouched. On `client-htllv`:
+
+```
+fuse_tier_peer_read_latency_ms   12.894
+fuse_tier_peer_success_ratio     0.0000   ← the one sample was a miss
+fuse_tier_cloud_read_latency_ms  121.146
+fuse_tier_cloud_success_ratio    1.0000
+```
+
+`readChunkDataFromTiers` called `recordTierPerf(primary, …, false)` on any
+error from the ordered fallback. But a peer-tier error is usually just "no
+holder has this chunk" — which is the *definition* of a cold read, not a tier
+fault. Every chunk misses its primary tier at least once by construction.
+
+Two silent consequences, both worse than the pairwise version because they
+change routing for all traffic on the node:
+
+- **`order()` inverts.** `score = success/latency`, so peer collapses to 0 and
+  cloud wins. Reads a peer could serve in ~13ms get sent to Azure at ~121ms
+  first — the adaptive feature actively preferring the ~10x slower tier.
+- **`shouldHedge()` pins on.** `ewmaSuccess < tierPerfReliableSuccess` (0.85)
+  stays true forever, so every read races both tiers and burns cloud bandwidth
+  it does not need. `tierPerfRecoveryFloor` (0.7) is below the threshold and
+  does not rescue it.
+
+Busy was also being recorded as failure here, violating the convention
+established in #12.
+
+*Fixed.* New `internal/cache/tier_miss.go`: `isCloudMiss` classifies not-found
+across all three providers (Azure `bloberror`, S3/GCP `awserr` 404 +
+`NoSuchKey`), `isTierMiss` unions it with `isPeerMiss`, and
+`recordTierOutcome` replaces the two raw record sites — skipping busy,
+counting misses out-of-band, recording only real transport/provider failures.
+The two aggregate peer errors (`"no active peers available"`,
+`"file not found on any peer"`) were untyped `fmt.Errorf` and are now
+`peerMissError`, so they classify correctly one level up.
+
+Misses are exposed as `fuse_tier_{peer,cloud}_misses_total`, because excluding
+them from the EWMA otherwise makes `samples == 0` ambiguous between "no
+traffic" and "all misses" — trading one silent metric for another. A miss also
+leaves `lastSampleAt` untouched, so an idle tier still ages into its recovery
+floor and gets re-probed rather than being held down by misses that carry no
+health signal.
+
+Regression coverage drives the real read path, not just the classifier:
+`TestTierPerf_ColdReadMissesDoNotInvertTierOrder` runs 12 cold chunk reads
+against an empty peer tier and a populated cloud tier, and asserts peer
+samples stay 0, misses reach 12, and `order()` stays peer-first.
+`TestTierPerf_RealPeerFailuresStillDemote` guards the other half — a genuinely
+broken peer tier must still be demoted, or the fix just makes the tracker
+blind. Both were verified to fail with the fix reverted; with the sample-count
+assertions disabled, the reverted code produces `order = [cloud peer]`,
+confirming the inversion is real and not just a counter artifact.
+
+**Generalized lesson** (now in CLAUDE.md): every adaptive scorer must be fed
+only outcomes carrying the signal it scores. This defect appeared twice, in
+two trackers written months apart, because "error" was treated as one class.
+Worth auditing any future scorer the same way.
+
+### 14. Flaky herd test — `TestPeerRead_JitteredRetryAfterAllBusy`
+
+Surfaced during the #13 race sweep. `time.Sleep(5 * time.Millisecond)` before
+releasing the serve gate races the requester's first dial: under `-race` the
+dial can take longer than the timer, so the gate is already open when the
+request lands, the read succeeds first try, and `busySkipsTotal` stays 0.
+Reproduced at roughly 1-in-3 across 30-iteration batches, on `main` as well —
+pre-existing, not a regression from #13. (An initial A/B suggested otherwise;
+an interleaved re-run controlling for machine load showed clean `main` failing
+too.) *Fixed* by polling the gate's `rejected` counter so the release is
+causally ordered after an observed rejection. 200 consecutive passes under
+`-race`.
 
 ---
 

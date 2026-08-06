@@ -347,7 +347,11 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		candidates = append(candidates, peer)
 	}
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no active peers available")
+		// A typed miss: no holder to ask is the same information as every
+		// holder answering "not held" — the tier does not have it. Leaving
+		// this untyped makes the adaptive tier tracker score an empty
+		// candidate list as a peer-tier transport failure.
+		return nil, &peerMissError{addr: "none", path: path}
 	}
 	if ps.sortByNetwork {
 		sortPeersByNetwork(candidates, path)
@@ -414,7 +418,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("file not found on any peer")
+	return nil, &peerMissError{addr: "any", path: path}
 }
 
 func sortPeersByNetwork(peers []*coordinator.PeerInfo, key string) {
