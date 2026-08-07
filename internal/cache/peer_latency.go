@@ -14,15 +14,12 @@ import (
 // PeerStorage records an EWMA of observed read latency/success per peer from
 // real transfers and uses it to order candidates, so traversal converges on
 // the closest holders and routes around peers whose latency regresses.
+// The EWMA weight and the latency floor are shared with the other adaptive
+// scorer; see ewma.go.
 const (
-	// peerPairAlpha is the EWMA weight for new latency samples (mirrors
-	// tierPerfAlpha in tier_perf.go).
-	peerPairAlpha = 0.3
 	// peerPairMinSamples is how many observations a pair needs before its
 	// measured latency is trusted over the coordinator's probe estimate.
 	peerPairMinSamples = 3
-	// peerPairLatencyFloorMs avoids divide-by-zero / over-weighting sub-ms reads.
-	peerPairLatencyFloorMs = 0.5
 	// peerPairAssumedLatencyMs is the neutral prior for peers with no probe
 	// data and no samples.
 	peerPairAssumedLatencyMs = 5.0
@@ -36,20 +33,14 @@ type PeerPairLatency struct {
 	Samples   int64   `json:"samples"`
 }
 
-type peerPairStat struct {
-	ewmaLatencyMs float64
-	ewmaSuccess   float64
-	samples       int64
-}
-
 // peerLatencyTracker holds this node's observed latency to each peer.
 type peerLatencyTracker struct {
 	mu    sync.RWMutex
-	stats map[string]*peerPairStat
+	stats map[string]*ewmaStat
 }
 
 func newPeerLatencyTracker() *peerLatencyTracker {
-	return &peerLatencyTracker{stats: make(map[string]*peerPairStat)}
+	return &peerLatencyTracker{stats: make(map[string]*ewmaStat)}
 }
 
 // record folds one observed transfer into the pair's EWMA. Busy rejections
@@ -58,23 +49,14 @@ func (t *peerLatencyTracker) record(peerID string, latency time.Duration, ok boo
 	if t == nil || peerID == "" {
 		return
 	}
-	latencyMs := float64(latency) / float64(time.Millisecond)
-	successVal := 0.0
-	if ok {
-		successVal = 1.0
-	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	s := t.stats[peerID]
 	if s == nil {
-		s = &peerPairStat{ewmaLatencyMs: latencyMs, ewmaSuccess: successVal}
+		s = &ewmaStat{}
 		t.stats[peerID] = s
-	} else {
-		s.ewmaLatencyMs = peerPairAlpha*latencyMs + (1-peerPairAlpha)*s.ewmaLatencyMs
-		s.ewmaSuccess = peerPairAlpha*successVal + (1-peerPairAlpha)*s.ewmaSuccess
 	}
-	s.samples++
+	s.observe(latency, ok)
 }
 
 // measured returns the pair's EWMA latency/success and whether enough samples
@@ -130,10 +112,10 @@ func (ps *PeerStorage) pairScore(peer *coordinator.PeerInfo) float64 {
 		}
 		success = 1.0
 	}
-	if latencyMs < peerPairLatencyFloorMs {
-		latencyMs = peerPairLatencyFloorMs
-	}
-	return success / latencyMs
+	// Estimated peers get scored through the same fold as measured ones, so
+	// the two stay on one 1/ms scale and sort together.
+	est := ewmaStat{ewmaLatencyMs: latencyMs}
+	return est.scoreWith(success)
 }
 
 // hasMeasuredPair reports whether any candidate has trusted pair samples.

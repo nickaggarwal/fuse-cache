@@ -5,11 +5,9 @@ import (
 	"time"
 )
 
-// Adaptive remote-read tuning constants.
+// Adaptive remote-read tuning constants. The EWMA weight and the latency floor
+// are shared with the other adaptive scorer; see ewma.go.
 const (
-	// tierPerfAlpha is the EWMA weight applied to each new sample. Higher values
-	// react faster to change; lower values are steadier.
-	tierPerfAlpha = 0.3
 	// tierPerfMinSamples is how many samples a tier needs before its measured
 	// score is trusted. Below this, the cold-start prior (peer-first) is used.
 	tierPerfMinSamples = 3
@@ -28,17 +26,12 @@ const (
 	// of the primary's, the two are a close race and hedging buys latency
 	// insurance for little wasted bandwidth.
 	tierPerfCloseRatio = 0.75
-	// tierPerfLatencyFloorMs avoids divide-by-zero and over-weighting sub-ms
-	// reads when computing score = success / latency.
-	tierPerfLatencyFloorMs = 0.5
 )
 
 // tierStat holds EWMA performance for a single remote tier.
 type tierStat struct {
-	ewmaLatencyMs float64
-	ewmaSuccess   float64
-	samples       int64
-	lastSampleAt  time.Time
+	ewmaStat
+	lastSampleAt time.Time
 	// misses counts reads this tier declined because it did not hold the
 	// object. Kept out of the EWMAs (see recordTierOutcome) but reported, so
 	// samples==0 can be told apart from "busy tier that never has anything".
@@ -75,23 +68,10 @@ func (t *tierPerfTracker) record(tier CacheTier, latency time.Duration, ok bool)
 	if tier != TierPeer && tier != TierCloud {
 		return
 	}
-	latencyMs := float64(latency) / float64(time.Millisecond)
-	successVal := 0.0
-	if ok {
-		successVal = 1.0
-	}
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	s := t.statFor(tier)
-	if s.samples == 0 {
-		s.ewmaLatencyMs = latencyMs
-		s.ewmaSuccess = successVal
-	} else {
-		s.ewmaLatencyMs = tierPerfAlpha*latencyMs + (1-tierPerfAlpha)*s.ewmaLatencyMs
-		s.ewmaSuccess = tierPerfAlpha*successVal + (1-tierPerfAlpha)*s.ewmaSuccess
-	}
-	s.samples++
+	s.observe(latency, ok)
 	s.lastSampleAt = time.Now()
 }
 
@@ -105,19 +85,16 @@ func (t *tierPerfTracker) recordMiss(tier CacheTier) {
 	}
 }
 
-// score returns a higher-is-better score for a tier: effective success divided
-// by latency. A stale tier (unsampled beyond the recovery window) gets an
-// optimistic success floor so it is periodically re-probed.
-func (s *tierStat) score(now time.Time) float64 {
+// scoreAt returns a higher-is-better score for a tier: effective success
+// divided by latency. A stale tier (unsampled beyond the recovery window) gets
+// an optimistic success floor so it is periodically re-probed — the one thing
+// this scorer does that the shared fold does not.
+func (s *tierStat) scoreAt(now time.Time) float64 {
 	effSuccess := s.ewmaSuccess
 	if !s.lastSampleAt.IsZero() && now.Sub(s.lastSampleAt) > tierPerfRecoveryWindow && effSuccess < tierPerfRecoveryFloor {
 		effSuccess = tierPerfRecoveryFloor
 	}
-	latency := s.ewmaLatencyMs
-	if latency < tierPerfLatencyFloorMs {
-		latency = tierPerfLatencyFloorMs
-	}
-	return effSuccess / latency
+	return s.scoreWith(effSuccess)
 }
 
 // order returns the remote tiers ordered best-first. Until both tiers have
@@ -130,7 +107,7 @@ func (t *tierPerfTracker) order() []CacheTier {
 		return remoteReadOrderPeerFirst
 	}
 	now := time.Now()
-	if t.cloud.score(now) > t.peer.score(now) {
+	if t.cloud.scoreAt(now) > t.peer.scoreAt(now) {
 		return []CacheTier{TierCloud, TierPeer}
 	}
 	return []CacheTier{TierPeer, TierCloud}
@@ -146,8 +123,8 @@ func (t *tierPerfTracker) shouldHedge() (hedge bool, ok bool) {
 		return false, false
 	}
 	now := time.Now()
-	peerScore := t.peer.score(now)
-	cloudScore := t.cloud.score(now)
+	peerScore := t.peer.scoreAt(now)
+	cloudScore := t.cloud.scoreAt(now)
 
 	primary := &t.peer
 	primaryScore, secondaryScore := peerScore, cloudScore

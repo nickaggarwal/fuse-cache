@@ -349,3 +349,80 @@ func TestPeerWrite_ContextCancelledDuringStagger(t *testing.T) {
 		t.Fatalf("replicas written before cancellation = %d, want exactly 1", written)
 	}
 }
+
+// The two replication entry points share one loop and differ only in how they
+// report "no eligible targets": Write turns it into an error (the caller has
+// data that landed nowhere), ReplicateTo returns zero with no error (a top-up
+// that found nothing to do is not a failure).
+func TestReplication_NoEligibleTargets(t *testing.T) {
+	addr, _, stop := startHerdPeer(t, 8, nil)
+	defer stop()
+	coord := &herdCoordinator{peers: []*coordinator.PeerInfo{
+		{ID: "held", Status: "active", GRPCAddress: addr},
+	}}
+	ps := newHerdPeerStorage(t, coord)
+	defer ps.Close()
+	ps.minReplicationCount = 1
+	ctx := context.Background()
+
+	// ReplicateTo with the only peer excluded: nothing to do, not an error.
+	n, err := ps.ReplicateTo(ctx, "/x.bin", []byte("x"), map[string]struct{}{"held": {}}, 2)
+	if err != nil {
+		t.Fatalf("ReplicateTo with every peer excluded: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("wrote %d replicas with every peer excluded", n)
+	}
+	// A zero count is a no-op regardless of peers.
+	if n, err := ps.ReplicateTo(ctx, "/x.bin", []byte("x"), nil, 0); n != 0 || err != nil {
+		t.Fatalf("ReplicateTo(count=0) = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// Write with no active peers at all must report failure. A fresh
+	// PeerStorage, because getPeers caches the coordinator's answer.
+	downCoord := &herdCoordinator{peers: []*coordinator.PeerInfo{
+		{ID: "down", Status: "inactive", GRPCAddress: addr},
+	}}
+	downPS := newHerdPeerStorage(t, downCoord)
+	defer downPS.Close()
+	if err := downPS.Write(ctx, "/y.bin", []byte("y")); err == nil {
+		t.Fatal("Write with no active peers should error")
+	}
+}
+
+// ReplicateTo must honor its count even when more peers are eligible.
+func TestReplicateTo_StopsAtRequestedCount(t *testing.T) {
+	addr1, cm1, stop1 := startHerdPeer(t, 8, nil)
+	defer stop1()
+	addr2, cm2, stop2 := startHerdPeer(t, 8, nil)
+	defer stop2()
+	addr3, cm3, stop3 := startHerdPeer(t, 8, nil)
+	defer stop3()
+
+	coord := &herdCoordinator{peers: []*coordinator.PeerInfo{
+		{ID: "a", Status: "active", GRPCAddress: addr1},
+		{ID: "b", Status: "active", GRPCAddress: addr2},
+		{ID: "c", Status: "active", GRPCAddress: addr3},
+	}}
+	ps := newHerdPeerStorage(t, coord)
+	defer ps.Close()
+
+	n, err := ps.ReplicateTo(context.Background(), "/topup.bin", []byte("topup"), nil, 2)
+	if err != nil {
+		t.Fatalf("ReplicateTo: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("wrote %d replicas, want the 2 requested", n)
+	}
+	landed := 0
+	for _, cm := range []*DefaultCacheManager{cm1, cm2, cm3} {
+		cm.mu.RLock()
+		if _, ok := cm.entries.get("/topup.bin"); ok {
+			landed++
+		}
+		cm.mu.RUnlock()
+	}
+	if landed != 2 {
+		t.Fatalf("replicas on peers = %d, want 2", landed)
+	}
+}

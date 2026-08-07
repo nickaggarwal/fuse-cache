@@ -698,70 +698,43 @@ func (ps *PeerStorage) startGC(ctx context.Context) {
 // replication does not itself stampede the network, and targets that signal
 // busy (serve-side admission control) are skipped rather than retried.
 func (ps *PeerStorage) Write(ctx context.Context, path string, data []byte) error {
-	peers, err := ps.getPeers(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Shuffle first so equally-scored peers get load spread across objects,
-	// then prefer targets with more headroom.
-	cryptoShuffle(peers)
-	sortPeersByReplicationScore(peers)
-
-	successCount := 0
-	var lastErr error
-
-	for _, peer := range peers {
-		if successCount >= ps.minReplicationCount {
-			break
-		}
-		if peer.Status != "active" || peer.GRPCAddress == "" {
-			continue
-		}
-		// Stagger replicas after the first so one write does not burst
-		// minReplicationCount transfers onto the network at the same instant.
-		if successCount > 0 {
-			stagger := ps.replicationStagger
-			if stagger <= 0 {
-				stagger = defaultPeerReplicationStagger
-			}
-			ps.replStaggersTotal.Add(1)
-			if err := sleepWithJitter(ctx, stagger/2, stagger*3/2); err != nil {
-				break // context cancelled; keep what we have
-			}
-		}
-		if err := ps.writeToPeer(ctx, peer.GRPCAddress, path, data); err == nil {
-			successCount++
-		} else if isPeerBusy(err) {
-			// Busy target: skip it (replication is best-effort; the reconciler
-			// or read-promotion will top up replicas later).
-			ps.replBusySkipsTotal.Add(1)
-			lastErr = err
-		} else {
-			lastErr = err
-		}
-	}
-
-	if successCount > 0 {
-		if successCount < ps.minReplicationCount {
+	written, err := ps.replicate(ctx, path, data, nil, ps.minReplicationCount)
+	if written > 0 {
+		if written < ps.minReplicationCount {
 			log.Printf("[CACHE] WARNING: peer replication for %s: %d/%d replicas written",
-				path, successCount, ps.minReplicationCount)
+				path, written, ps.minReplicationCount)
 		}
 		return nil
 	}
-
-	if lastErr != nil {
-		return fmt.Errorf("failed to write to any peer: %v", lastErr)
+	if err != nil {
+		return fmt.Errorf("failed to write to any peer: %v", err)
 	}
 	return fmt.Errorf("no active peers available")
 }
 
 // ReplicateTo writes path to up to count additional peers, excluding the IDs
-// in exclude (peers that already hold the object). Targets are chosen by
-// headroom score, RPCs are staggered with jitter, and busy targets are
-// skipped — the replica top-up used by the Phase 3 reconciler must never
-// itself stampede. Returns how many replicas were written.
+// in exclude (peers that already hold the object). Returns how many replicas
+// were written. Used by the Phase 3 reconciler to top up under-replicated
+// objects.
 func (ps *PeerStorage) ReplicateTo(ctx context.Context, path string, data []byte, exclude map[string]struct{}, count int) (int, error) {
+	written, err := ps.replicate(ctx, path, data, exclude, count)
+	if written == 0 && err != nil {
+		return 0, err
+	}
+	return written, nil
+}
+
+// replicate is the one replication loop: pick up to count active peers not in
+// exclude, ordered by headroom, and write to them one at a time with a
+// jittered stagger between transfers.
+//
+// Returns how many replicas landed and the last error seen. A nil error with
+// zero written means there were no eligible targets at all — the two callers
+// report that differently, which is the only thing that used to differ between
+// them and the reason this was two near-identical loops. Splitting it that way
+// meant every herd-control rule (stagger, busy-is-not-failure, headroom order)
+// had to be remembered twice.
+func (ps *PeerStorage) replicate(ctx context.Context, path string, data []byte, exclude map[string]struct{}, count int) (int, error) {
 	if count <= 0 {
 		return 0, nil
 	}
@@ -780,6 +753,8 @@ func (ps *PeerStorage) ReplicateTo(ctx context.Context, path string, data []byte
 		}
 		candidates = append(candidates, peer)
 	}
+	// Shuffle first so equally-scored peers get load spread across objects,
+	// then prefer targets with more headroom.
 	cryptoShuffle(candidates)
 	sortPeersByReplicationScore(candidates)
 
@@ -789,6 +764,8 @@ func (ps *PeerStorage) ReplicateTo(ctx context.Context, path string, data []byte
 		if written >= count {
 			break
 		}
+		// Stagger replicas after the first so one write does not burst count
+		// transfers onto the network at the same instant.
 		if written > 0 {
 			stagger := ps.replicationStagger
 			if stagger <= 0 {
@@ -796,22 +773,21 @@ func (ps *PeerStorage) ReplicateTo(ctx context.Context, path string, data []byte
 			}
 			ps.replStaggersTotal.Add(1)
 			if err := sleepWithJitter(ctx, stagger/2, stagger*3/2); err != nil {
-				break
+				break // context cancelled; keep what we have
 			}
 		}
 		if err := ps.writeToPeer(ctx, peer.GRPCAddress, path, data); err == nil {
 			written++
 		} else if isPeerBusy(err) {
+			// Busy target: skip it (replication is best-effort; the reconciler
+			// or read-promotion will top up replicas later).
 			ps.replBusySkipsTotal.Add(1)
 			lastErr = err
 		} else {
 			lastErr = err
 		}
 	}
-	if written == 0 && lastErr != nil {
-		return 0, lastErr
-	}
-	return written, nil
+	return written, lastErr
 }
 
 // Delete removes a file from peer storage.
