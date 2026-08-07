@@ -143,6 +143,56 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+// A node whose FUSE serve loop has died still answers HTTP perfectly well.
+// Health has to reflect the mount, or the liveness probe keeps the pod alive
+// while every workload on the node sees ENOTCONN.
+func TestHealthReflectsMountState(t *testing.T) {
+	cm := newMockCacheManager()
+	h := NewHandler(cm, nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	mounted := true
+	h.SetMountHealth(func() bool { return mounted })
+
+	probe := func() (int, map[string]interface{}) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/health", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		var body map[string]interface{}
+		json.NewDecoder(w.Body).Decode(&body)
+		return w.Code, body
+	}
+
+	if code, body := probe(); code != http.StatusOK || body["status"] != "healthy" {
+		t.Fatalf("mounted: status=%d body=%v, want 200/healthy", code, body)
+	}
+
+	mounted = false
+	code, body := probe()
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("dead mount: status = %d, want %d", code, http.StatusServiceUnavailable)
+	}
+	if body["status"] != "unhealthy" {
+		t.Fatalf("dead mount: body status = %v, want unhealthy", body["status"])
+	}
+
+	// Recovery must clear it, so a successful remount puts the node back in
+	// rotation without a restart.
+	mounted = true
+	if code, _ := probe(); code != http.StatusOK {
+		t.Fatalf("after remount: status = %d, want 200", code)
+	}
+
+	// Clearing the probe returns the handler to the unsupervised default,
+	// which is what the coordinator and CSI driver rely on.
+	h.SetMountHealth(nil)
+	mounted = false
+	if code, _ := probe(); code != http.StatusOK {
+		t.Fatalf("with no probe installed: status = %d, want 200", code)
+	}
+}
+
 func TestFilePutAndGet(t *testing.T) {
 	cm := newMockCacheManager()
 	h := NewHandler(cm, nil, "test-peer", "")

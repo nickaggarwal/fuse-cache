@@ -453,9 +453,16 @@ gRPC ports and peering that the examples below omit.
 `./bin/client -help` prints the full set. Other flag families: `-s3-*` /
 `-azure-*` / `-gcp-*` (per-provider credentials and transfer concurrency),
 `-range-*` / `-hybrid-*` / `-peer-read-*` (large-file read parallelism,
-prefetch, peer/cloud hedging), `-mount-retries` / `-mount-retry-delay-sec`
-(FUSE mount recovery), `-node-init-config` / `-node-init-host-root` (adopt
-node-init's discovered disk).
+prefetch, peer/cloud hedging), `-mount-retries` / `-mount-retry-delay-sec` /
+`-mount-remount-attempts` (FUSE mount recovery), `-node-init-config` /
+`-node-init-host-root` (adopt node-init's discovered disk).
+
+If the FUSE serve loop dies while the process is otherwise healthy — an
+external unmount, a severed `/dev/fuse` connection — the client reports
+`/api/health` as 503 and remounts. After `-mount-remount-attempts` consecutive
+deaths (default 3, reset once a mount serves for 5 minutes) it shuts down
+cleanly and exits non-zero so the DaemonSet restarts the pod, rather than
+leaving a node advertising a mount nothing can use.
 
 ## API Endpoints
 

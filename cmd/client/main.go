@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -23,6 +22,7 @@ import (
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
 	fusefs "fuse-client/internal/fuse"
+	"fuse-client/internal/fusemount"
 	"fuse-client/internal/nodeinit"
 	"fuse-client/internal/nodelabels"
 	pb "fuse-client/internal/pb"
@@ -102,6 +102,7 @@ func main() {
 		peerLabelsFromNode   = flag.String("peer-labels-from-node", "", "Comma-separated node label keys to import as peer labels, each optionally renamed peerKey=nodeKey (e.g. pool=agentpool,topology.kubernetes.io/zone); needs NODE_NAME and RBAC get on nodes. FUSE_PEER_LABELS_FROM_NODE env overrides; imported keys win over -peer-labels")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
 		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
+		mountRemountAttempts = flag.Int("mount-remount-attempts", fusemount.DefaultRemountAttempts, "Consecutive remounts to attempt when the FUSE serve loop dies before exiting so the DaemonSet restarts the pod; negative disables remounting (first death is fatal)")
 
 		// CSI agent server
 		agentSocket       = flag.String("agent-socket", "/var/run/fuse-client/agent.sock", "Unix socket path for CSI agent gRPC server")
@@ -495,6 +496,15 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_MOUNT_RETRY_DELAY_SEC value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_MOUNT_REMOUNT_ATTEMPTS"); v != "" {
+		// Unlike the two above, zero and negative are meaningful here: they
+		// select "use the default" and "never remount" respectively.
+		if n, err := strconv.Atoi(v); err == nil {
+			*mountRemountAttempts = n
+		} else {
+			logger.Printf("WARNING: invalid FUSE_MOUNT_REMOUNT_ATTEMPTS value %q: %v", v, err)
+		}
+	}
 
 	// Create the session manager before the cache manager: eviction can run
 	// from other goroutines as soon as the cache manager exists, so sessMgr
@@ -583,7 +593,7 @@ func main() {
 	}()
 
 	// Create FUSE backend
-	var filesystem fuseMountBackend
+	var filesystem fusemount.Backend
 	switch backend := normalizeFuseBackend(*fuseBackendName); backend {
 	case "bazil":
 		filesystem = &bazilFuseBackend{fs: fusefs.NewFileSystem(cacheManager)}
@@ -597,15 +607,27 @@ func main() {
 
 	// Mount the FUSE filesystem
 	logger.Printf("Mounting FUSE filesystem at: %s (backend=%s)", *mountPoint, *fuseBackendName)
-	err = mountWithRetry(ctx, filesystem, *mountPoint, *mountRetries, time.Duration(*mountDelayS)*time.Second, logger)
+	err = fusemount.MountWithRetry(ctx, filesystem, *mountPoint, *mountRetries, time.Duration(*mountDelayS)*time.Second, logger)
 	if err != nil {
 		logger.Fatalf("Failed to mount FUSE filesystem: %v", err)
 	}
 
-	// Start serving the filesystem in a goroutine
+	// Serve under a supervisor. A serve loop that ends while the process is
+	// still running means the mount is gone; the node must stop advertising
+	// itself as healthy and either get the mount back or die so the DaemonSet
+	// replaces it.
+	mountSupervisor := fusemount.NewSupervisor(filesystem, fusemount.Config{
+		MountPoint:      *mountPoint,
+		MountRetries:    *mountRetries,
+		MountRetryDelay: time.Duration(*mountDelayS) * time.Second,
+		RemountAttempts: *mountRemountAttempts,
+		Logger:          logger,
+	})
+	apiHandler.SetMountHealth(mountSupervisor.Healthy)
+	mountFailed := make(chan error, 1)
 	go func() {
-		if err := filesystem.Serve(ctx); err != nil {
-			logger.Printf("FUSE filesystem server error: %v", err)
+		if err := mountSupervisor.Run(ctx); err != nil {
+			mountFailed <- err
 		}
 	}()
 
@@ -662,13 +684,23 @@ func main() {
 	logger.Printf("- Peer raw transport (HTTP sendfile): %t", cacheConfig.PeerRawTransport)
 	logger.Printf("- FUSE mount retries: %d", *mountRetries)
 	logger.Printf("- FUSE mount retry delay sec: %d", *mountDelayS)
+	logger.Printf("- FUSE remount attempts on serve death: %d", *mountRemountAttempts)
 
-	// Wait for interrupt signal to gracefully shutdown
+	// Wait for an interrupt signal, or for the mount to become unrecoverable.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	logger.Println("Shutting down client...")
+	mountLost := false
+	select {
+	case <-sigChan:
+		logger.Println("Shutting down client...")
+	case err := <-mountFailed:
+		// Shut down through the same path rather than exiting here: the peer
+		// must stop serving reads and drain its background work before the
+		// process goes away, or peers keep routing to a node with no mount.
+		mountLost = true
+		logger.Printf("FUSE mount at %s is unrecoverable: %v", *mountPoint, err)
+		logger.Println("Shutting down client so it can be restarted with a clean mount...")
+	}
 
 	// Graceful shutdown: cancel context, stop accepting new requests, then drain
 	// in-flight background goroutines (cloud persist, NVMe promotion, metadata publish).
@@ -688,6 +720,11 @@ func main() {
 	}
 
 	logger.Println("Client stopped")
+	if mountLost {
+		// Non-zero so the container is recorded as failed and the DaemonSet's
+		// restart policy brings it back; a clean exit would look intentional.
+		os.Exit(1)
+	}
 }
 
 // waitForNodeInitConfig polls for a readable, valid node-init config until
@@ -990,75 +1027,6 @@ func getLocalIP() string {
 		}
 	}
 	return "localhost"
-}
-
-func mountWithRetry(ctx context.Context, filesystem fuseMountBackend, mountPoint string, retries int, baseDelay time.Duration, logger *log.Logger) error {
-	if retries < 1 {
-		retries = 1
-	}
-	if baseDelay <= 0 {
-		baseDelay = 2 * time.Second
-	}
-
-	var lastErr error
-	for attempt := 1; attempt <= retries; attempt++ {
-		if err := cleanupStaleMountpoint(ctx, mountPoint, logger); err != nil {
-			logger.Printf("Mount cleanup warning for %s: %v", mountPoint, err)
-		}
-
-		err := filesystem.Mount(ctx, mountPoint)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		logger.Printf("FUSE mount attempt %d/%d failed at %s: %v", attempt, retries, mountPoint, err)
-
-		if attempt == retries {
-			break
-		}
-
-		wait := time.Duration(attempt) * baseDelay
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
-	}
-	return fmt.Errorf("mount retries exhausted for %s: %w", mountPoint, lastErr)
-}
-
-func cleanupStaleMountpoint(ctx context.Context, mountPoint string, logger *log.Logger) error {
-	commands := [][]string{
-		{"fusermount3", "-u", "-z", mountPoint},
-		{"fusermount", "-u", "-z", mountPoint},
-		{"umount", "-l", mountPoint},
-	}
-
-	var lastErr error
-	for _, cmdArgs := range commands {
-		cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			lastErr = err
-			output := strings.TrimSpace(string(out))
-			if output != "" {
-				logger.Printf("Mount cleanup command failed: %s (%v): %s", strings.Join(cmdArgs, " "), err, output)
-			}
-			continue
-		}
-		lastErr = nil
-	}
-
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return err
-	}
-	return lastErr
-}
-
-type fuseMountBackend interface {
-	Mount(ctx context.Context, mountPoint string) error
-	Serve(ctx context.Context) error
-	Unmount(mountPoint string) error
 }
 
 type bazilFuseBackend struct {

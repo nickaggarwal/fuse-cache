@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fuse-client/internal/cache"
@@ -50,6 +51,23 @@ type Handler struct {
 	// warmJobs tracks async /api/cache/warm passes so callers can poll them.
 	// Zero value is usable; the map is created on first start.
 	warmJobs warmJobs
+	// mountHealthy reports whether the FUSE mount is currently being served.
+	// Unset means "not supervised" and health reports healthy, which keeps
+	// callers that mount nothing on the same handler. Atomic because the
+	// client installs it after the API server is already accepting probes,
+	// and it is read from the probe path, so it must not block.
+	mountHealthy atomic.Pointer[func() bool]
+}
+
+// SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
+// loop has died still answers HTTP fine, so without this the liveness probe
+// passes while every pod on the node sees ENOTCONN on the mount.
+func (h *Handler) SetMountHealth(fn func() bool) {
+	if fn == nil {
+		h.mountHealthy.Store(nil)
+		return
+	}
+	h.mountHealthy.Store(&fn)
 }
 
 type fsSnapshotRequest struct {
@@ -732,7 +750,17 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"peer_id":   h.peerID,
 	}
 
+	status := http.StatusOK
+	if probe := h.mountHealthy.Load(); probe != nil && !(*probe)() {
+		health["status"] = "unhealthy"
+		health["mount"] = "unavailable"
+		// 503 so the kubelet restarts the pod rather than leaving a node
+		// serving reads off a mount its own pods cannot use.
+		status = http.StatusServiceUnavailable
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(health)
 }
 

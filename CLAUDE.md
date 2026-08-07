@@ -331,7 +331,8 @@ load-bearing ones:
 Other flag families: `-s3-*` / `-azure-*` / `-gcp-*` (per-provider creds and
 download/upload concurrency), `-range-*` and `-hybrid-*` and `-peer-read-*`
 (large-file read parallelism, prefetch, peer/cloud hedging), `-mount-retries` /
-`-mount-retry-delay-sec` (FUSE mount recovery).
+`-mount-retry-delay-sec` / `-mount-remount-attempts` (FUSE mount recovery; see
+`internal/fusemount/`).
 
 Coordinator flags: `-port`, `-grpc-port`, `-etcd-endpoints` (empty ⇒ in-memory),
 `-etcd-prefix`, `-etcd-peer-lease-ttl`.
