@@ -28,7 +28,7 @@ func chunkIndexOf(chunkPath string) int64 {
 	return n
 }
 
-// entryTable holds file metadata keyed by path plus two indexes that turn
+// entryTable holds file metadata keyed by path plus three indexes that turn
 // what used to be whole-map scans into point lookups:
 //
 //   - chunks: parent path -> its "<parent>_chunk_N" keys. Delete and
@@ -38,14 +38,31 @@ func chunkIndexOf(chunkPath string) int64 {
 //   - dirs: directory -> direct children. FUSE lookup and readdir used to
 //     copy the entire map and then scan the copy (twice, for lookup); both
 //     are now O(children of that directory).
+//   - a recency list threaded through the nodes themselves, coldest first, so
+//     eviction takes the entries it needs off the cold end instead of
+//     collecting and sorting every entry inside the write that triggered it.
 //
-// byPath is unexported and every mutation goes through put/del, so the
+// byPath is unexported and every mutation goes through put/del/touch, so the
 // indexes cannot drift: a raw map assignment elsewhere would silently
 // reintroduce the scan.
 type entryTable struct {
-	byPath map[string]*CacheEntry
+	byPath map[string]*tableNode
 	chunks map[string]map[string]struct{}
 	dirs   map[string]map[string]*dirChild
+	// Recency list. lruHead is the coldest entry, lruTail the most recently
+	// touched. The list records the order operations happened in rather than
+	// deriving it from CacheEntry.LastAccessed, which is a plain field several
+	// packages write to directly — an order maintained by the touch itself
+	// cannot disagree with the touches.
+	lruHead *tableNode
+	lruTail *tableNode
+}
+
+// tableNode is one entry plus its position in the recency list.
+type tableNode struct {
+	entry *CacheEntry
+	prev  *tableNode
+	next  *tableNode
 }
 
 // dirChild is one name inside a directory. The two counters exist because the
@@ -64,7 +81,7 @@ func (c *dirChild) alive() bool { return c.fileRefs > 0 || c.dirRefs > 0 }
 
 func newEntryTable() *entryTable {
 	return &entryTable{
-		byPath: make(map[string]*CacheEntry),
+		byPath: make(map[string]*tableNode),
 		chunks: make(map[string]map[string]struct{}),
 		dirs:   make(map[string]map[string]*dirChild),
 	}
@@ -75,36 +92,80 @@ func (t *entryTable) len() int { return len(t.byPath) }
 // get returns the live entry pointer for path. It mirrors map indexing (the
 // bool reports presence) so callers read the same way they did when entries
 // was a bare map. Callers holding only a read lock must not mutate the result.
+//
+// A read does not count as a use: touch does that, and it needs the write lock
+// the recency list is protected by.
 func (t *entryTable) get(path string) (*CacheEntry, bool) {
-	entry, ok := t.byPath[path]
-	return entry, ok
+	node, ok := t.byPath[path]
+	if !ok {
+		return nil, false
+	}
+	return node.entry, true
 }
 
-// put inserts or replaces the entry keyed by its own FilePath.
+// put inserts or replaces the entry keyed by its own FilePath, and marks it as
+// the most recently used. A rewrite is a use.
 func (t *entryTable) put(entry *CacheEntry) {
 	if entry == nil || entry.FilePath == "" {
 		return
 	}
-	if _, exists := t.byPath[entry.FilePath]; !exists {
-		t.index(entry.FilePath)
+	if node, exists := t.byPath[entry.FilePath]; exists {
+		node.entry = entry
+		t.lruUnlink(node)
+		t.lruPushBack(node)
+		return
 	}
-	t.byPath[entry.FilePath] = entry
+	t.index(entry.FilePath)
+	node := &tableNode{entry: entry}
+	t.byPath[entry.FilePath] = node
+	t.lruPushBack(node)
 }
 
 // del removes path and releases its index references. No-op if absent.
 func (t *entryTable) del(path string) {
-	if _, exists := t.byPath[path]; !exists {
+	node, exists := t.byPath[path]
+	if !exists {
 		return
 	}
+	t.lruUnlink(node)
 	delete(t.byPath, path)
 	t.unindex(path)
+}
+
+// touch moves path to the hot end of the recency list. Callers that also bump
+// CacheEntry.LastAccessed should call this in the same critical section, so
+// the two views of recency cannot disagree.
+func (t *entryTable) touch(path string) {
+	node, ok := t.byPath[path]
+	if !ok {
+		return
+	}
+	if node == t.lruTail {
+		return
+	}
+	t.lruUnlink(node)
+	t.lruPushBack(node)
 }
 
 // each visits every entry. Returning false stops the walk. Iteration order is
 // map order, i.e. random.
 func (t *entryTable) each(fn func(path string, entry *CacheEntry) bool) {
-	for path, entry := range t.byPath {
-		if !fn(path, entry) {
+	for path, node := range t.byPath {
+		if !fn(path, node.entry) {
+			return
+		}
+	}
+}
+
+// eachColdest visits entries from the least to the most recently used.
+// Returning false stops the walk, which is the point: eviction stops as soon
+// as it has freed enough, so a sweep that reclaims one file off a million-entry
+// table touches one node instead of sorting a million.
+//
+// The callback must not mutate the table.
+func (t *entryTable) eachColdest(fn func(path string, entry *CacheEntry) bool) {
+	for node := t.lruHead; node != nil; node = node.next {
+		if !fn(node.entry.FilePath, node.entry) {
 			return
 		}
 	}
@@ -114,14 +175,39 @@ func (t *entryTable) each(fn func(path string, entry *CacheEntry) bool) {
 // after releasing the lock.
 func (t *entryTable) snapshot() []*CacheEntry {
 	out := make([]*CacheEntry, 0, len(t.byPath))
-	for _, entry := range t.byPath {
-		if entry == nil {
+	for _, node := range t.byPath {
+		if node.entry == nil {
 			continue
 		}
-		entryCopy := *entry
+		entryCopy := *node.entry
 		out = append(out, &entryCopy)
 	}
 	return out
+}
+
+func (t *entryTable) lruPushBack(node *tableNode) {
+	node.prev = t.lruTail
+	node.next = nil
+	if t.lruTail != nil {
+		t.lruTail.next = node
+	} else {
+		t.lruHead = node
+	}
+	t.lruTail = node
+}
+
+func (t *entryTable) lruUnlink(node *tableNode) {
+	if node.prev != nil {
+		node.prev.next = node.next
+	} else if t.lruHead == node {
+		t.lruHead = node.next
+	}
+	if node.next != nil {
+		node.next.prev = node.prev
+	} else if t.lruTail == node {
+		t.lruTail = node.prev
+	}
+	node.prev, node.next = nil, nil
 }
 
 // chunkKeys returns the known chunk keys of parent, in ascending index order.

@@ -3,6 +3,7 @@ package cache
 import (
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -84,6 +85,13 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 	if walkErr != nil {
 		cm.logger.Printf("NVMe rehydration walk failed for %s: %v", base, walkErr)
 	}
+
+	// Insert oldest-first: the recency list takes its order from insertion,
+	// and these entries carry a LastAccessed from mtime rather than "now".
+	// Walk order is arbitrary, so without this the list would contradict the
+	// timestamps it is meant to reflect and eviction would reclaim pre-restart
+	// files in directory order.
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
 
 	adopted := 0
 	var bytes int64

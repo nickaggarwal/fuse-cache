@@ -36,9 +36,23 @@ func evictTestManager(t *testing.T, maxNVMe int64) *DefaultCacheManager {
 	}
 }
 
+// seedAges tracks what each manager has been seeded with, so seedNVMe can hold
+// callers to its ordering contract.
+var seedAges = map[*DefaultCacheManager]time.Duration{}
+
 // seedNVMe writes a file to NVMe with the given persist state and age.
+//
+// Seeds must be oldest-first. Eviction order comes from the entry table's
+// recency list, which records insertion order, so a test that seeds a 1-hour
+// file before a 3-hour one would get an eviction order that contradicts the
+// ages it asked for — and would still pass or fail for the wrong reason.
 func seedNVMe(t *testing.T, cm *DefaultCacheManager, path string, size int, persisted bool, age time.Duration) {
 	t.Helper()
+	if prev, ok := seedAges[cm]; ok && age > prev {
+		t.Fatalf("seeded %s (age %v) after a newer file (age %v): seeds must go oldest-first", path, age, prev)
+	}
+	seedAges[cm] = age
+	t.Cleanup(func() { delete(seedAges, cm) })
 	data := make([]byte, size)
 	if err := cm.nvmeStorage.Write(context.Background(), path, data); err != nil {
 		t.Fatalf("seed %s: %v", path, err)

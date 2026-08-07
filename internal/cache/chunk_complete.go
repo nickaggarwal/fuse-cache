@@ -228,6 +228,7 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil {
 		parent.Tier = TierNVMe
 		parent.LastAccessed = now
+		cm.entries.touch(filePath)
 		if parent.ChunkSize <= 0 {
 			parent.ChunkSize = chunkSize
 		}

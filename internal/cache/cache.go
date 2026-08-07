@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/metrics"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -329,9 +328,12 @@ type DefaultCacheManager struct {
 	chunkPromoteGate chan struct{}
 	tierPerf         *tierPerfTracker
 	chunkCompletion  chunkCompletionState
-	shutdownCtx      context.Context
-	shutdownCancel   context.CancelFunc
-	bgWg             sync.WaitGroup
+	// evictSignal wakes the watermark evictor between its periodic sweeps.
+	// Depth 1, non-blocking send: a pending wake already covers a burst.
+	evictSignal    chan struct{}
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	bgWg           sync.WaitGroup
 }
 
 type chunkFileCache struct {
@@ -499,6 +501,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		chunkAds:         newChunkAdvertiser(),
 		chunkPromoteGate: make(chan struct{}, chunkPromoteMaxConcurrent),
 		tierPerf:         newTierPerfTracker(),
+		evictSignal:      make(chan struct{}, 1),
 		shutdownCtx:      shutdownCtx,
 		shutdownCancel:   shutdownCancel,
 	}
@@ -1554,6 +1557,10 @@ func (cm *DefaultCacheManager) touchEntries(paths ...string) {
 		}
 		if entry, ok := cm.entries.get(path); ok && entry != nil {
 			entry.LastAccessed = now
+			// Same critical section as the timestamp: eviction walks the list,
+			// so a touch that updated one and not the other would hand it a
+			// stale ordering.
+			cm.entries.touch(path)
 		}
 	}
 }
@@ -1784,69 +1791,107 @@ func (cm *DefaultCacheManager) Evict(ctx context.Context, tier CacheTier) error 
 	return nil
 }
 
+// evictBatchSize is how many candidates one pass takes off the cold end of the
+// recency list before re-checking usage. It bounds the work done under the
+// lock and the work wasted when the first few candidates free enough: a pass
+// that reclaims one file walks one batch, not the whole table.
+const evictBatchSize = 64
+
 // evictToTarget deletes least-recently-accessed NVMe entries until usage is
 // at or under target bytes. Shared by the reactive write-path Evict and the
 // background watermark evictor; both honor pinning and the durability guard.
+//
+// Candidates come off the cold end of the entry table's recency list rather
+// than from a scan-and-sort of every entry. The old shape cost O(N log N) with
+// N = every cached object — including one entry per chunk, so a node holding a
+// single 100GB file at an 8MB stride sorted 12800 entries — and it ran inline
+// in the write that tripped the capacity check, meaning the write paid for it.
 func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) {
-	cm.mu.RLock()
-	if cm.nvmeUsed <= target {
-		cm.mu.RUnlock()
-		return
-	}
-
-	// Collect NVMe entries and sort by LastAccessed (oldest first)
-	type entryRef struct {
-		key   string
-		entry *CacheEntry
-	}
-	var nvmeEntries []entryRef
-	cm.entries.each(func(k string, e *CacheEntry) bool {
-		if e == nil || e.Tier != TierNVMe {
-			return true
-		}
-		if parentPath, ok := parentFilePathFromChunkPath(k); ok {
-			if parent, exists := cm.entries.get(parentPath); exists && parent != nil && parent.Tier == TierNVMe && parent.IsChunked {
-				return true
-			}
-		}
-		nvmeEntries = append(nvmeEntries, entryRef{k, e})
-		return true
-	})
-	cm.mu.RUnlock()
-	sort.Slice(nvmeEntries, func(i, j int) bool {
-		return nvmeEntries[i].entry.LastAccessed.Before(nvmeEntries[j].entry.LastAccessed)
-	})
-
 	// Collect pinned prefixes once before the eviction loop.
 	var pinnedPrefixes []string
 	if cm.config.PinnedPrefixesFn != nil {
 		pinnedPrefixes = cm.config.PinnedPrefixesFn()
 	}
 
-	for _, ref := range nvmeEntries {
+	type entryRef struct {
+		key   string
+		entry *CacheEntry
+	}
+	// Paths already considered and rejected this call: pinned, not yet durable,
+	// or a failed delete. They stay in the list at their current position, so
+	// without this the next batch would start on the same ones and never
+	// advance.
+	skipped := make(map[string]struct{})
+
+	for {
 		cm.mu.RLock()
-		done := cm.nvmeUsed <= target
+		if cm.nvmeUsed <= target {
+			cm.mu.RUnlock()
+			return
+		}
+		batch := make([]entryRef, 0, evictBatchSize)
+		cm.entries.eachColdest(func(k string, e *CacheEntry) bool {
+			if e == nil || e.Tier != TierNVMe {
+				return true
+			}
+			if _, seen := skipped[k]; seen {
+				return true
+			}
+			// A chunk of a file that is itself present and chunked is evicted
+			// with its parent, not on its own.
+			if parentPath, ok := parentFilePathFromChunkPath(k); ok {
+				if parent, exists := cm.entries.get(parentPath); exists && parent != nil && parent.Tier == TierNVMe && parent.IsChunked {
+					return true
+				}
+			}
+			batch = append(batch, entryRef{k, e})
+			return len(batch) < evictBatchSize
+		})
 		cm.mu.RUnlock()
-		if done {
-			break
+
+		if len(batch) == 0 {
+			// Nothing left that this call can reclaim; usage stays above
+			// target until the blocked entries become durable or unpinned.
+			return
 		}
-		if isPathPinned(ref.key, pinnedPrefixes) {
-			continue
+
+		for _, ref := range batch {
+			cm.mu.RLock()
+			done := cm.nvmeUsed <= target
+			cm.mu.RUnlock()
+			if done {
+				return
+			}
+			if isPathPinned(ref.key, pinnedPrefixes) {
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			// Durability guard: never evict the only copy. Under sustained
+			// pressure with a slow cloud link this can leave usage above target —
+			// by design; ENOSPC risk beats data loss.
+			if !cm.evictionSafe(ctx, ref.key, ref.entry) {
+				cm.metrics.EvictionSkippedUnpersisted.Add(1)
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			freed, err := cm.deleteLocalNVMeFootprint(ctx, ref.key, true, true)
+			if err != nil {
+				cm.logger.Printf("Eviction delete failed for %s: %v", ref.key, err)
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			// A delete that leaves the entry in place (nothing local to remove)
+			// frees nothing and would be picked again on the next batch.
+			cm.mu.RLock()
+			_, stillThere := cm.entries.get(ref.key)
+			cm.mu.RUnlock()
+			if stillThere {
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			cm.metrics.RecordEviction()
+			cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 		}
-		// Durability guard: never evict the only copy. Under sustained
-		// pressure with a slow cloud link this can leave usage above target —
-		// by design; ENOSPC risk beats data loss.
-		if !cm.evictionSafe(ctx, ref.key, ref.entry) {
-			cm.metrics.EvictionSkippedUnpersisted.Add(1)
-			continue
-		}
-		freed, err := cm.deleteLocalNVMeFootprint(ctx, ref.key, true, true)
-		if err != nil {
-			cm.logger.Printf("Eviction delete failed for %s: %v", ref.key, err)
-			continue
-		}
-		cm.metrics.RecordEviction()
-		cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 	}
 }
 
@@ -2072,6 +2117,9 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 	}
 	cm.nvmeUsed += entry.Size
 	cm.mu.Unlock()
+	// Hand the next eviction to the background evictor while there is still
+	// headroom, so the write after this one is less likely to run one inline.
+	cm.maybeSignalEvictionPressure()
 	return nil
 }
 

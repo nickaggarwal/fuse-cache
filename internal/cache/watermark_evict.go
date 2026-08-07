@@ -47,11 +47,45 @@ func (cm *DefaultCacheManager) startWatermarkEvictor() {
 			select {
 			case <-cm.shutdownCtx.Done():
 				return
+			case <-cm.evictSignal:
 			case <-time.After(wait):
 			}
 			cm.runWatermarkEviction(cm.shutdownCtx)
 		}
 	})
+}
+
+// signalEvictionPressure wakes the watermark evictor now instead of at the next
+// sweep. A write burst can cross the high watermark and hit the hard capacity
+// limit well inside one 15s interval, and a write that finds no headroom evicts
+// synchronously — the caller waits on a cloud durability probe per candidate.
+// Nudging the background loop as soon as usage enters the band keeps that
+// foreground path rare rather than merely bounded.
+//
+// Non-blocking on a depth-1 channel: a full buffer already means a sweep is
+// pending, and coalescing bursts is the desired behavior.
+func (cm *DefaultCacheManager) signalEvictionPressure() {
+	if cm.evictSignal == nil {
+		return
+	}
+	select {
+	case cm.evictSignal <- struct{}{}:
+	default:
+	}
+}
+
+// maybeSignalEvictionPressure signals when internal usage is inside the
+// eviction band. Deliberately checks only our own accounting: device pressure
+// needs a statfs syscall, which is too much to pay on every write, and the
+// periodic sweep still covers that case.
+func (cm *DefaultCacheManager) maybeSignalEvictionPressure() {
+	if cm.config.MaxNVMeSize <= 0 || cm.config.WatermarkEvictDisabled {
+		return
+	}
+	used, capacity := cm.Stats()
+	if capacity > 0 && used*100 >= capacity*watermarkHighPct {
+		cm.signalEvictionPressure()
+	}
 }
 
 // nvmePressurePct returns the effective pressure percentage: the max of our
