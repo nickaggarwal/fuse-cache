@@ -24,7 +24,7 @@ func TestEvictionSafe_SizeMismatchBlocksEviction(t *testing.T) {
 	cm.Evict(context.Background(), TierNVMe)
 
 	cm.mu.RLock()
-	_, alive := cm.entries["/v2.bin"]
+	_, alive := cm.entries.get("/v2.bin")
 	cm.mu.RUnlock()
 	if !alive {
 		t.Fatal("evicted local copy against a different-size cloud version")
@@ -156,8 +156,8 @@ func TestRehydrateNVMeAccounting(t *testing.T) {
 	}
 	cm.mu.RLock()
 	used := cm.nvmeUsed
-	e := cm.entries["/old-whole.bin"]
-	nested := cm.entries["/sub/dir/nested.bin"]
+	e, _ := cm.entries.get("/old-whole.bin")
+	nested, _ := cm.entries.get("/sub/dir/nested.bin")
 	cm.mu.RUnlock()
 	if used != 2000+3000+1024+500 {
 		t.Fatalf("nvmeUsed = %d, want %d", used, 2000+3000+1024+500)
@@ -191,8 +191,8 @@ func TestRehydratedEntriesEvictOnlyWhenCloudConfirms(t *testing.T) {
 	cm.rehydrateNVMeAccounting()
 	// Make /durable.bin the older (preferred) eviction candidate.
 	cm.mu.Lock()
-	cm.entries["/durable.bin"].LastAccessed = time.Now().Add(-2 * time.Hour)
-	cm.entries["/local-only.bin"].LastAccessed = time.Now().Add(-1 * time.Hour)
+	mustEntry(t, cm, "/durable.bin").LastAccessed = time.Now().Add(-2 * time.Hour)
+	mustEntry(t, cm, "/local-only.bin").LastAccessed = time.Now().Add(-1 * time.Hour)
 	used := cm.nvmeUsed
 	cm.mu.Unlock()
 	if used != 6000 {
@@ -203,8 +203,8 @@ func TestRehydratedEntriesEvictOnlyWhenCloudConfirms(t *testing.T) {
 	cm.Evict(ctx, TierNVMe)
 
 	cm.mu.RLock()
-	_, durableAlive := cm.entries["/durable.bin"]
-	_, localAlive := cm.entries["/local-only.bin"]
+	_, durableAlive := cm.entries.get("/durable.bin")
+	_, localAlive := cm.entries.get("/local-only.bin")
 	cm.mu.RUnlock()
 	if durableAlive {
 		t.Fatal("cloud-confirmed rehydrated entry should have been evicted")

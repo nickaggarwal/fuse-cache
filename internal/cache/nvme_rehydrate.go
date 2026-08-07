@@ -89,10 +89,10 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 	var bytes int64
 	cm.mu.Lock()
 	for _, f := range files {
-		if existing, ok := cm.entries[f.key]; ok && existing != nil {
+		if existing, ok := cm.entries.get(f.key); ok && existing != nil {
 			continue
 		}
-		cm.entries[f.key] = &CacheEntry{
+		cm.entries.put(&CacheEntry{
 			FilePath:    f.key,
 			StoragePath: f.key,
 			Size:        f.size,
@@ -101,7 +101,7 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 			LastAccessed: f.modTime,
 			Tier:         TierNVMe,
 			// Not marked persisted: evictionSafe's cloud probe decides.
-		}
+		})
 		cm.nvmeUsed += f.size
 		adopted++
 		bytes += f.size

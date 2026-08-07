@@ -298,7 +298,10 @@ type DefaultCacheManager struct {
 	nvmeStorage  TierStorage
 	peerStorage  TierStorage
 	cloudStorage TierStorage
-	entries      map[string]*CacheEntry
+	// entries indexes local metadata by path, plus parent->chunks and
+	// directory->children so delete/lookup/readdir are point lookups rather
+	// than scans of every cached object. Mutate only via put/del.
+	entries      *entryTable
 	nvmeUsed     int64
 	mu           sync.RWMutex
 	rangeMu      sync.RWMutex
@@ -481,7 +484,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	cm := &DefaultCacheManager{
 		config:           config,
-		entries:          make(map[string]*CacheEntry),
+		entries:          newEntryTable(),
 		logger:           log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
 		metrics:          NewCacheMetrics(),
 		rangeChunks:      make(map[string]*chunkFileCache),
@@ -628,7 +631,7 @@ func (cm *DefaultCacheManager) goBackground(fn func()) {
 func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*CacheEntry, error) {
 	// Check if this is a chunked file
 	cm.mu.RLock()
-	if entry, ok := cm.entries[filePath]; ok && entry.IsChunked {
+	if entry, ok := cm.entries.get(filePath); ok && entry.IsChunked {
 		cm.mu.RUnlock()
 		result, err := cm.getChunked(ctx, entry)
 		if err == nil {
@@ -694,7 +697,7 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 // without recursion.
 func (cm *DefaultCacheManager) GetLocal(ctx context.Context, filePath string) (*CacheEntry, error) {
 	cm.mu.RLock()
-	entry, ok := cm.entries[filePath]
+	entry, ok := cm.entries.get(filePath)
 	chunked := ok && entry != nil && entry.IsChunked
 	cm.mu.RUnlock()
 
@@ -765,7 +768,7 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 		return "", 0, 0, false
 	}
 	cm.mu.RLock()
-	entry, hasParent := cm.entries[parent]
+	entry, hasParent := cm.entries.get(parent)
 	var size int64
 	var chunked bool
 	var chunkSize int64
@@ -879,8 +882,8 @@ func (cm *DefaultCacheManager) lookupFileSizeHint(filePath string) (int64, bool)
 	return 0, false
 }
 
-func lookupEntrySizeLocked(entries map[string]*CacheEntry, filePath string) (int64, bool) {
-	entry, ok := entries[filePath]
+func lookupEntrySizeLocked(entries *entryTable, filePath string) (int64, bool) {
+	entry, ok := entries.get(filePath)
 	if !ok || entry == nil {
 		return 0, false
 	}
@@ -1150,7 +1153,7 @@ func (cm *DefaultCacheManager) WriteTo(ctx context.Context, filePath string, w i
 	var isChunked bool
 	var numChunks int64
 	var wantSize int64
-	if entry, ok := cm.entries[filePath]; ok && entry != nil {
+	if entry, ok := cm.entries.get(filePath); ok && entry != nil {
 		isChunked = entry.IsChunked
 		numChunks = entry.NumChunks
 		wantSize = entry.Size
@@ -1227,7 +1230,7 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 	if err := cm.putToNVMeWithEviction(ctx, entry); err == nil {
 		entry.Tier = TierNVMe
 		cm.mu.Lock()
-		cm.entries[entry.FilePath] = entry
+		cm.entries.put(entry)
 		cm.mu.Unlock()
 
 		cm.metrics.RecordWrite(int64(len(entry.Data)))
@@ -1290,7 +1293,7 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		if res.err == nil {
 			cm.mu.Lock()
 			entry.Tier = res.tier
-			cm.entries[entry.FilePath] = entry
+			cm.entries.put(entry)
 			cm.mu.Unlock()
 			cm.metrics.RecordWrite(int64(len(entry.Data)))
 			tier := res.tier
@@ -1367,7 +1370,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &chunkMeta
+		cm.entries.put(&chunkMeta)
 		cm.mu.Unlock()
 		cm.metrics.RecordWrite(chunkEntry.Size)
 		remaining -= toRead
@@ -1384,7 +1387,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 		ChunkSize:    cm.config.ChunkSize,
 	}
 	cm.mu.Lock()
-	cm.entries[filePath] = meta
+	cm.entries.put(meta)
 	cm.mu.Unlock()
 	cm.goBackground(func() { cm.publishFileLocation(context.Background(), meta, TierNVMe) })
 	fp, nc := filePath, numChunks
@@ -1465,7 +1468,7 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 
 	cm.mu.Lock()
 	cm.removeChunkEntriesLocked(filePath)
-	cm.entries[filePath] = entry
+	cm.entries.put(entry)
 	cm.nvmeUsed += size
 	cm.mu.Unlock()
 	cm.metrics.RecordWrite(size)
@@ -1483,7 +1486,7 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	cm.invalidateRangeCache(filePath)
 
 	cm.mu.RLock()
-	entry, exists := cm.entries[filePath]
+	entry, exists := cm.entries.get(filePath)
 	cm.mu.RUnlock()
 	if !exists {
 		return errors.New("file not found in cache")
@@ -1503,7 +1506,7 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 
 func (cm *DefaultCacheManager) deleteSingleEntry(ctx context.Context, filePath string, ignoreMissing bool) error {
 	cm.mu.RLock()
-	entry, exists := cm.entries[filePath]
+	entry, exists := cm.entries.get(filePath)
 	cm.mu.RUnlock()
 	if !exists || entry == nil {
 		if ignoreMissing {
@@ -1531,7 +1534,7 @@ func (cm *DefaultCacheManager) deleteSingleEntry(ctx context.Context, filePath s
 			cm.nvmeUsed = 0
 		}
 	}
-	delete(cm.entries, filePath)
+	cm.entries.del(filePath)
 	cm.mu.Unlock()
 	return nil
 }
@@ -1545,7 +1548,7 @@ func (cm *DefaultCacheManager) touchEntries(paths ...string) {
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
-		if entry, ok := cm.entries[path]; ok && entry != nil {
+		if entry, ok := cm.entries.get(path); ok && entry != nil {
 			entry.LastAccessed = now
 		}
 	}
@@ -1579,12 +1582,12 @@ func (cm *DefaultCacheManager) collectLocalDeleteTargets(filePath string, includ
 		})
 	}
 
-	if entry, ok := cm.entries[filePath]; ok && entry != nil && entry.Tier == TierNVMe {
+	if entry, ok := cm.entries.get(filePath); ok && entry != nil && entry.Tier == TierNVMe {
 		addTarget(filePath, entry.StoragePath)
 		if includeChildren && entry.IsChunked && entry.NumChunks > 0 {
 			for i := int64(0); i < entry.NumChunks; i++ {
 				chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
-				if chunkEntry, ok := cm.entries[chunkPath]; ok && chunkEntry != nil && chunkEntry.Tier == TierNVMe {
+				if chunkEntry, ok := cm.entries.get(chunkPath); ok && chunkEntry != nil && chunkEntry.Tier == TierNVMe {
 					addTarget(chunkPath, chunkEntry.StoragePath)
 					continue
 				}
@@ -1593,10 +1596,15 @@ func (cm *DefaultCacheManager) collectLocalDeleteTargets(filePath string, includ
 		}
 	}
 
+	// Chunks the parent's own NumChunks did not cover: a partially-fetched
+	// file, or one whose parent metadata is gone. The index makes this
+	// O(chunks of this file); it used to scan every cached object on every
+	// overwrite, which on a node holding one large file means one pass over
+	// thousands of chunk entries per write.
 	if includeChildren {
-		prefix := filePath + "_chunk_"
-		for key, entry := range cm.entries {
-			if !strings.HasPrefix(key, prefix) || entry == nil || entry.Tier != TierNVMe {
+		for _, key := range cm.entries.chunkKeys(filePath) {
+			entry, ok := cm.entries.get(key)
+			if !ok || entry == nil || entry.Tier != TierNVMe {
 				continue
 			}
 			addTarget(key, entry.StoragePath)
@@ -1628,14 +1636,14 @@ func (cm *DefaultCacheManager) deleteLocalNVMeFootprint(ctx context.Context, fil
 	var freed int64
 	cm.mu.Lock()
 	for _, target := range targets {
-		entry, ok := cm.entries[target.key]
+		entry, ok := cm.entries.get(target.key)
 		if !ok || entry == nil || entry.Tier != TierNVMe {
 			continue
 		}
 		if counted[target.key] {
 			freed += entry.Size
 		}
-		delete(cm.entries, target.key)
+		cm.entries.del(target.key)
 	}
 	cm.nvmeUsed -= freed
 	if cm.nvmeUsed < 0 {
@@ -1692,11 +1700,7 @@ func (cm *DefaultCacheManager) ListFresh(ctx context.Context) ([]*CacheEntry, er
 
 func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRefresh bool) ([]*CacheEntry, error) {
 	cm.mu.RLock()
-	entries := make([]*CacheEntry, 0, len(cm.entries))
-	for _, entry := range cm.entries {
-		entryCopy := *entry
-		entries = append(entries, &entryCopy)
-	}
+	entries := cm.entries.snapshot()
 	coord := cm.config.Coordinator
 	metadataFresh := !forceRefresh && time.Since(cm.metadataAt) < cm.config.MetadataRefreshTTL
 	metadataView := cm.metadataView
@@ -1720,6 +1724,19 @@ func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRef
 		return entries, nil
 	}
 
+	remote := cm.entriesFromLocations(locations)
+
+	cm.mu.Lock()
+	cm.metadataView = remote
+	cm.metadataAt = time.Now()
+	cm.mu.Unlock()
+
+	return mergeEntries(entries, remote), nil
+}
+
+// entriesFromLocations converts coordinator file locations into the metadata
+// view shape. Shared by list() and the point-lookup refresh path.
+func (cm *DefaultCacheManager) entriesFromLocations(locations []*coordinator.FileLocation) []*CacheEntry {
 	remote := make([]*CacheEntry, 0, len(locations))
 	for _, loc := range locations {
 		if loc == nil || loc.FilePath == "" {
@@ -1746,13 +1763,7 @@ func (cm *DefaultCacheManager) list(ctx context.Context, forceRefresh, strictRef
 			ChunkSize:    chunkSize,
 		})
 	}
-
-	cm.mu.Lock()
-	cm.metadataView = remote
-	cm.metadataAt = time.Now()
-	cm.mu.Unlock()
-
-	return mergeEntries(entries, remote), nil
+	return remote
 }
 
 // Evict removes the least recently accessed entries from a tier to free the given number of bytes.
@@ -1781,16 +1792,18 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 		entry *CacheEntry
 	}
 	var nvmeEntries []entryRef
-	for k, e := range cm.entries {
-		if e.Tier == TierNVMe {
-			if parentPath, ok := parentFilePathFromChunkPath(k); ok {
-				if parent, exists := cm.entries[parentPath]; exists && parent != nil && parent.Tier == TierNVMe && parent.IsChunked {
-					continue
-				}
-			}
-			nvmeEntries = append(nvmeEntries, entryRef{k, e})
+	cm.entries.each(func(k string, e *CacheEntry) bool {
+		if e == nil || e.Tier != TierNVMe {
+			return true
 		}
-	}
+		if parentPath, ok := parentFilePathFromChunkPath(k); ok {
+			if parent, exists := cm.entries.get(parentPath); exists && parent != nil && parent.Tier == TierNVMe && parent.IsChunked {
+				return true
+			}
+		}
+		nvmeEntries = append(nvmeEntries, entryRef{k, e})
+		return true
+	})
 	cm.mu.RUnlock()
 	sort.Slice(nvmeEntries, func(i, j int) bool {
 		return nvmeEntries[i].entry.LastAccessed.Before(nvmeEntries[j].entry.LastAccessed)
@@ -1834,19 +1847,19 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if e, ok := cm.entries[filePath]; ok && e != nil {
+	if e, ok := cm.entries.get(filePath); ok && e != nil {
 		e.PersistedToCloud = true
 	}
 	parentPath, isChunk := parentFilePathFromChunkPath(filePath)
 	if !isChunk {
 		return
 	}
-	parent, ok := cm.entries[parentPath]
+	parent, ok := cm.entries.get(parentPath)
 	if !ok || parent == nil || !parent.IsChunked || parent.PersistedToCloud {
 		return
 	}
 	for i := int64(0); i < parent.NumChunks; i++ {
-		ce, ok := cm.entries[chunkPathFor(parentPath, i)]
+		ce, ok := cm.entries.get(chunkPathFor(parentPath, i))
 		if !ok || ce == nil || !ce.PersistedToCloud {
 			return
 		}
@@ -2011,7 +2024,7 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry *CacheEntry) error {
 	cm.mu.RLock()
 	existingLocalSize := int64(0)
-	if existing, ok := cm.entries[entry.FilePath]; ok && existing != nil && existing.Tier == TierNVMe {
+	if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
 		if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
 			existingLocalSize = existing.Size
 		}
@@ -2024,7 +2037,7 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 		// Re-check after eviction
 		cm.mu.RLock()
 		existingLocalSize = 0
-		if existing, ok := cm.entries[entry.FilePath]; ok && existing != nil && existing.Tier == TierNVMe {
+		if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
 			if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
 				existingLocalSize = existing.Size
 			}
@@ -2041,7 +2054,7 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 	}
 
 	cm.mu.Lock()
-	if existing, ok := cm.entries[entry.FilePath]; ok && existing != nil && existing.Tier == TierNVMe {
+	if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
 		if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
 			cm.nvmeUsed -= existing.Size
 			if cm.nvmeUsed < 0 {
@@ -2180,11 +2193,8 @@ func (cm *DefaultCacheManager) putToTier(ctx context.Context, entry *CacheEntry,
 }
 
 func (cm *DefaultCacheManager) removeChunkEntriesLocked(filePath string) {
-	prefix := filePath + "_chunk_"
-	for key := range cm.entries {
-		if strings.HasPrefix(key, prefix) {
-			delete(cm.entries, key)
-		}
+	for _, key := range cm.entries.chunkKeys(filePath) {
+		cm.entries.del(key)
 	}
 }
 
@@ -2194,7 +2204,7 @@ func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, 
 		return nil, os.ErrNotExist
 	}
 	cm.mu.RLock()
-	parentMeta, hasParent := cm.entries[parentPath]
+	parentMeta, hasParent := cm.entries.get(parentPath)
 	cm.mu.RUnlock()
 	if !hasParent || parentMeta == nil {
 		return nil, os.ErrNotExist
@@ -2326,7 +2336,7 @@ func mergeEntries(local []*CacheEntry, remote []*CacheEntry) []*CacheEntry {
 // already landed.
 func (cm *DefaultCacheManager) alreadyLocalNVMe(ctx context.Context, path string, size int64) bool {
 	cm.mu.RLock()
-	existing := cm.entries[path]
+	existing, _ := cm.entries.get(path)
 	cm.mu.RUnlock()
 	return existing != nil && existing.Tier == TierNVMe && existing.Size == size &&
 		cm.nvmeStorage.Exists(ctx, path)
@@ -2352,7 +2362,7 @@ func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEn
 	}
 
 	cm.mu.Lock()
-	cm.entries[entry.FilePath] = newEntry
+	cm.entries.put(newEntry)
 	cm.mu.Unlock()
 	cm.touchEntries(entry.FilePath)
 	// These bytes came from a peer or the cloud and are now servable locally:
@@ -2392,7 +2402,7 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &chunkMeta
+		cm.entries.put(&chunkMeta)
 		cm.mu.Unlock()
 		cm.metrics.RecordWrite(chunkEntry.Size)
 	}
@@ -2407,7 +2417,7 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	entry.Checksum = ""
 
 	cm.mu.Lock()
-	cm.entries[entry.FilePath] = entry
+	cm.entries.put(entry)
 	cm.mu.Unlock()
 	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 	fp, nc := entry.FilePath, numChunks
@@ -2465,7 +2475,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	}
 
 	cm.mu.RLock()
-	entry, hasMeta := cm.entries[filePath]
+	entry, hasMeta := cm.entries.get(filePath)
 	isChunked := hasMeta && entry.IsChunked
 	cm.mu.RUnlock()
 	if !isChunked {
@@ -2695,7 +2705,7 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 
 func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath string) (*CacheEntry, bool) {
 	cm.mu.RLock()
-	if entry, ok := cm.entries[filePath]; ok && entry != nil && entry.IsChunked {
+	if entry, ok := cm.entries.get(filePath); ok && entry != nil && entry.IsChunked {
 		cm.mu.RUnlock()
 		return entry, true
 	}
@@ -2724,7 +2734,7 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 		}
 		cm.mu.RUnlock()
 		cm.mu.Lock()
-		cm.entries[filePath] = resolved
+		cm.entries.put(resolved)
 		cm.mu.Unlock()
 		return resolved, true
 	}
@@ -2762,7 +2772,7 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 			ChunkSize:    chunkSize,
 		}
 		cm.mu.Lock()
-		cm.entries[filePath] = resolved
+		cm.entries.put(resolved)
 		cm.mu.Unlock()
 		return resolved, true
 	}

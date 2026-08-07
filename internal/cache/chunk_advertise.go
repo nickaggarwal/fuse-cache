@@ -100,7 +100,7 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &chunkMeta
+		cm.entries.put(&chunkMeta)
 		cm.mu.Unlock()
 	}
 
@@ -130,7 +130,7 @@ func (cm *DefaultCacheManager) advertiseHolder(ctx context.Context, filePath str
 	// chunk hints via the parent (peerIDsForPath), and a partial holder just
 	// costs a requester one failed probe (readers already try all peers).
 	cm.mu.RLock()
-	parentEntry := cm.entries[filePath]
+	parentEntry, _ := cm.entries.get(filePath)
 	cm.mu.RUnlock()
 	size := int64(0)
 	isChunked := forceChunked

@@ -83,6 +83,16 @@ type freshLister interface {
 	ListFresh(ctx context.Context) ([]*cache.CacheEntry, error)
 }
 
+// metadataLookup is the point-lookup metadata API. FUSE resolves one path per
+// syscall, so answering from an index beats copying and scanning the whole
+// entry set (one entry per chunk) on every lookup, readdir, and getattr.
+// Optional: a cache manager without it falls back to the List-based paths.
+type metadataLookup interface {
+	LookupEntry(ctx context.Context, filePath string, forceRefresh bool) (*cache.CacheEntry, bool)
+	DirExists(ctx context.Context, path string) bool
+	ReadDir(ctx context.Context, dir string) ([]cache.DirEntry, error)
+}
+
 type streamingPutter interface {
 	PutFromReader(ctx context.Context, filePath string, r io.Reader, size int64, lastAccessed time.Time) error
 }
@@ -175,6 +185,10 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	fullPath := filepath.Join(d.path, name)
 
+	if ml, ok := d.fs.cacheManager.(metadataLookup); ok {
+		return d.lookupIndexed(ctx, ml, fullPath)
+	}
+
 	entries, err := d.fs.cacheManager.List(ctx)
 	if err != nil {
 		return nil, fuse.ENOENT
@@ -193,6 +207,26 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		}
 	}
 
+	return nil, fuse.ENOENT
+}
+
+// lookupIndexed resolves one name without materializing the entry set. It
+// keeps the old resolution order: exact file match first, directory second,
+// then one forced coordinator refresh before ENOENT.
+func (d *Dir) lookupIndexed(ctx context.Context, ml metadataLookup, fullPath string) (fs.Node, error) {
+	if entry, ok := ml.LookupEntry(ctx, fullPath, false); ok {
+		return &File{fs: d.fs, path: fullPath, entry: entry, isNew: false}, nil
+	}
+	if ml.DirExists(ctx, fullPath) {
+		return &Dir{fs: d.fs, path: fullPath}, nil
+	}
+	// On metadata miss, force a fresh coordinator snapshot before ENOENT.
+	if entry, ok := ml.LookupEntry(ctx, fullPath, true); ok {
+		return &File{fs: d.fs, path: fullPath, entry: entry, isNew: false}, nil
+	}
+	if ml.DirExists(ctx, fullPath) {
+		return &Dir{fs: d.fs, path: fullPath}, nil
+	}
 	return nil, fuse.ENOENT
 }
 
@@ -226,6 +260,22 @@ func (d *Dir) lookupNodeFromEntries(fullPath string, entries []*cache.CacheEntry
 
 // ReadDirAll reads all entries in the directory
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	if ml, ok := d.fs.cacheManager.(metadataLookup); ok {
+		children, err := ml.ReadDir(ctx, d.path)
+		if err != nil {
+			return nil, err
+		}
+		dirents := make([]fuse.Dirent, 0, len(children))
+		for _, child := range children {
+			t := fuse.DT_File
+			if child.IsDir {
+				t = fuse.DT_Dir
+			}
+			dirents = append(dirents, fuse.Dirent{Name: child.Name, Type: t})
+		}
+		return dirents, nil
+	}
+
 	entries, err := d.fs.cacheManager.List(ctx)
 	if err != nil {
 		return nil, err
@@ -276,7 +326,14 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	fullPath := filepath.Join(d.path, req.Name)
 
 	// Safe write-to-new semantics: refuse overwrite when metadata says object exists.
-	if lister, ok := d.fs.cacheManager.(freshLister); ok {
+	if ml, ok := d.fs.cacheManager.(metadataLookup); ok {
+		// forceRefresh mirrors the ListFresh this replaced; on coordinator
+		// failure LookupEntry falls back to the last good view rather than
+		// failing the create.
+		if _, exists := ml.LookupEntry(ctx, fullPath, true); exists {
+			return nil, nil, fuse.EEXIST
+		}
+	} else if lister, ok := d.fs.cacheManager.(freshLister); ok {
 		entries, err := lister.ListFresh(ctx)
 		if err != nil {
 			// Coordinator outages should not make local writes fail. Fall back to
@@ -451,8 +508,11 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	f.mu.RUnlock()
 
 	if entry == nil {
-		entries, err := f.fs.cacheManager.List(ctx)
-		if err == nil {
+		if ml, ok := f.fs.cacheManager.(metadataLookup); ok {
+			if found, exists := ml.LookupEntry(ctx, f.path, false); exists {
+				entry = found
+			}
+		} else if entries, err := f.fs.cacheManager.List(ctx); err == nil {
 			for _, listed := range entries {
 				if listed.FilePath == f.path {
 					entry = listed

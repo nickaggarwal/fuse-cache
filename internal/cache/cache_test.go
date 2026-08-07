@@ -115,7 +115,7 @@ func newTestCacheManager() *DefaultCacheManager {
 		nvmeStorage:    nvme,
 		peerStorage:    peer,
 		cloudStorage:   cloud,
-		entries:        make(map[string]*CacheEntry),
+		entries:        newEntryTable(),
 		logger:         log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
 		metrics:        NewCacheMetrics(),
 		rangeChunks:    make(map[string]*chunkFileCache),
@@ -171,7 +171,7 @@ func TestCacheManager_Delete(t *testing.T) {
 
 	// Verify entry removed from entries map
 	cm.mu.RLock()
-	_, exists := cm.entries["/del.txt"]
+	_, exists := cm.entries.get("/del.txt")
 	cm.mu.RUnlock()
 
 	if exists {
@@ -199,7 +199,7 @@ func TestCacheManager_DeleteChunkedParentRemovesChunks(t *testing.T) {
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &chunkMeta
+		cm.entries.put(&chunkMeta)
 		cm.mu.Unlock()
 	}
 
@@ -213,7 +213,7 @@ func TestCacheManager_DeleteChunkedParentRemovesChunks(t *testing.T) {
 		NumChunks:    2,
 	}
 	cm.mu.Lock()
-	cm.entries[parent.FilePath] = parent
+	cm.entries.put(parent)
 	cm.mu.Unlock()
 
 	if err := cm.Delete(ctx, parent.FilePath); err != nil {
@@ -221,9 +221,9 @@ func TestCacheManager_DeleteChunkedParentRemovesChunks(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	_, parentExists := cm.entries[parent.FilePath]
-	_, chunk0Exists := cm.entries["/chunked.bin_chunk_0"]
-	_, chunk1Exists := cm.entries["/chunked.bin_chunk_1"]
+	_, parentExists := cm.entries.get(parent.FilePath)
+	_, chunk0Exists := cm.entries.get("/chunked.bin_chunk_0")
+	_, chunk1Exists := cm.entries.get("/chunked.bin_chunk_1")
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 
@@ -286,13 +286,13 @@ func TestCacheManager_DeleteFallsBackToFilePathWhenStoragePathMissing(t *testing
 	}
 
 	cm.mu.Lock()
-	cm.entries[filePath] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     filePath,
 		StoragePath:  "",
 		Size:         1,
 		LastAccessed: time.Now(),
 		Tier:         TierNVMe,
-	}
+	})
 	cm.nvmeUsed = 1
 	cm.mu.Unlock()
 
@@ -308,7 +308,7 @@ func TestCacheManager_DeleteFallsBackToFilePathWhenStoragePathMissing(t *testing
 	}
 
 	cm.mu.RLock()
-	_, exists := cm.entries[filePath]
+	_, exists := cm.entries.get(filePath)
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 
@@ -360,7 +360,7 @@ func TestCacheManager_Evict(t *testing.T) {
 		}
 		cm.nvmeStorage.Write(ctx, entry.FilePath, entry.Data)
 		cm.mu.Lock()
-		cm.entries[entry.FilePath] = entry
+		cm.entries.put(entry)
 		entry.Tier = TierNVMe
 		cm.nvmeUsed += entry.Size
 		cm.mu.Unlock()
@@ -397,7 +397,7 @@ func TestCacheManager_GetTouchesLastAccessed(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[entry.FilePath].LastAccessed = old
+	mustEntry(t, cm, entry.FilePath).LastAccessed = old
 	cm.mu.Unlock()
 
 	if _, err := cm.Get(ctx, entry.FilePath); err != nil {
@@ -405,7 +405,7 @@ func TestCacheManager_GetTouchesLastAccessed(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	got := cm.entries[entry.FilePath].LastAccessed
+	got := mustEntry(t, cm, entry.FilePath).LastAccessed
 	cm.mu.RUnlock()
 	if !got.After(old) {
 		t.Fatalf("LastAccessed = %v, want after %v", got, old)
@@ -434,12 +434,12 @@ func TestCacheManager_ReadRangeTouchesParentAndChunk(t *testing.T) {
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &chunkMeta
+		cm.entries.put(&chunkMeta)
 		cm.mu.Unlock()
 	}
 
 	cm.mu.Lock()
-	cm.entries["/range.bin"] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     "/range.bin",
 		StoragePath:  "/range.bin",
 		Size:         8,
@@ -447,7 +447,7 @@ func TestCacheManager_ReadRangeTouchesParentAndChunk(t *testing.T) {
 		Tier:         TierNVMe,
 		IsChunked:    true,
 		NumChunks:    2,
-	}
+	})
 	cm.mu.Unlock()
 
 	if _, err := cm.ReadRange(ctx, "/range.bin", 0, 4); err != nil {
@@ -455,8 +455,8 @@ func TestCacheManager_ReadRangeTouchesParentAndChunk(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	parentTouched := cm.entries["/range.bin"].LastAccessed
-	chunkTouched := cm.entries["/range.bin_chunk_0"].LastAccessed
+	parentTouched := mustEntry(t, cm, "/range.bin").LastAccessed
+	chunkTouched := mustEntry(t, cm, "/range.bin_chunk_0").LastAccessed
 	cm.mu.RUnlock()
 	if !parentTouched.After(old) {
 		t.Fatalf("parent LastAccessed = %v, want after %v", parentTouched, old)
@@ -509,13 +509,13 @@ func TestCacheManager_PromoteToNVMeReplacesExistingSize(t *testing.T) {
 		t.Fatalf("seed write: %v", err)
 	}
 	cm.mu.Lock()
-	cm.entries["/promote.txt"] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     "/promote.txt",
 		StoragePath:  "/promote.txt",
 		Size:         10,
 		LastAccessed: time.Now().Add(-1 * time.Hour),
 		Tier:         TierNVMe,
-	}
+	})
 	cm.nvmeUsed = 10
 	cm.mu.Unlock()
 
@@ -561,17 +561,17 @@ func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
 			t.Fatalf("seed chunk %d: %v", i, err)
 		}
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &CacheEntry{
+		cm.entries.put(&CacheEntry{
 			FilePath:     chunkPath,
 			StoragePath:  chunkPath,
 			Size:         int64(len(payload)),
 			LastAccessed: time.Now().Add(-1 * time.Hour),
 			Tier:         TierNVMe,
-		}
+		})
 		cm.mu.Unlock()
 	}
 	cm.mu.Lock()
-	cm.entries["/stage.bin"] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     "/stage.bin",
 		StoragePath:  "/stage.bin",
 		Size:         8,
@@ -579,7 +579,7 @@ func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
 		Tier:         TierNVMe,
 		IsChunked:    true,
 		NumChunks:    2,
-	}
+	})
 	cm.nvmeUsed = 8
 	cm.mu.Unlock()
 
@@ -594,9 +594,9 @@ func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
 
 	cm.mu.RLock()
 	used := cm.nvmeUsed
-	_, chunk0Exists := cm.entries["/stage.bin_chunk_0"]
-	_, chunk1Exists := cm.entries["/stage.bin_chunk_1"]
-	parent := cm.entries["/stage.bin"]
+	_, chunk0Exists := cm.entries.get("/stage.bin_chunk_0")
+	_, chunk1Exists := cm.entries.get("/stage.bin_chunk_1")
+	parent, _ := cm.entries.get("/stage.bin")
 	cm.mu.RUnlock()
 
 	if used != 6 {
@@ -628,17 +628,17 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 			t.Fatalf("seed chunk checksum %d: %v", i, err)
 		}
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &CacheEntry{
+		cm.entries.put(&CacheEntry{
 			FilePath:     chunkPath,
 			StoragePath:  chunkPath,
 			Size:         int64(len(payload)),
 			LastAccessed: old,
 			Tier:         TierNVMe,
-		}
+		})
 		cm.mu.Unlock()
 	}
 	cm.mu.Lock()
-	cm.entries["/evict.bin"] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     "/evict.bin",
 		StoragePath:  "/evict.bin",
 		Size:         8,
@@ -648,7 +648,7 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 		NumChunks:    2,
 		// Durable in cloud: eviction refuses to delete the only copy.
 		PersistedToCloud: true,
-	}
+	})
 	cm.nvmeUsed = 8
 	cm.mu.Unlock()
 
@@ -665,9 +665,9 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	_, parentExists := cm.entries["/evict.bin"]
-	_, chunk0Exists := cm.entries["/evict.bin_chunk_0"]
-	_, chunk1Exists := cm.entries["/evict.bin_chunk_1"]
+	_, parentExists := cm.entries.get("/evict.bin")
+	_, chunk0Exists := cm.entries.get("/evict.bin_chunk_0")
+	_, chunk1Exists := cm.entries.get("/evict.bin_chunk_1")
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 
@@ -857,7 +857,7 @@ func TestCacheManager_Get_UsesPeerFirstAt5GBBoundary(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{FilePath: path, Size: peerLimit}
+	cm.entries.put(&CacheEntry{FilePath: path, Size: peerLimit})
 	cm.mu.Unlock()
 
 	got, err := cm.Get(ctx, path)
@@ -891,7 +891,7 @@ func TestCacheManager_Get_UsesPeerFirstBelowPeerLimit(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{FilePath: path, Size: 64 * 1024 * 1024}
+	cm.entries.put(&CacheEntry{FilePath: path, Size: 64 * 1024 * 1024})
 	cm.mu.Unlock()
 
 	got, err := cm.Get(ctx, path)
@@ -931,7 +931,7 @@ func TestCacheManager_Get_ChunkUsesParentSizeHint(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[parent] = &CacheEntry{FilePath: parent, Size: peerLimit + 1}
+	cm.entries.put(&CacheEntry{FilePath: parent, Size: peerLimit + 1})
 	cm.mu.Unlock()
 
 	got, err := cm.Get(ctx, chunkPath)
@@ -990,12 +990,12 @@ func TestCacheManager_ReadRange_HybridSplitsPeerAndCloud(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      fileSize,
 		IsChunked: true,
 		NumChunks: 2,
-	}
+	})
 	cm.mu.Unlock()
 
 	got, err := cm.ReadRange(ctx, path, 0, 8)
@@ -1054,12 +1054,12 @@ func TestCacheManager_ReadRange_HybridHedgeUsesCloudWhenPeerStalls(t *testing.T)
 	}
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      fileSize,
 		IsChunked: true,
 		NumChunks: 1,
-	}
+	})
 	cm.mu.Unlock()
 
 	start := time.Now()
@@ -1092,12 +1092,12 @@ func TestCacheManager_ReadRange_DedupesConcurrentChunkFetches(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      16,
 		IsChunked: true,
 		NumChunks: 1,
-	}
+	})
 	cm.mu.Unlock()
 
 	start := make(chan struct{})
@@ -1154,7 +1154,7 @@ func TestCacheManager_ChunkedReassembly(t *testing.T) {
 
 	// Verify the entry is marked as chunked
 	cm.mu.RLock()
-	e := cm.entries["/chunked.txt"]
+	e, _ := cm.entries.get("/chunked.txt")
 	cm.mu.RUnlock()
 
 	if !e.IsChunked {
@@ -1186,7 +1186,7 @@ func TestCacheManager_PutFromReader_Chunked(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	meta := cm.entries["/stream.bin"]
+	meta, _ := cm.entries.get("/stream.bin")
 	cm.mu.RUnlock()
 	if meta == nil {
 		t.Fatalf("missing metadata entry")
@@ -1372,7 +1372,7 @@ func newLargeFileCacheManager(maxNVMe int64) *DefaultCacheManager {
 		nvmeStorage:    nvme,
 		peerStorage:    peer,
 		cloudStorage:   cloud,
-		entries:        make(map[string]*CacheEntry),
+		entries:        newEntryTable(),
 		logger:         log.New(log.Writer(), "[CACHE-LARGE] ", log.LstdFlags),
 		metrics:        NewCacheMetrics(),
 		rangeChunks:    make(map[string]*chunkFileCache),
@@ -1417,7 +1417,7 @@ func TestLargeFile_10MB(t *testing.T) {
 
 	// Verify entry is chunked
 	cm.mu.RLock()
-	e := cm.entries["/large-10mb.bin"]
+	e, _ := cm.entries.get("/large-10mb.bin")
 	cm.mu.RUnlock()
 
 	if !e.IsChunked {
@@ -1496,7 +1496,7 @@ func TestLargeFile_100MB(t *testing.T) {
 
 	// Verify chunking
 	cm.mu.RLock()
-	e := cm.entries["/large-100mb.bin"]
+	e, _ := cm.entries.get("/large-100mb.bin")
 	cm.mu.RUnlock()
 
 	if !e.IsChunked {
@@ -1544,7 +1544,7 @@ func TestLargeFile_100MB(t *testing.T) {
 
 	// Verify everything is cleaned up
 	cm.mu.RLock()
-	remaining := len(cm.entries)
+	remaining := cm.entries.len()
 	cm.mu.RUnlock()
 	if remaining != 0 {
 		t.Errorf("After delete, %d entries remain, want 0", remaining)
@@ -1593,7 +1593,7 @@ func TestLargeFile_1GB(t *testing.T) {
 
 	// Verify chunking
 	cm.mu.RLock()
-	e := cm.entries["/large-1gb.bin"]
+	e, _ := cm.entries.get("/large-1gb.bin")
 	cm.mu.RUnlock()
 
 	if !e.IsChunked {
@@ -1773,12 +1773,12 @@ func TestCacheManager_ReadRange_AdaptivePrefetchPopulatesCache(t *testing.T) {
 		}
 	}
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      4 * numChunks,
 		IsChunked: true,
 		NumChunks: numChunks,
-	}
+	})
 	cm.mu.Unlock()
 
 	got, err := cm.ReadRange(ctx, path, 0, 4)

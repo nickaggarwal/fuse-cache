@@ -26,7 +26,7 @@ func newStreamPromoteManager(t testing.TB, maxNVMe int64) (*DefaultCacheManager,
 		nvmeStorage:      nvme,
 		peerStorage:      newMockStorage(),
 		cloudStorage:     newMockStorage(),
-		entries:          make(map[string]*CacheEntry),
+		entries:          newEntryTable(),
 		logger:           log.New(io.Discard, "", 0),
 		metrics:          NewCacheMetrics(),
 		rangeChunks:      make(map[string]*chunkFileCache),
@@ -61,7 +61,7 @@ func TestStreamPromotion_CommitLandsFileAndAccounting(t *testing.T) {
 		t.Fatalf("landed bytes mismatch: %d vs %d", len(got), len(payload))
 	}
 	cm.mu.RLock()
-	entry := cm.entries["/f.bin"]
+	entry, _ := cm.entries.get("/f.bin")
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 	if entry == nil || entry.Tier != TierNVMe || entry.Size != int64(len(payload)) {
@@ -88,7 +88,7 @@ func TestStreamPromotion_ShortBodyNeverLands(t *testing.T) {
 		t.Fatalf("short.bin should not exist, stat err=%v", err)
 	}
 	cm.mu.RLock()
-	_, exists := cm.entries["/short.bin"]
+	_, exists := cm.entries.get("/short.bin")
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 	if exists || used != 0 {
@@ -152,7 +152,7 @@ func TestStreamPromotion_SkipsAlreadyLocal(t *testing.T) {
 		t.Fatalf("seed write: %v", err)
 	}
 	cm.mu.Lock()
-	cm.entries["/dup.bin"] = &CacheEntry{FilePath: "/dup.bin", Size: int64(len(payload)), Tier: TierNVMe}
+	cm.entries.put(&CacheEntry{FilePath: "/dup.bin", Size: int64(len(payload)), Tier: TierNVMe})
 	cm.mu.Unlock()
 
 	if _, ok := cm.BeginPromotion("/dup.bin", int64(len(payload))); ok {

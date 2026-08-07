@@ -31,7 +31,7 @@ func startTestPeerGRPCServer(t *testing.T) (pb.PeerServiceClient, *DefaultCacheM
 		nvmeStorage:  newMockStorage(),
 		peerStorage:  newMockStorage(),
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(log.Writer(), "[GRPC-TEST] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
 	}
@@ -185,13 +185,13 @@ func TestPeerGRPC_DeleteFile(t *testing.T) {
 	// Write directly to NVMe only (no background cloud persist)
 	cm.nvmeStorage.Write(ctx, "/delete-me.txt", []byte("hello"))
 	cm.mu.Lock()
-	cm.entries["/delete-me.txt"] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:     "/delete-me.txt",
 		Size:         5,
 		LastAccessed: time.Now(),
 		Tier:         TierNVMe,
 		Data:         []byte("hello"),
-	}
+	})
 	cm.mu.Unlock()
 
 	_, err := client.DeleteFile(ctx, &pb.DeleteFileRequest{Path: "/delete-me.txt"})
@@ -201,7 +201,7 @@ func TestPeerGRPC_DeleteFile(t *testing.T) {
 
 	// Verify it's gone from the cache entries
 	cm.mu.RLock()
-	_, exists := cm.entries["/delete-me.txt"]
+	_, exists := cm.entries.get("/delete-me.txt")
 	cm.mu.RUnlock()
 	if exists {
 		t.Error("file should be deleted from cache entries")

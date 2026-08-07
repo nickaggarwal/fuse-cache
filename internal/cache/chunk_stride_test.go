@@ -104,13 +104,13 @@ func TestReadRange_LegacyStrideMismatchDoesNotPanic(t *testing.T) {
 	cm, whole := newStrideTestManager(t, path)
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      int64(len(whole)),
 		IsChunked: true,
 		NumChunks: int64(len(strideTestChunks())),
 		// ChunkSize deliberately unset: metadata written before the field existed.
-	}
+	})
 	cm.mu.Unlock()
 
 	for offset := 0; offset <= len(whole); offset++ {
@@ -134,13 +134,13 @@ func TestWriteTo_ShortAssemblyIsAnError(t *testing.T) {
 	cm, whole := newStrideTestManager(t, path)
 
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  path,
 		Size:      int64(len(whole)),
 		IsChunked: true,
 		NumChunks: int64(len(strideTestChunks())) / 2, // e.g. count derived from the wrong stride
 		ChunkSize: strideTestChunk,
-	}
+	})
 	cm.mu.Unlock()
 
 	var buf bytes.Buffer

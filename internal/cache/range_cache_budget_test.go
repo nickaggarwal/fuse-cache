@@ -17,7 +17,7 @@ func newRangeBudgetManager(t testing.TB, perFileMax, globalMax int64) *DefaultCa
 			RangeCacheGlobalMaxBytes: globalMax,
 			RangeCacheIdleExpiry:     time.Minute,
 		},
-		entries:     make(map[string]*CacheEntry),
+		entries:     newEntryTable(),
 		logger:      log.New(io.Discard, "", 0),
 		metrics:     NewCacheMetrics(),
 		rangeChunks: make(map[string]*chunkFileCache),

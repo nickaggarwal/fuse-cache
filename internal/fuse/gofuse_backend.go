@@ -277,6 +277,27 @@ func (n *goFuseNode) Readdir(ctx context.Context) (gfs.DirStream, syscall.Errno)
 	if n.kind != goFuseNodeDir {
 		return nil, syscall.ENOTDIR
 	}
+
+	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
+		children, err := ml.ReadDir(ctx, n.path)
+		if err != nil {
+			return nil, syscall.EIO
+		}
+		dirents := make([]gfuse.DirEntry, 0, len(children))
+		for _, child := range children {
+			mode := uint32(syscall.S_IFREG)
+			if child.IsDir {
+				mode = syscall.S_IFDIR
+			}
+			dirents = append(dirents, gfuse.DirEntry{
+				Name: child.Name,
+				Mode: mode,
+				Ino:  pathToInode(filepath.Join(n.path, child.Name)),
+			})
+		}
+		return gfs.NewListDirStream(dirents), 0
+	}
+
 	entries, err := n.gfs.cacheManager.List(ctx)
 	if err != nil {
 		return nil, syscall.EIO
@@ -911,6 +932,18 @@ func (n *goFuseNode) resolveEntry(ctx context.Context) *cache.CacheEntry {
 
 	// Size=0 for an existing file is often stale metadata while chunk manifests
 	// are converging; prefer a fresh coordinator-backed view first.
+	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
+		entry, found := ml.LookupEntry(ctx, n.path, true)
+		if !found {
+			return nil
+		}
+		n.mu.Lock()
+		n.entry = entry
+		n.mu.Unlock()
+		entryCopy := *entry
+		return &entryCopy
+	}
+
 	if lister, ok := n.gfs.cacheManager.(freshLister); ok {
 		freshEntries, err := lister.ListFresh(ctx)
 		if err == nil {
@@ -939,6 +972,10 @@ func (n *goFuseNode) resolveEntry(ctx context.Context) *cache.CacheEntry {
 }
 
 func (n *goFuseNode) fileExists(ctx context.Context, fullPath string) bool {
+	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
+		_, exists := ml.LookupEntry(ctx, fullPath, true)
+		return exists
+	}
 	if lister, ok := n.gfs.cacheManager.(freshLister); ok {
 		entries, err := lister.ListFresh(ctx)
 		if err == nil {
@@ -965,6 +1002,30 @@ func (n *goFuseNode) fileExists(ctx context.Context, fullPath string) bool {
 }
 
 func (n *goFuseNode) lookupNodeFromPath(ctx context.Context, fullPath string) (*goFuseNode, bool) {
+	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
+		// Size<=0 for a file means metadata is still converging; force a
+		// refresh rather than exposing a stale EOF-sized file.
+		entry, found := ml.LookupEntry(ctx, fullPath, false)
+		if found && entry.Size <= 0 {
+			if fresh, ok := ml.LookupEntry(ctx, fullPath, true); ok {
+				entry = fresh
+			}
+		}
+		if found {
+			return &goFuseNode{gfs: n.gfs, path: fullPath, kind: goFuseNodeFile, entry: entry}, true
+		}
+		if ml.DirExists(ctx, fullPath) {
+			return &goFuseNode{gfs: n.gfs, path: fullPath, kind: goFuseNodeDir}, true
+		}
+		if entry, ok := ml.LookupEntry(ctx, fullPath, true); ok {
+			return &goFuseNode{gfs: n.gfs, path: fullPath, kind: goFuseNodeFile, entry: entry}, true
+		}
+		if ml.DirExists(ctx, fullPath) {
+			return &goFuseNode{gfs: n.gfs, path: fullPath, kind: goFuseNodeDir}, true
+		}
+		return nil, false
+	}
+
 	entries, err := n.gfs.cacheManager.List(ctx)
 	if err != nil {
 		return nil, false

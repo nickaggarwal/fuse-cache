@@ -62,19 +62,19 @@ func startHerdPeer(t *testing.T, gateCap int, entries map[string][]byte) (addr s
 		nvmeStorage:   newMockStorage(),
 		peerStorage:   newMockStorage(),
 		cloudStorage:  newMockStorage(),
-		entries:       make(map[string]*CacheEntry),
+		entries:       newEntryTable(),
 		logger:        log.New(io.Discard, "", 0),
 		metrics:       NewCacheMetrics(),
 		peerServeGate: newPeerServeGate(gateCap),
 	}
 	cm.shutdownCtx, cm.shutdownCancel = context.WithCancel(context.Background())
 	for p, data := range entries {
-		cm.entries[p] = &CacheEntry{
+		cm.entries.put(&CacheEntry{
 			FilePath:     p,
 			Size:         int64(len(data)),
 			LastAccessed: time.Now(),
 			Data:         data,
-		}
+		})
 		// GetLocal serves from the NVMe tier, so back the entry with data there.
 		if err := cm.nvmeStorage.Write(context.Background(), p, data); err != nil {
 			t.Fatalf("seed nvme: %v", err)
@@ -286,7 +286,7 @@ func TestPeerWrite_SkipsBusyTargetAndStaggers(t *testing.T) {
 	stored := 0
 	for _, cm := range []*DefaultCacheManager{okCM1, okCM2} {
 		cm.mu.RLock()
-		if _, ok := cm.entries["/repl.bin"]; ok {
+		if _, ok := cm.entries.get("/repl.bin"); ok {
 			stored++
 		}
 		cm.mu.RUnlock()
@@ -295,7 +295,7 @@ func TestPeerWrite_SkipsBusyTargetAndStaggers(t *testing.T) {
 		t.Fatalf("replicas on non-busy peers = %d, want 2", stored)
 	}
 	busyCM.mu.RLock()
-	_, onBusy := busyCM.entries["/repl.bin"]
+	_, onBusy := busyCM.entries.get("/repl.bin")
 	busyCM.mu.RUnlock()
 	if onBusy {
 		t.Fatal("busy peer should not have received a replica")
@@ -340,7 +340,7 @@ func TestPeerWrite_ContextCancelledDuringStagger(t *testing.T) {
 	written := 0
 	for _, cm := range []*DefaultCacheManager{okCM, okCM2} {
 		cm.mu.RLock()
-		if _, ok := cm.entries["/partial.bin"]; ok {
+		if _, ok := cm.entries.get("/partial.bin"); ok {
 			written++
 		}
 		cm.mu.RUnlock()

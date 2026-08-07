@@ -55,19 +55,19 @@ func benchCacheManagerWithWholeFile(tb testing.TB, chunkSize int64, numChunks in
 		nvmeStorage:  nvme,
 		peerStorage:  newMockStorage(),
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
 		hybridHints:  make(map[string]hybridReadHint),
 		tierPerf:     newTierPerfTracker(),
 	}
-	cm.entries[parent] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  parent,
 		Size:      total,
 		IsChunked: true,
 		NumChunks: numChunks,
-	}
+	})
 	return cm, parent, numChunks
 }
 
@@ -188,14 +188,14 @@ func TestPeerServe_GRPCReadFile_CorrectBytes(t *testing.T) {
 		nvmeStorage:  nvme,
 		peerStorage:  newMockStorage(),
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
 		hybridHints:  make(map[string]hybridReadHint),
 		tierPerf:     newTierPerfTracker(),
 	}
-	cm.entries[parent] = &CacheEntry{FilePath: parent, Size: int64(len(content)), IsChunked: true, NumChunks: 4}
+	cm.entries.put(&CacheEntry{FilePath: parent, Size: int64(len(content)), IsChunked: true, NumChunks: 4})
 
 	client, cleanup := startBufconnPeerServer(t, cm)
 	defer cleanup()

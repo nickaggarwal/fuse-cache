@@ -74,20 +74,21 @@ func (cm *DefaultCacheManager) hotLocalObjects(now time.Time) []reconcileCandida
 	cutoff := now.Add(-reconcileHotWindow)
 	var out []reconcileCandidate
 	cm.mu.RLock()
-	for path, entry := range cm.entries {
+	cm.entries.each(func(path string, entry *CacheEntry) bool {
 		if entry == nil || entry.LastAccessed.Before(cutoff) {
-			continue
+			return true
 		}
 		// Chunk entries propagate with their parent; skip to keep coordinator
 		// lookups at parent granularity (metadata is published per parent).
 		if _, isChunk := parentFilePathFromChunkPath(path); isChunk {
-			continue
+			return true
 		}
 		if entry.Size <= 0 || entry.Size > reconcileMaxObjectBytes {
-			continue
+			return true
 		}
 		out = append(out, reconcileCandidate{path: path, size: entry.Size, lastAccessed: entry.LastAccessed})
-	}
+		return true
+	})
 	cm.mu.RUnlock()
 	// Most-recently-accessed first so the hottest objects get the pass budget
 	// (map iteration order is random).

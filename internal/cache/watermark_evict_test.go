@@ -26,7 +26,7 @@ func evictTestManager(t *testing.T, maxNVMe int64) *DefaultCacheManager {
 		nvmeStorage:  nvme,
 		peerStorage:  newMockStorage(),
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
@@ -48,11 +48,11 @@ func seedNVMe(t *testing.T, cm *DefaultCacheManager, path string, size int, pers
 		cm.cloudStorage.Write(context.Background(), path, data)
 	}
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath: path, StoragePath: path, Size: int64(size),
 		LastAccessed: time.Now().Add(-age), Tier: TierNVMe,
 		PersistedToCloud: persisted,
-	}
+	})
 	cm.nvmeUsed += int64(size)
 	cm.mu.Unlock()
 }
@@ -72,8 +72,8 @@ func TestEvict_SkipsUnpersistedFiles(t *testing.T) {
 	}
 
 	cm.mu.RLock()
-	_, unpersistedAlive := cm.entries["/unpersisted-old.bin"]
-	_, midAlive := cm.entries["/persisted-mid.bin"]
+	_, unpersistedAlive := cm.entries.get("/unpersisted-old.bin")
+	_, midAlive := cm.entries.get("/persisted-mid.bin")
 	used := cm.nvmeUsed
 	cm.mu.RUnlock()
 
@@ -104,7 +104,7 @@ func TestEvict_CloudProbeRescuesRestartedEntries(t *testing.T) {
 	cm.Evict(context.Background(), TierNVMe)
 
 	cm.mu.RLock()
-	_, restartedAlive := cm.entries["/restarted.bin"]
+	_, restartedAlive := cm.entries.get("/restarted.bin")
 	cm.mu.RUnlock()
 	if restartedAlive {
 		t.Fatal("cloud-confirmed entry should have been evicted after probe")
@@ -117,17 +117,17 @@ func TestMarkPersisted_ChunkedParentAggregation(t *testing.T) {
 	cm := evictTestManager(t, 1<<30)
 	parent := "/p.bin"
 	cm.mu.Lock()
-	cm.entries[parent] = &CacheEntry{FilePath: parent, Size: 3072, IsChunked: true, NumChunks: 3, Tier: TierNVMe}
+	cm.entries.put(&CacheEntry{FilePath: parent, Size: 3072, IsChunked: true, NumChunks: 3, Tier: TierNVMe})
 	for i := int64(0); i < 3; i++ {
 		cp := chunkPathFor(parent, i)
-		cm.entries[cp] = &CacheEntry{FilePath: cp, Size: 1024, Tier: TierNVMe}
+		cm.entries.put(&CacheEntry{FilePath: cp, Size: 1024, Tier: TierNVMe})
 	}
 	cm.mu.Unlock()
 
 	cm.markPersistedToCloud(chunkPathFor(parent, 0))
 	cm.markPersistedToCloud(chunkPathFor(parent, 2))
 	cm.mu.RLock()
-	parentFlagged := cm.entries[parent].PersistedToCloud
+	parentFlagged := mustEntry(t, cm, parent).PersistedToCloud
 	cm.mu.RUnlock()
 	if parentFlagged {
 		t.Fatal("parent flagged with a chunk still unpersisted")
@@ -135,7 +135,7 @@ func TestMarkPersisted_ChunkedParentAggregation(t *testing.T) {
 
 	cm.markPersistedToCloud(chunkPathFor(parent, 1))
 	cm.mu.RLock()
-	parentFlagged = cm.entries[parent].PersistedToCloud
+	parentFlagged = mustEntry(t, cm, parent).PersistedToCloud
 	cm.mu.RUnlock()
 	if !parentFlagged {
 		t.Fatal("parent not flagged after all chunks persisted")
@@ -165,8 +165,8 @@ func TestWatermarkEviction_TriggersAboveHighWatermark(t *testing.T) {
 	}
 	// Oldest files went first.
 	cm.mu.RLock()
-	_, oldestAlive := cm.entries["/f0.bin"]
-	_, newestAlive := cm.entries["/f8.bin"]
+	_, oldestAlive := cm.entries.get("/f0.bin")
+	_, newestAlive := cm.entries.get("/f8.bin")
 	cm.mu.RUnlock()
 	if oldestAlive || !newestAlive {
 		t.Fatalf("LRU order violated: oldest=%v newest=%v", oldestAlive, newestAlive)
@@ -192,7 +192,7 @@ func TestWatermarkEviction_IdleBelowWatermark(t *testing.T) {
 		t.Fatal("evictor ran below the high watermark")
 	}
 	cm.mu.RLock()
-	_, alive := cm.entries["/small.bin"]
+	_, alive := cm.entries.get("/small.bin")
 	cm.mu.RUnlock()
 	if !alive {
 		t.Fatal("file evicted below watermark")

@@ -53,7 +53,7 @@ func completionTestManager(t *testing.T, numChunks int64, chunkSize int64, missi
 		nvmeStorage:  nvme,
 		peerStorage:  peer,
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
@@ -61,14 +61,14 @@ func completionTestManager(t *testing.T, numChunks int64, chunkSize int64, missi
 		tierPerf:     newTierPerfTracker(),
 		shutdownCtx:  shutdownCtx,
 	}
-	cm.entries[parent] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath: parent, Size: int64(len(full)), IsChunked: true, NumChunks: numChunks,
-	}
+	})
 	// Local chunk entries for the seeded ones.
 	for i := int64(0); i < numChunks; i++ {
 		if !missing[i] {
 			cp := fmt.Sprintf("%s_chunk_%d", parent, i)
-			cm.entries[cp] = &CacheEntry{FilePath: cp, Size: chunkSize, Tier: TierNVMe}
+			cm.entries.put(&CacheEntry{FilePath: cp, Size: chunkSize, Tier: TierNVMe})
 			cm.nvmeUsed += chunkSize
 		}
 	}
@@ -105,7 +105,7 @@ func TestChunkCompletion_AssemblesWholeFile(t *testing.T) {
 			t.Fatalf("chunk file %d not retired", i)
 		}
 		cm.mu.RLock()
-		_, hasEntry := cm.entries[cp]
+		_, hasEntry := cm.entries.get(cp)
 		cm.mu.RUnlock()
 		if hasEntry {
 			t.Fatalf("chunk entry %d not removed", i)
@@ -221,7 +221,7 @@ func TestBusyRetry_RecoversWithoutCloud(t *testing.T) {
 		nvmeStorage:  nvme,
 		peerStorage:  peer,
 		cloudStorage: cloud,
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),
@@ -262,7 +262,7 @@ func TestBusyRetry_StillBusySurfacesError(t *testing.T) {
 		nvmeStorage:  nvme,
 		peerStorage:  alwaysBusyStorage{newMockStorage()},
 		cloudStorage: newMockStorage(),
-		entries:      make(map[string]*CacheEntry),
+		entries:      newEntryTable(),
 		logger:       log.New(io.Discard, "", 0),
 		metrics:      NewCacheMetrics(),
 		rangeChunks:  make(map[string]*chunkFileCache),

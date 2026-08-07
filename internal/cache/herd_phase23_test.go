@@ -231,7 +231,7 @@ func TestPromoteChunkAndAdvertise_MakesChunkServable(t *testing.T) {
 
 	parent := "/adv.bin"
 	cm.mu.Lock()
-	cm.entries[parent] = &CacheEntry{FilePath: parent, Size: 12, IsChunked: true, NumChunks: 3}
+	cm.entries.put(&CacheEntry{FilePath: parent, Size: 12, IsChunked: true, NumChunks: 3})
 	cm.mu.Unlock()
 
 	data := []byte("chunk-1-data")
@@ -326,7 +326,7 @@ func TestReconcile_TopsUpUnderReplicatedHotObject(t *testing.T) {
 		t.Fatalf("seed nvme: %v", err)
 	}
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe}
+	cm.entries.put(&CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe})
 	cm.mu.Unlock()
 	coord.locations[path] = []*coordinator.FileLocation{
 		{FilePath: path, PeerID: "local-node", StorageTier: "nvme"},
@@ -338,7 +338,7 @@ func TestReconcile_TopsUpUnderReplicatedHotObject(t *testing.T) {
 	replicated := 0
 	for _, peerCM := range []*DefaultCacheManager{okCM1, okCM2} {
 		peerCM.mu.RLock()
-		if _, ok := peerCM.entries[path]; ok {
+		if _, ok := peerCM.entries.get(path); ok {
 			replicated++
 		}
 		peerCM.mu.RUnlock()
@@ -377,7 +377,7 @@ func TestReconcile_SkipsSatisfiedAndColdObjects(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 		cm.mu.Lock()
-		cm.entries[path] = &CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: accessed, Tier: TierNVMe}
+		cm.entries.put(&CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: accessed, Tier: TierNVMe})
 		cm.mu.Unlock()
 	}
 
@@ -396,8 +396,8 @@ func TestReconcile_SkipsSatisfiedAndColdObjects(t *testing.T) {
 	cm.reconcileReplicasOnce(context.Background())
 
 	okCM.mu.RLock()
-	_, hasSatisfied := okCM.entries["/satisfied.bin"]
-	_, hasCold := okCM.entries["/cold.bin"]
+	_, hasSatisfied := okCM.entries.get("/satisfied.bin")
+	_, hasCold := okCM.entries.get("/cold.bin")
 	okCM.mu.RUnlock()
 	if hasSatisfied {
 		t.Fatal("satisfied object must not be re-replicated")
@@ -439,7 +439,7 @@ func TestReconcile_BudgetCapsWork(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 		cm.mu.Lock()
-		cm.entries[path] = &CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe}
+		cm.entries.put(&CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe})
 		cm.mu.Unlock()
 		coord.locations[path] = []*coordinator.FileLocation{
 			{FilePath: path, PeerID: "local-node", StorageTier: "nvme"},
@@ -451,11 +451,12 @@ func TestReconcile_BudgetCapsWork(t *testing.T) {
 	total := 0
 	for _, peerCM := range []*DefaultCacheManager{okCM1, okCM2} {
 		peerCM.mu.RLock()
-		for path := range peerCM.entries {
+		peerCM.entries.each(func(path string, _ *CacheEntry) bool {
 			if path == "/hot-a.bin" || path == "/hot-b.bin" {
 				total++
 			}
-		}
+			return true
+		})
 		peerCM.mu.RUnlock()
 	}
 	if total != 1 {
@@ -489,7 +490,7 @@ func TestReconcile_HeatBoostRaisesTarget(t *testing.T) {
 		t.Fatalf("seed nvme: %v", err)
 	}
 	cm.mu.Lock()
-	cm.entries[path] = &CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe}
+	cm.entries.put(&CacheEntry{FilePath: path, Size: int64(len(payload)), LastAccessed: time.Now(), Tier: TierNVMe})
 	cm.mu.Unlock()
 	coord.locations[path] = []*coordinator.FileLocation{
 		{FilePath: path, PeerID: "local-node", StorageTier: "nvme"},
@@ -498,7 +499,7 @@ func TestReconcile_HeatBoostRaisesTarget(t *testing.T) {
 	// No heat: base target 1 is satisfied, nothing replicates.
 	cm.reconcileReplicasOnce(context.Background())
 	okCM.mu.RLock()
-	_, present := okCM.entries[path]
+	_, present := okCM.entries.get(path)
 	okCM.mu.RUnlock()
 	if present {
 		t.Fatal("satisfied object replicated without heat")
@@ -510,7 +511,7 @@ func TestReconcile_HeatBoostRaisesTarget(t *testing.T) {
 	cm.reconcileReplicasOnce(context.Background())
 
 	okCM.mu.RLock()
-	_, present = okCM.entries[path]
+	_, present = okCM.entries.get(path)
 	okCM.mu.RUnlock()
 	if !present {
 		t.Fatal("heat-boosted object was not replicated")

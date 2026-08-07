@@ -40,7 +40,7 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 		return
 	}
 	cm.mu.RLock()
-	entry := cm.entries[filePath]
+	entry, _ := cm.entries.get(filePath)
 	cm.mu.RUnlock()
 	if entry == nil || !entry.IsChunked || entry.NumChunks <= 0 || entry.Size <= 0 {
 		return
@@ -225,18 +225,18 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	// Whole file is live: account it, then retire the chunk files.
 	now := time.Now()
 	cm.mu.Lock()
-	if parent, ok := cm.entries[filePath]; ok && parent != nil {
+	if parent, ok := cm.entries.get(filePath); ok && parent != nil {
 		parent.Tier = TierNVMe
 		parent.LastAccessed = now
 		if parent.ChunkSize <= 0 {
 			parent.ChunkSize = chunkSize
 		}
 	} else {
-		cm.entries[filePath] = &CacheEntry{
+		cm.entries.put(&CacheEntry{
 			FilePath: filePath, StoragePath: filePath, Size: size,
 			LastAccessed: now, Tier: TierNVMe, IsChunked: true, NumChunks: numChunks,
 			ChunkSize: chunkSize,
-		}
+		})
 	}
 	cm.nvmeUsed += size
 	cm.mu.Unlock()
@@ -251,7 +251,7 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 		// completed file leaked numChunks orphan .sha256 files on NVMe.
 		_ = cm.nvmeStorage.Delete(ctx, cp+".sha256")
 		cm.mu.Lock()
-		delete(cm.entries, cp)
+		cm.entries.del(cp)
 		if serr == nil {
 			cm.nvmeUsed -= chunkBytes
 			if cm.nvmeUsed < 0 {
@@ -361,7 +361,7 @@ func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chu
 		meta := *landed
 		meta.Data = nil
 		cm.mu.Lock()
-		cm.entries[chunkPath] = &meta
+		cm.entries.put(&meta)
 		cm.mu.Unlock()
 		cm.metrics.RecordWrite(landed.Size)
 		cm.advertisePromoted(chunkPath)

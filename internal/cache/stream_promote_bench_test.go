@@ -83,9 +83,9 @@ func BenchmarkPeerReceive_StreamingTee(b *testing.B) {
 		// (steady-state fetches are of chunks not yet local). Cheap unlink,
 		// same for both benchmarks' fairness since the old path overwrites.
 		cm.mu.Lock()
-		if e := cm.entries[path]; e != nil {
+		if e, ok := cm.entries.get(path); ok && e != nil {
 			cm.nvmeUsed -= e.Size
-			delete(cm.entries, path)
+			cm.entries.del(path)
 		}
 		cm.mu.Unlock()
 		cm.nvmeStorage.Delete(ctx, path)

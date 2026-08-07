@@ -23,12 +23,12 @@ func TestGetLocal_ServesChunkFromWholeFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "whole.bin"), content, 0o644); err != nil {
 		t.Fatalf("write whole file: %v", err)
 	}
-	cm.entries[parent] = &CacheEntry{
+	cm.entries.put(&CacheEntry{
 		FilePath:  parent,
 		Size:      int64(len(content)),
 		IsChunked: true,
 		NumChunks: 3,
-	}
+	})
 
 	cases := []struct {
 		chunk int

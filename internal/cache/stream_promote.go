@@ -123,7 +123,7 @@ func (sp *streamPromotion) Commit() {
 		Tier:         TierNVMe,
 	}
 	sp.cm.mu.Lock()
-	if existing, ok := sp.cm.entries[sp.path]; ok && existing != nil && existing.Tier == TierNVMe {
+	if existing, ok := sp.cm.entries.get(sp.path); ok && existing != nil && existing.Tier == TierNVMe {
 		// Replaced an object we were already accounting for.
 		sp.cm.nvmeUsed -= existing.Size
 		if sp.cm.nvmeUsed < 0 {
@@ -131,7 +131,7 @@ func (sp *streamPromotion) Commit() {
 		}
 	}
 	sp.cm.nvmeUsed += sp.size
-	sp.cm.entries[sp.path] = meta
+	sp.cm.entries.put(meta)
 	sp.cm.mu.Unlock()
 }
 
