@@ -2,6 +2,10 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +31,69 @@ func (ns *NVMeStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	fullPath := filepath.Join(ns.basePath, strings.TrimPrefix(path, "/"))
 	return os.ReadFile(fullPath)
 }
+
+// Open opens path for ranged reading. The caller must Close the result.
+//
+// Read() is the wrong primitive for serving FUSE, which asks for one ~128KiB
+// window at a time; answering each with a whole-file read costs
+// filesize/windowsize the bytes the caller asked for. Everything the ranged
+// path needs — size, identity, content hash, the bytes themselves — comes off
+// this one descriptor, so a concurrent overwrite (Write renames a new file
+// over the old one) cannot slip between the checks and the read: the handle
+// keeps referring to the inode it was opened on.
+func (ns *NVMeStorage) Open(path string) (*NVMeFileReader, error) {
+	f, err := os.Open(filepath.Join(ns.basePath, strings.TrimPrefix(path, "/")))
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		f.Close()
+		return nil, os.ErrInvalid
+	}
+	return &NVMeFileReader{f: f, info: info}, nil
+}
+
+// NVMeFileReader is an open handle to one file on NVMe.
+type NVMeFileReader struct {
+	f    *os.File
+	info os.FileInfo
+}
+
+func (r *NVMeFileReader) Size() int64 { return r.info.Size() }
+
+// ModTimeNanos is half of the identity used to tell one version of a file from
+// the next; Write renames a fully-written temp file into place, so replaced
+// content always arrives with a fresh mtime.
+func (r *NVMeFileReader) ModTimeNanos() int64 { return r.info.ModTime().UnixNano() }
+
+// ReadAt reads up to len(p) bytes at off. A short read at EOF is not an error.
+func (r *NVMeFileReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.f.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	return n, nil
+}
+
+// Hash streams the SHA-256 of the whole file. Unlike hashing what Read
+// returned, it holds one buffer rather than the entire object.
+func (r *NVMeFileReader) Hash() (string, error) {
+	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, r.f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (r *NVMeFileReader) Close() error { return r.f.Close() }
 
 func (ns *NVMeStorage) Write(ctx context.Context, path string, data []byte) error {
 	fullPath := filepath.Join(ns.basePath, strings.TrimPrefix(path, "/"))

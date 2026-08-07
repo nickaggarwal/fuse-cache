@@ -301,7 +301,11 @@ type DefaultCacheManager struct {
 	// entries indexes local metadata by path, plus parent->chunks and
 	// directory->children so delete/lookup/readdir are point lookups rather
 	// than scans of every cached object. Mutate only via put/del.
-	entries      *entryTable
+	entries *entryTable
+	// nvmeVerify remembers which local files have had their sidecar checksum
+	// checked, so serving a file through many small FUSE reads hashes it once
+	// rather than once per read.
+	nvmeVerify   nvmeVerifier
 	nvmeUsed     int64
 	mu           sync.RWMutex
 	rangeMu      sync.RWMutex
@@ -1626,6 +1630,10 @@ func (cm *DefaultCacheManager) deleteLocalNVMeFootprint(ctx context.Context, fil
 	storage := cm.getStorageForTier(TierNVMe)
 	counted := make(map[string]bool, len(targets))
 	for _, target := range targets {
+		// Every removal of a local copy goes through here — delete, overwrite,
+		// eviction — so it is the one place the verification record has to be
+		// dropped for the ranged read path to never serve a stale approval.
+		cm.nvmeVerify.forget(target.key)
 		counted[target.key] = storage.Exists(ctx, target.deletePath)
 		if err := storage.Delete(ctx, target.deletePath); err != nil && !isDeleteNotFoundError(err) {
 			return 0, err
@@ -2491,9 +2499,24 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	chunkSize := cm.effectiveChunkSize(entry)
 
 	if !isChunked {
+		// Serve the window straight off the local file when we hold it.
+		// Falling through to Get() reads and hashes the whole object for every
+		// ~128KiB FUSE window, so an 8MB file read end to end moved 512MB.
+		if out, ok := cm.readWholeFileRange(ctx, filePath, offset, size); ok {
+			dur := time.Since(started)
+			cm.metrics.RecordHit(TierNVMe)
+			cm.metrics.RecordTierRead(TierNVMe, int64(len(out)), dur)
+			cm.metrics.RecordReadWall(int64(len(out)), dur, int64(len(out)), 0, 0)
+			return out, nil
+		}
 		got, err := cm.Get(ctx, filePath)
 		if err != nil {
 			return nil, err
+		}
+		if got.Tier == TierNVMe {
+			// Get() verified the sidecar; remember it so the rest of this
+			// file's windows take the ranged path above.
+			cm.noteNVMeVerified(filePath)
 		}
 		if offset >= int64(len(got.Data)) {
 			return []byte{}, nil
@@ -3503,6 +3526,14 @@ func (cm *DefaultCacheManager) logReadRangeSnapshot(
 }
 
 func (cm *DefaultCacheManager) invalidateRangeCache(filePath string) {
+	// The verification record is keyed on (size, mtime), so replaced content
+	// would not match it anyway; dropping it here keeps the two caches
+	// invalidated by the same call rather than relying on that.
+	cm.nvmeVerify.forget(filePath)
+	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
+		cm.nvmeVerify.forget(parent)
+	}
+
 	cm.rangeMu.Lock()
 	cm.dropFileCacheLocked(filePath)
 	if parent, ok := parentFilePathFromChunkPath(filePath); ok {
