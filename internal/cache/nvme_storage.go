@@ -181,6 +181,27 @@ func (w *NVMeStreamWriter) Abort() {
 	os.Remove(w.tmpName)
 }
 
+// Move relocates path's bytes to newPath within this volume, creating the
+// destination directory as needed. It is an os.Rename, so the inode — and
+// therefore every open descriptor, and the mtime the verification record is
+// keyed on — survives, and no bytes are read or written.
+//
+// A rename is the only way to move a large object cheaply. Read-then-Write
+// costs the file twice through the page cache, and for a chunked 50GB object
+// that is 100GB of I/O to change a name.
+func (ns *NVMeStorage) Move(ctx context.Context, path, newPath string) error {
+	_ = ctx
+	from := filepath.Join(ns.basePath, strings.TrimPrefix(path, "/"))
+	to := filepath.Join(ns.basePath, strings.TrimPrefix(newPath, "/"))
+	if from == to {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
+		return err
+	}
+	return os.Rename(from, to)
+}
+
 func (ns *NVMeStorage) Delete(ctx context.Context, path string) error {
 	fullPath := filepath.Join(ns.basePath, strings.TrimPrefix(path, "/"))
 	return os.Remove(fullPath)

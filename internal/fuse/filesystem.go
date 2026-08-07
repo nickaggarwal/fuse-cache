@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -103,6 +104,46 @@ type stagedWriteFileCreator interface {
 
 type stagedFilePutter interface {
 	PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error
+}
+
+// entryRenamer moves a file by re-keying its metadata and renaming its local
+// bytes. Optional: without it rename falls back to read-write-delete, which
+// for a chunked file means buffering the whole object in RAM and re-uploading
+// every chunk.
+type entryRenamer interface {
+	Rename(ctx context.Context, oldPath, newPath string) error
+}
+
+// renameEntry moves oldPath to newPath, preferring the cache manager's
+// metadata move and falling back to copy-then-delete. Shared by both FUSE
+// backends, which had byte-identical rename implementations.
+//
+// A cache.ErrNotFound return means the source does not exist (ENOENT to the
+// caller); anything else is a move that failed (EIO). That is the only
+// distinction either backend's rename drew.
+func renameEntry(ctx context.Context, cm cache.CacheManager, logger *log.Logger, oldPath, newPath string) error {
+	if renamer, ok := cm.(entryRenamer); ok {
+		return renamer.Rename(ctx, oldPath, newPath)
+	}
+
+	entry, err := cm.Get(ctx, oldPath)
+	if err != nil {
+		return fmt.Errorf("%w: %v", cache.ErrNotFound, err)
+	}
+	newEntry := &cache.CacheEntry{
+		FilePath:     newPath,
+		StoragePath:  newPath,
+		Size:         entry.Size,
+		LastAccessed: time.Now(),
+		Data:         entry.Data,
+	}
+	if err := cm.Put(ctx, newEntry); err != nil {
+		return err
+	}
+	if err := cm.Delete(ctx, oldPath); err != nil {
+		logger.Printf("Rename: failed to delete old path %s: %v", oldPath, err)
+	}
+	return nil
 }
 
 // NewFileSystem creates a new FUSE filesystem
@@ -391,27 +432,12 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	}
 	newPath := filepath.Join(newDirNode.path, req.NewName)
 
-	// Get the old entry
-	entry, err := d.fs.cacheManager.Get(ctx, oldPath)
-	if err != nil {
-		return fuse.ENOENT
-	}
-
-	// Put with new path
-	newEntry := &cache.CacheEntry{
-		FilePath:     newPath,
-		StoragePath:  newPath,
-		Size:         entry.Size,
-		LastAccessed: time.Now(),
-		Data:         entry.Data,
-	}
-	if err := d.fs.cacheManager.Put(ctx, newEntry); err != nil {
+	if err := renameEntry(ctx, d.fs.cacheManager, d.fs.logger, oldPath, newPath); err != nil {
+		if errors.Is(err, cache.ErrNotFound) {
+			return fuse.ENOENT
+		}
+		d.fs.logger.Printf("Rename %s -> %s failed: %v", oldPath, newPath, err)
 		return fuse.EIO
-	}
-
-	// Delete old entry
-	if err := d.fs.cacheManager.Delete(ctx, oldPath); err != nil {
-		d.fs.logger.Printf("Rename: failed to delete old path %s: %v", oldPath, err)
 	}
 
 	d.fs.logger.Printf("Renamed %s -> %s", oldPath, newPath)

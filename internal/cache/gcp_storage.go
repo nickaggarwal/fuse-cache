@@ -89,6 +89,12 @@ func (gs *GCPStorage) Write(ctx context.Context, path string, data []byte) error
 	return err
 }
 
+// CopyObject duplicates an object inside the bucket server-side. GCS honours
+// the S3 CopyObject verb through the interoperability endpoint.
+func (gs *GCPStorage) CopyObject(ctx context.Context, srcPath, dstPath string) error {
+	return s3CopyObject(ctx, gs.s3Client, gs.bucket, srcPath, dstPath, gs.timeout)
+}
+
 func (gs *GCPStorage) Delete(ctx context.Context, path string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, gs.timeout)
 	defer cancel()

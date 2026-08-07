@@ -393,22 +393,12 @@ func (n *goFuseNode) Rename(ctx context.Context, name string, newParent gfs.Inod
 	oldPath := filepath.Join(n.path, name)
 	newPath := filepath.Join(dstParent.path, newName)
 
-	entry, err := n.gfs.cacheManager.Get(ctx, oldPath)
-	if err != nil {
-		return syscall.ENOENT
-	}
-	newEntry := &cache.CacheEntry{
-		FilePath:     newPath,
-		StoragePath:  newPath,
-		Size:         entry.Size,
-		LastAccessed: time.Now(),
-		Data:         entry.Data,
-	}
-	if err := n.gfs.cacheManager.Put(ctx, newEntry); err != nil {
+	if err := renameEntry(ctx, n.gfs.cacheManager, n.gfs.logger, oldPath, newPath); err != nil {
+		if errors.Is(err, cache.ErrNotFound) {
+			return syscall.ENOENT
+		}
+		n.gfs.logger.Printf("Rename %s -> %s failed: %v", oldPath, newPath, err)
 		return syscall.EIO
-	}
-	if err := n.gfs.cacheManager.Delete(ctx, oldPath); err != nil {
-		n.gfs.logger.Printf("Rename: failed to delete old path %s: %v", oldPath, err)
 	}
 	return 0
 }

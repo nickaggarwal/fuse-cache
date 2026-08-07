@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -232,6 +233,12 @@ func (cs *CloudStorage) putObject(ctx context.Context, key string, data []byte) 
 	return err
 }
 
+// CopyObject duplicates an object inside the bucket server-side, so a rename
+// costs one request per object instead of a download plus an upload.
+func (cs *CloudStorage) CopyObject(ctx context.Context, srcPath, dstPath string) error {
+	return s3CopyObject(ctx, cs.s3Client, cs.bucket, srcPath, dstPath, cs.timeout)
+}
+
 func (cs *CloudStorage) Delete(ctx context.Context, path string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
@@ -293,6 +300,43 @@ func (cs *CloudStorage) Size(ctx context.Context, path string) (int64, error) {
 
 func normalizeS3Key(path string) string {
 	return strings.TrimPrefix(path, "/")
+}
+
+// s3CopyObject issues a server-side copy, shared by the S3 and GCS-interop
+// backends. The source is tried under both key spellings for the same reason
+// reads are (keyCandidates): objects written before key normalization still
+// carry the leading slash.
+func s3CopyObject(ctx context.Context, client *s3.S3, bucket, srcPath, dstPath string, timeout time.Duration) error {
+	if srcPath == dstPath {
+		return nil
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var firstErr error
+	for _, srcKey := range keyCandidates(srcPath) {
+		_, err := client.CopyObjectWithContext(timeoutCtx, &s3.CopyObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(normalizeS3Key(dstPath)),
+			// CopySource is "bucket/key" and must be URL-escaped: object keys
+			// routinely contain characters (spaces, "+") that would otherwise
+			// be reinterpreted by the service.
+			CopySource: aws.String(url.PathEscape(bucket + "/" + srcKey)),
+		})
+		if err == nil {
+			return nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if timeoutCtx.Err() != nil {
+			return err
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("s3 copy failed")
+	}
+	return firstErr
 }
 
 func keyCandidates(path string) []string {

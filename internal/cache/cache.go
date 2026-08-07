@@ -92,6 +92,9 @@ type ExtendedCacheManager interface {
 	GetLocal(ctx context.Context, filePath string) (*CacheEntry, error)
 	GetMetrics() map[string]interface{}
 	RangeCacheSnapshot() RangeCacheSnapshot
+	// Rename moves a file's metadata and local bytes without reading the
+	// contents; the cloud copy is re-pointed server-side.
+	Rename(ctx context.Context, oldPath, newPath string) error
 }
 
 // TierStorage represents storage interface for each tier
@@ -1496,7 +1499,7 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	entry, exists := cm.entries.get(filePath)
 	cm.mu.RUnlock()
 	if !exists {
-		return errors.New("file not found in cache")
+		return fmt.Errorf("delete %s: %w", filePath, ErrNotFound)
 	}
 
 	if entry.IsChunked && entry.NumChunks > 0 {
@@ -1519,7 +1522,7 @@ func (cm *DefaultCacheManager) deleteSingleEntry(ctx context.Context, filePath s
 		if ignoreMissing {
 			return nil
 		}
-		return errors.New("file not found in cache")
+		return fmt.Errorf("delete %s: %w", filePath, ErrNotFound)
 	}
 
 	storage := cm.getStorageForTier(entry.Tier)

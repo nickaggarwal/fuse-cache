@@ -13,6 +13,18 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+)
+
+const (
+	// azureCopySASTTL is how long the signed source URL handed to the copy
+	// service stays valid. The copy reads the source once, at the start.
+	azureCopySASTTL = 1 * time.Hour
+	// azureCopyPollInterval / azureCopyPollTimeout bound the wait for an
+	// async blob copy. Intra-account copies of committed blobs complete
+	// server-side almost immediately; the timeout is a backstop, not a budget.
+	azureCopyPollInterval = 250 * time.Millisecond
+	azureCopyPollTimeout  = 5 * time.Minute
 )
 
 // AzureStorage implements TierStorage for Azure Blob Storage
@@ -209,6 +221,79 @@ func (as *AzureStorage) Write(ctx context.Context, path string, data []byte) err
 		Concurrency: as.downloadConcurrency,
 	})
 	return err
+}
+
+// CopyObject duplicates a blob inside the container without the bytes passing
+// through this process. Rename uses it so moving a 50GB chunked object costs a
+// handful of control-plane calls instead of a download plus an upload.
+//
+// The copy is started asynchronously and then polled. Azure's synchronous
+// CopyFromURL caps at 256MB, which is smaller than the objects this matters
+// most for, so the async form is the only one worth having.
+func (as *AzureStorage) CopyObject(ctx context.Context, srcPath, dstPath string) error {
+	if srcPath == dstPath {
+		return nil
+	}
+	container := as.client.ServiceClient().NewContainerClient(as.containerName)
+	src := container.NewBlobClient(srcPath)
+	dst := container.NewBlobClient(dstPath)
+
+	// The service fetches the source itself, so it needs a URL it can read.
+	// GetSASURL signs with the shared key this client was built from.
+	sourceURL, err := src.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(azureCopySASTTL), nil)
+	if err != nil {
+		return fmt.Errorf("sign copy source %s: %w", srcPath, err)
+	}
+
+	startCtx, cancel := context.WithTimeout(ctx, as.timeout)
+	resp, err := dst.StartCopyFromURL(startCtx, sourceURL, nil)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if resp.CopyStatus != nil && *resp.CopyStatus == blob.CopyStatusTypeSuccess {
+		return nil
+	}
+
+	// Intra-account copies of already-committed blobs are normally immediate,
+	// but the service is allowed to take its time, and a rename that returned
+	// before the destination existed would let the source deletion race it.
+	deadline := time.Now().Add(azureCopyPollTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(azureCopyPollInterval):
+		}
+		propsCtx, propsCancel := context.WithTimeout(ctx, as.timeout)
+		props, err := dst.GetProperties(propsCtx, nil)
+		propsCancel()
+		if err != nil {
+			return err
+		}
+		if props.CopyStatus == nil {
+			// No copy in progress and the blob is readable: it landed.
+			return nil
+		}
+		switch *props.CopyStatus {
+		case blob.CopyStatusTypeSuccess:
+			return nil
+		case blob.CopyStatusTypeFailed, blob.CopyStatusTypeAborted:
+			desc := ""
+			if props.CopyStatusDescription != nil {
+				desc = *props.CopyStatusDescription
+			}
+			return fmt.Errorf("copy %s -> %s ended as %s: %s", srcPath, dstPath, *props.CopyStatus, desc)
+		}
+		if time.Now().After(deadline) {
+			if resp.CopyID != nil {
+				abortCtx, abortCancel := context.WithTimeout(context.WithoutCancel(ctx), as.timeout)
+				_, _ = dst.AbortCopyFromURL(abortCtx, *resp.CopyID, nil)
+				abortCancel()
+			}
+			return fmt.Errorf("copy %s -> %s still pending after %v", srcPath, dstPath, azureCopyPollTimeout)
+		}
+	}
 }
 
 func (as *AzureStorage) Delete(ctx context.Context, path string) error {
