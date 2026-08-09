@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"time"
 )
 
@@ -33,6 +34,11 @@ type Coordinator interface {
 	GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error)
 	ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error)
 	UpdateFileLocation(ctx context.Context, location *FileLocation) error
+	// DeleteFileLocation retracts location metadata so a deleted file stops
+	// resolving cluster-wide. wholePath drops every replica row; otherwise
+	// only the named peer's rows go. Advisory, like the rest of this
+	// interface: callers must tolerate failure.
+	DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error
 	GetPeerStats() map[string]interface{}
 }
 
@@ -216,6 +222,30 @@ func (cc *CoordinatorClient) UpdateFileLocation(ctx context.Context, location *F
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("update file location failed: %s", string(b))
+	}
+	return nil
+}
+
+func (cc *CoordinatorClient) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
+	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s", cc.addr,
+		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID))
+	if wholePath {
+		url += "&whole_path=true"
+	}
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := cc.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete file location failed: %s", string(b))
 	}
 	return nil
 }

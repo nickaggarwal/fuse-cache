@@ -122,6 +122,10 @@ func (cm *DefaultCacheManager) advertiseHolder(ctx context.Context, filePath str
 	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
 		return
 	}
+	// Advertising a deleted file re-arms the ghost the delete just retracted.
+	if cm.tombstoned(filePath) {
+		return
+	}
 	if !cm.chunkAds.shouldPublish(filePath, time.Now()) {
 		return
 	}

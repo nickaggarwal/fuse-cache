@@ -45,6 +45,9 @@ func (c *herdCoordinator) ListFileLocations(context.Context, string) ([]*coordin
 func (c *herdCoordinator) UpdateFileLocation(context.Context, *coordinator.FileLocation) error {
 	return nil
 }
+func (c *herdCoordinator) DeleteFileLocation(context.Context, string, string, bool) error {
+	return nil
+}
 func (c *herdCoordinator) GetPeerStats() map[string]interface{} { return nil }
 
 // startHerdPeer starts an in-process peer gRPC server whose manager has the
@@ -63,6 +66,7 @@ func startHerdPeer(t *testing.T, gateCap int, entries map[string][]byte) (addr s
 		peerStorage:   newMockStorage(),
 		cloudStorage:  newMockStorage(),
 		entries:       newEntryTable(),
+		tombstones:    newDeleteTombstones(),
 		logger:        log.New(io.Discard, "", 0),
 		metrics:       NewCacheMetrics(),
 		peerServeGate: newPeerServeGate(gateCap),
@@ -70,7 +74,13 @@ func startHerdPeer(t *testing.T, gateCap int, entries map[string][]byte) (addr s
 	cm.shutdownCtx, cm.shutdownCancel = context.WithCancel(context.Background())
 	for p, data := range entries {
 		cm.entries.put(&CacheEntry{
-			FilePath:     p,
+			FilePath: p,
+			// StoragePath and TierNVMe are what a real NVMe-resident entry
+			// looks like; the zero CacheTier is TierUnknown-adjacent (the iota
+			// starts after TierUnknown = -1), and paths that key off the tier —
+			// local delete among them — skip such an entry entirely.
+			StoragePath:  p,
+			Tier:         TierNVMe,
 			Size:         int64(len(data)),
 			LastAccessed: time.Now(),
 			Data:         data,

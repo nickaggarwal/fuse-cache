@@ -409,6 +409,13 @@ func (n *goFuseNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 	fullPath := filepath.Join(n.path, name)
 	if err := n.gfs.cacheManager.Delete(ctx, fullPath); err != nil {
+		// "No such file" is a reachable outcome now that delete resolves
+		// through the merged view, and reporting it as EIO breaks `rm -f`,
+		// which expects ENOENT to be the ignorable case.
+		if errors.Is(err, cache.ErrNotFound) {
+			return syscall.ENOENT
+		}
+		n.gfs.logger.Printf("Unlink %s failed: %v", fullPath, err)
 		return syscall.EIO
 	}
 	return 0

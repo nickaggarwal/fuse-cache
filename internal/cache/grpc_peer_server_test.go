@@ -32,6 +32,7 @@ func startTestPeerGRPCServer(t *testing.T) (pb.PeerServiceClient, *DefaultCacheM
 		peerStorage:  newMockStorage(),
 		cloudStorage: newMockStorage(),
 		entries:      newEntryTable(),
+		tombstones:   newDeleteTombstones(),
 		logger:       log.New(log.Writer(), "[GRPC-TEST] ", log.LstdFlags),
 		metrics:      NewCacheMetrics(),
 	}

@@ -532,19 +532,20 @@ func main() {
 
 	// Declarative warmup: a CSI session mounted with cachePolicy warmup=full
 	// prefetches its subtree into local NVMe (warmup=metadata enumerates only).
+	// The mount declares a steady state, so the intent is registered with the
+	// warm reconciler rather than executed once — it runs the first pass
+	// immediately and re-asserts it on every tick for as long as the volume is
+	// mounted. See internal/cache/warm_reconciler.go.
 	if sessMgr != nil {
 		sessMgr.SetWarmupHook(func(req session.WarmupRequest) {
 			logger.Printf("Session warmup starting: volume=%s root=%s mode=%s source=%s bandwidth=%s",
 				req.VolumeID, req.RootPath, req.Mode, req.Source, req.Bandwidth)
-			res, err := cacheManager.WarmPrefixOpts(ctx, req.RootPath, cache.WarmupOptions{
+			cacheManager.RegisterWarmIntent(req.VolumeID, req.RootPath, cache.WarmupOptions{
 				Mode: req.Mode, Source: req.Source, Bandwidth: req.Bandwidth,
 			})
-			if err != nil {
-				logger.Printf("Session warmup for volume %s failed: %v", req.VolumeID, err)
-				return
-			}
-			logger.Printf("Session warmup done: volume=%s root=%s mode=%s files=%d warmed=%d already_local=%d skipped=%d failed=%d bytes=%d",
-				req.VolumeID, req.RootPath, res.Mode, res.Files, res.Warmed, res.AlreadyLocal, res.Skipped, res.Failed, res.Bytes)
+		})
+		sessMgr.SetTeardownHook(func(volumeID string) {
+			cacheManager.ForgetWarmIntent(volumeID)
 		})
 	}
 
@@ -824,6 +825,8 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		UsedSpace:      usedSpace,
 		Status:         "active",
 		Labels:         labels,
+		// Empty outside Kubernetes; nothing downstream may require it.
+		NodeName: os.Getenv("NODE_NAME"),
 	}
 
 	// Keep retrying registration until success or shutdown.

@@ -281,3 +281,42 @@ func TestManager_WarmupHookFiresOncePerVolume(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestManager_TeardownHookFiresAtRefcountZero: the teardown hook is the signal
+// that a declared cache obligation is discharged, so it must fire exactly when
+// the session actually goes away — not on an intermediate unmount, and not
+// again on a repeat delete of an already-gone volume.
+func TestManager_TeardownHookFiresAtRefcountZero(t *testing.T) {
+	m := NewManager(t.TempDir())
+	var torn []string
+	m.SetTeardownHook(func(volumeID string) { torn = append(torn, volumeID) })
+
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := m.Create(ctx, "vol-1", "/models/llama", true, CachePolicy{Warmup: "full"}); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	if removed, err := m.Delete(ctx, "vol-1"); err != nil || removed {
+		t.Fatalf("first delete: removed=%v err=%v, want removed=false", removed, err)
+	}
+	if len(torn) != 0 {
+		t.Fatalf("teardown hook fired at refcount 1: %v", torn)
+	}
+
+	if removed, err := m.Delete(ctx, "vol-1"); err != nil || !removed {
+		t.Fatalf("second delete: removed=%v err=%v, want removed=true", removed, err)
+	}
+	if len(torn) != 1 || torn[0] != "vol-1" {
+		t.Fatalf("teardown fired %v, want exactly [vol-1]", torn)
+	}
+
+	// Delete is idempotent; a repeat must not re-fire the hook.
+	if _, err := m.Delete(ctx, "vol-1"); err != nil {
+		t.Fatalf("idempotent delete: %v", err)
+	}
+	if len(torn) != 1 {
+		t.Fatalf("teardown fired %v on a repeat delete, want it to stay [vol-1]", torn)
+	}
+}

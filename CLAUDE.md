@@ -349,6 +349,7 @@ Environment variables: `POD_IP` / `NODE_NAME` (Kubernetes downward API),
 - `PUT /api/peers/status` — heartbeat / status update
 - `GET/PUT /api/files/location` — file location metadata
 - `GET /api/stats` — cluster stats
+- `GET /api/residency?prefix=<p>` — which nodes currently hold a prefix, measured (fans out to peers, 5s TTL cache)
 - `GET /api/health` — health check
 
 **Client (`:8081+`):**
@@ -359,6 +360,7 @@ Environment variables: `POD_IP` / `NODE_NAME` (Kubernetes downward API),
 - `GET /api/cache/stats` — cache stats
 - `POST /api/cache/warm` — warm a prefix on this node (`async` ⇒ 202 + `job_id`)
 - `GET /api/cache/warm` — list async warm jobs; `GET /api/cache/warm/{id}` — one job's live progress
+- `GET /api/cache/residency?prefix=<p>` — measured local residency for a prefix (stats the disk, not location metadata)
 - `POST /api/fs/snapshot` — build a cache-warming manifest of known files
 - `POST /api/fs/restore` — rehydrate peer NVMe caches from cloud using a manifest
 - `GET /metrics` — Prometheus metrics (incl. go-fuse write-path counters)
@@ -541,3 +543,80 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
   against a live cluster.
 - Stray uncommitted files in repo root (`tmp_s3probe*.go`, test binaries,
   `client`/`coordinator`/`csi-driver` dirs) predate this work — left alone.
+
+## Session Context (August 2026): Declarative cache + routing signal
+
+Phases 1–3 of `docs/`-less plan "Declarative cache + external routing
+integration". Branch `perf-refactors`, uncommitted. The premise: the cache's
+declarative *surface* (CSI `volumeAttributes`) was real, but the mechanism
+behind it was a fire-and-forget goroutine — declared intent and actual
+residency could diverge permanently and silently, which is exactly the wrong
+failure mode when a half-warmed dataset drops the workload onto the cold path
+(JuiceFS measured 8 IOPS cold vs ~12,000 warm on 4KB random reads).
+
+**Phase 1 — reconciled warmup** (`internal/cache/warm_reconciler.go`).
+The session warmup hook now *registers an intent* rather than executing a
+warm. A ticker (`WarmReconcileInterval`, default 2min, ±50% jitter, 0
+disables) re-asserts every registered intent; the first pass runs immediately
+at registration. Modeled on `replica_reconciler.go`. Key details:
+- Busy detection reads the `PeerLoadSnapshot().FetchBusySkips` **delta across
+  the pass**, not the returned error: `WarmPrefixOpts` folds every per-file
+  failure into `res.Failed` and only returns enumeration/plan errors, so
+  `isPeerBusy(err)` there would be dead code.
+- `lastVerified` advances **only on a clean pass**. A stale-but-honest "last
+  known good at T" is routable; a fresh timestamp over unknown residency is
+  not.
+- `session.Manager` gained `SetTeardownHook`, the missing half of the
+  lifecycle — fired only when refcount hits 0, synchronously under the
+  manager lock, so "hook fired" == "obligation discharged". Teardown drops
+  the intent but deliberately **leaves the warmed bytes** (still valid cache).
+- Registry is in-memory only, matching `session.Manager`. A daemon restart
+  drops intents, and because the CSI driver short-circuits
+  `NodePublishVolume` on an existing mountpoint, nothing re-registers them.
+  That belongs with session persistence, not here.
+- Metrics: `fuse_warm_reconcile_{runs,rewarms,files_warmed,skipped_busy}_total`,
+  `fuse_warm_intents_active`. Rewarms climbing in steady state means declared
+  bytes keep being evicted — the node is oversubscribed, not the loop working.
+
+**Phase 2 — node identity** (`PeerInfo.NodeName`, proto field 10). Peers are
+keyed `POD_IP:8081`, which nothing outside the cluster network can join back
+to a Node or a scheduled Pod. Populated from `NODE_NAME`. HTTP registration
+marshals the whole struct and no store rebuilds `PeerInfo` field-by-field, so
+only the two gRPC converters needed edits. Empty on older clients and outside
+Kubernetes — never required for registration or selection (pinned by test).
+
+**Phase 3 — residency query** (`internal/cache/residency.go`,
+`internal/coordinator/residency.go`). `GET /api/residency?prefix=<p>` on the
+coordinator, `GET /api/cache/residency?prefix=<p>` on each client.
+
+The load-bearing finding: **coordinator location metadata over-claims
+residency.** A node publishes itself as a holder on write and on warm, but
+LRU eviction (`deleteLocalNVMeFootprint`) never retracts those rows — only an
+explicit delete or rename does. So a location row means "held at some point",
+and `GetWorldView` inherits the same optimism. The plan's original phrasing
+(build it on `BuildManifest`'s walk) would have shipped the same over-claim in
+a new wrapper. The only authority is each node's own disk, so the coordinator
+fans out and every node stats its enumerated files locally.
+
+Conventions the endpoint enforces, each guarding a distinct silent failure:
+- **A node that could not be asked is `unknown`, never zero.** They are
+  indistinguishable to a scorer, and one of them deroutes a healthy node on a
+  transient blip.
+- **Enumeration failure is an error (503), not an empty report.** Same
+  reasoning one level down: 0/0 reads as "holds nothing".
+- **Residency is byte-weighted, not file-counted**, and the report carries
+  measured residency *and* the intent's `LastVerified` side by side. A router
+  that sees them diverge learns something true; one shown only the claim
+  cannot.
+- 5s TTL cache + in-flight coalescing (one fan-out per prefix regardless of
+  caller count) — a router polls this request-adjacent. Peer timeout is 2s on
+  a dedicated HTTP client; `coordinatorHTTPClient`'s 5-minute timeout is sized
+  for seeding and would let one wedged peer hold a routing query open.
+- Same 75s staleness filter as warm fan-out, so a crashed-but-unexpired pod
+  isn't kept in the candidate set costing a full timeout per query.
+
+Phase 4 (llm-d EPP plugin — an Affinity-category `Scorer` returning
+`fraction`, in a separate out-of-tree module) is designed but deliberately not
+built until 1–3 land. Note the landscape moved: EPP core left GIE for
+`github.com/llm-d/llm-d-router`, and docs showing
+`Score(ctx *types.SchedulingContext, ...)` are stale.

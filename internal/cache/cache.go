@@ -292,6 +292,18 @@ type CacheConfig struct {
 	// PinnedPrefixesFn returns file-path prefixes that must not be evicted
 	// (e.g., active CSI volume mounts). Nil means nothing is pinned.
 	PinnedPrefixesFn func() []string
+
+	// WarmReconcileInterval sets how often declared CSI warmup intents are
+	// re-asserted against actual residency (warm_reconciler.go). Applying a
+	// declared warmup once at mount time leaves it wrong forever if the first
+	// pass failed or eviction later reclaimed the bytes. <=0 uses a default;
+	// WarmReconcileDisabled turns the loop off entirely.
+	WarmReconcileInterval time.Duration
+
+	// WarmReconcileDisabled stops declarative warmups from being re-asserted.
+	// The first pass still runs at mount, matching the old fire-and-forget
+	// behavior.
+	WarmReconcileDisabled bool
 }
 
 // DefaultCacheManager implements CacheManager
@@ -326,7 +338,15 @@ type DefaultCacheManager struct {
 	hedgeLimiter     chan struct{}
 	peerServeGate    *peerServeGate
 	herdStats        herdControlStats
+	deleteStats      deleteStats
+	// tombstones suppress this node's own metadata publishes for recently
+	// deleted paths, so a background persist or chunk completion that was
+	// already in flight cannot re-advertise a file that is gone.
+	tombstones *deleteTombstones
 	readerHeat       readerHeat
+	// warmIntents holds declarative CSI warmup intents this node must keep
+	// re-asserting (warm_reconciler.go).
+	warmIntents      *warmIntentRegistry
 	chunkAds         *chunkAdvertiser
 	chunkPromoteGate chan struct{}
 	tierPerf         *tierPerfTracker
@@ -502,6 +522,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 		hedgeLimiter:     make(chan struct{}, config.HybridMaxSecondaryInflight),
 		peerServeGate:    newPeerServeGate(config.PeerServeMaxInflight),
 		chunkAds:         newChunkAdvertiser(),
+		tombstones:       newDeleteTombstones(),
 		chunkPromoteGate: make(chan struct{}, chunkPromoteMaxConcurrent),
 		tierPerf:         newTierPerfTracker(),
 		evictSignal:      make(chan struct{}, 1),
@@ -575,6 +596,15 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// Steady-state replica reconciler (thundering-herd Phase 3).
 	if config.ReplicaReconcileInterval > 0 {
 		cm.startReplicaReconciler(shutdownCtx)
+	}
+
+	// Declarative warmup reconciler: re-asserts CSI-declared warmup intents so
+	// a failed first pass or later eviction cannot leave declared and actual
+	// residency silently divergent. The registry exists even when the loop is
+	// off, so intents are still recorded and the first pass still runs.
+	cm.warmIntents = newWarmIntentRegistry()
+	if !config.WarmReconcileDisabled {
+		cm.startWarmReconciler(shutdownCtx)
 	}
 
 	// Idle-expiry sweeper for the range cache: reclaims per-file chunk caches
@@ -1212,6 +1242,9 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 	if strings.TrimSpace(entry.FilePath) == "" {
 		return errors.New("empty file path")
 	}
+	// Re-creating a deleted path is legitimate, and its metadata must publish
+	// again, so a write lifts the tombstone the delete left behind.
+	cm.tombstones.clear(entry.FilePath)
 	// Many API callers only set FilePath. Keep StoragePath aligned by default.
 	if strings.TrimSpace(entry.StoragePath) == "" {
 		entry.StoragePath = entry.FilePath
@@ -1324,6 +1357,7 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	if filePath == "" {
 		return errors.New("empty file path")
 	}
+	cm.tombstones.clear(filePath)
 	if lastAccessed.IsZero() {
 		lastAccessed = time.Now()
 	}
@@ -1432,6 +1466,7 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	if strings.TrimSpace(stagedPath) == "" {
 		return errors.New("empty staged path")
 	}
+	cm.tombstones.clear(filePath)
 	if lastAccessed.IsZero() {
 		lastAccessed = time.Now()
 	}
@@ -1488,64 +1523,6 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 		fp, fp2, nc := filePath, finalPath, numChunks
 		cm.goBackground(func() { cm.persistWholeFileAsChunksToCloud(cm.shutdownCtx, fp, fp2, nc) })
 	}
-	return nil
-}
-
-// Delete removes a file from cache
-func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) error {
-	cm.invalidateRangeCache(filePath)
-
-	cm.mu.RLock()
-	entry, exists := cm.entries.get(filePath)
-	cm.mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("delete %s: %w", filePath, ErrNotFound)
-	}
-
-	if entry.IsChunked && entry.NumChunks > 0 {
-		for i := int64(0); i < entry.NumChunks; i++ {
-			chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
-			if err := cm.deleteSingleEntry(ctx, chunkPath, true); err != nil {
-				cm.logger.Printf("Chunk delete failed for %s: %v", chunkPath, err)
-			}
-		}
-	}
-
-	return cm.deleteSingleEntry(ctx, filePath, false)
-}
-
-func (cm *DefaultCacheManager) deleteSingleEntry(ctx context.Context, filePath string, ignoreMissing bool) error {
-	cm.mu.RLock()
-	entry, exists := cm.entries.get(filePath)
-	cm.mu.RUnlock()
-	if !exists || entry == nil {
-		if ignoreMissing {
-			return nil
-		}
-		return fmt.Errorf("delete %s: %w", filePath, ErrNotFound)
-	}
-
-	storage := cm.getStorageForTier(entry.Tier)
-	deletePath := entry.StoragePath
-	if strings.TrimSpace(deletePath) == "" {
-		deletePath = entry.FilePath
-	}
-	if err := storage.Delete(ctx, deletePath); err != nil && !isDeleteNotFoundError(err) {
-		return err
-	}
-	if entry.Tier == TierNVMe && entry.Checksum != "" {
-		_ = storage.Delete(ctx, deletePath+".sha256")
-	}
-
-	cm.mu.Lock()
-	if entry.Tier == TierNVMe {
-		cm.nvmeUsed -= entry.Size
-		if cm.nvmeUsed < 0 {
-			cm.nvmeUsed = 0
-		}
-	}
-	cm.entries.del(filePath)
-	cm.mu.Unlock()
 	return nil
 }
 
@@ -1995,6 +1972,15 @@ func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath stri
 			return
 		default:
 		}
+		// Re-checked every attempt, not just on entry: a delete can land
+		// between retries, and this write-through is the most reliable way to
+		// resurrect a deleted blob — the whole-file variant holds an open fd
+		// that outlives the unlink, so it would happily upload a file whose
+		// local bytes are already gone.
+		if cm.tombstoned(filePath) {
+			cm.logger.Printf("Cloud persist of %s abandoned: deleted", filePath)
+			return
+		}
 		callCtx, cancel := context.WithTimeout(ctx, cm.config.CloudTimeout)
 		err := cm.cloudStorage.Write(callCtx, filePath, data)
 		cancel()
@@ -2128,6 +2114,13 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 
 func (cm *DefaultCacheManager) publishFileLocation(ctx context.Context, entry *CacheEntry, tier CacheTier) {
 	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" || entry == nil {
+		return
+	}
+	// A publish that lands after a delete recreates the row the delete just
+	// retracted, and the ghost is back. This and advertiseHolder are the only
+	// two callers of UpdateFileLocation in the package, so guarding here
+	// covers every metadata publish rather than each call site.
+	if cm.tombstoned(entry.FilePath) {
 		return
 	}
 	location := &coordinator.FileLocation{

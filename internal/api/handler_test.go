@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -489,6 +490,64 @@ func TestFSSnapshotAndRestoreViaCloudPath(t *testing.T) {
 	}
 }
 
+// The delete counters are the only way to see that an rm left bytes behind on
+// a peer, in cloud, or in coordinator metadata — delete is best-effort and
+// returns success regardless. If they stop being exported, the failure mode
+// this whole path guards against goes silent again, so pin the exposition.
+func TestPromMetricsExportsDeleteCounters(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{
+		NVMePath:     t.TempDir(),
+		MaxNVMeSize:  1 << 20,
+		ChunkSize:    1 << 20,
+		CloudTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewCacheManager: %v", err)
+	}
+	defer cm.Shutdown()
+
+	h := NewHandler(cm, nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, metric := range []string{
+		"fuse_delete_peer_failures_total 0",
+		"fuse_delete_cloud_failures_total 0",
+		"fuse_delete_coordinator_failures_total 0",
+		"fuse_delete_resurrection_suppressed_total 0",
+	} {
+		if !strings.Contains(body, metric) {
+			t.Errorf("/metrics missing %q", metric)
+		}
+	}
+}
+
+// A CacheManager that is not a *DefaultCacheManager makes handlePromMetrics
+// return early — every snapshot below that point is on the concrete type.
+// Scrapes must still succeed rather than 500 the endpoint.
+func TestPromMetricsWithNonDefaultCacheManager(t *testing.T) {
+	h := NewHandler(newMockCacheManager(), nil, "test-peer", "")
+	router := h.SetupRoutes()
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !strings.Contains(w.Body.String(), "fuse_coordinator_available 0") {
+		t.Fatalf("/metrics body = %q, want the coordinator gauge", w.Body.String())
+	}
+}
+
 func TestNetProbeEndpoint(t *testing.T) {
 	cm := newMockCacheManager()
 	h := NewHandler(cm, nil, "test-peer", "")
@@ -506,5 +565,48 @@ func TestNetProbeEndpoint(t *testing.T) {
 	}
 	if hdr := w.Header().Get("X-Netprobe-Bytes"); hdr != "262144" {
 		t.Fatalf("X-Netprobe-Bytes = %q, want 262144", hdr)
+	}
+}
+
+// The residency endpoint is the node-local half of the cluster routing query.
+// Its contract has two halves worth pinning: a cache manager that cannot
+// answer says so with 501 rather than a zero report, and a coordinator failure
+// is a 503 rather than a report of "this node holds nothing" — the two are
+// indistinguishable to a router, and one of them would deroute the node.
+func TestCacheResidencyRequiresPrefix(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{
+		NVMePath:     t.TempDir(),
+		MaxNVMeSize:  1 << 20,
+		ChunkSize:    1 << 20,
+		CloudTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewCacheManager: %v", err)
+	}
+	defer cm.Shutdown()
+
+	router := NewHandler(cm, nil, "test-peer", "").SetupRoutes()
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/api/cache/residency", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing prefix: status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	// No coordinator configured means no enumeration, so no denominator.
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/api/cache/residency?prefix=/models", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no coordinator: status = %d, want %d (body=%s)",
+			w.Code, http.StatusServiceUnavailable, strings.TrimSpace(w.Body.String()))
+	}
+}
+
+func TestCacheResidencyUnsupportedManager(t *testing.T) {
+	router := NewHandler(newMockCacheManager(), nil, "test-peer", "").SetupRoutes()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/api/cache/residency?prefix=/models", nil))
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotImplemented)
 	}
 }

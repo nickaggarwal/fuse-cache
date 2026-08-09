@@ -173,6 +173,15 @@ func (c *GRPCCoordinatorClient) UpdateFileLocation(ctx context.Context, location
 	return err
 }
 
+func (c *GRPCCoordinatorClient) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
+	_, err := c.client.DeleteFileLocation(ctx, &pb.DeleteFileLocationRequest{
+		FilePath:  filePath,
+		PeerId:    peerID,
+		WholePath: wholePath,
+	})
+	return err
+}
+
 func (c *GRPCCoordinatorClient) GetPeerStats() map[string]interface{} {
 	resp, err := c.client.GetPeerStats(context.Background(), &pb.GetPeerStatsRequest{})
 	if err != nil {

@@ -40,6 +40,13 @@ type localPathResolver interface {
 	LocalFilePath(ctx context.Context, filePath string) (string, bool)
 }
 
+// localDeleter is the local-only half of delete. Peer RPCs resolve through it
+// for the same reason reads resolve through localGetter: to serve a peer
+// without re-entering the cluster-wide path.
+type localDeleter interface {
+	DeleteLocal(ctx context.Context, filePath string) error
+}
+
 // localChunkResolver resolves a "<parent>_chunk_N" request to a byte range in a
 // whole parent file held on this node (the FUSE-write storage model), so the
 // chunk can be streamed directly from disk with a pooled buffer instead of
@@ -252,8 +259,22 @@ func (s *PeerGRPCServer) WriteFile(stream pb.PeerService_WriteFileServer) error 
 }
 
 // DeleteFile removes a file from local storage.
+//
+// Local only, by construction — never cacheManager.Delete, which fans out to
+// every peer. A fan-out that re-entered here would make A→B become B→{A,C} and
+// so on without bound, and since Delete now removes cloud objects too, such a
+// storm would be unrecoverable. Keeping the handler local-by-type means no
+// caller can get the depth wrong; a wire flag could be forgotten (and proto3
+// silently ignores unknown fields on an old binary mid-rollout).
+//
+// One RPC per file, not per chunk: DeleteLocal removes the parent plus every
+// chunk this node holds, including chunks the caller never knew about.
 func (s *PeerGRPCServer) DeleteFile(ctx context.Context, req *pb.DeleteFileRequest) (*pb.DeleteFileResponse, error) {
-	if err := s.cacheManager.Delete(ctx, req.Path); err != nil {
+	deleter, ok := s.cacheManager.(localDeleter)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "peer delete requires a local-delete capable cache manager")
+	}
+	if err := deleter.DeleteLocal(ctx, req.Path); err != nil {
 		return nil, err
 	}
 	return &pb.DeleteFileResponse{}, nil

@@ -80,6 +80,43 @@ func TestGRPC_RegisterAndGetPeers(t *testing.T) {
 	}
 }
 
+// TestGRPC_PeerNodeNameRoundTrip: NodeName is the join key an external
+// scheduler uses to map a Kubernetes node to a fuse peer, so it has to survive
+// the proto round-trip — and its absence has to stay harmless, since peers
+// outside Kubernetes and clients older than the field will never send it.
+func TestGRPC_PeerNodeNameRoundTrip(t *testing.T) {
+	client, cleanup := startTestGRPCServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for _, p := range []*pb.PeerInfo{
+		{Id: "peer-node", Address: "10.0.0.1:8081", Status: "active", NodeName: "aks-gpu-000001"},
+		{Id: "peer-bare", Address: "10.0.0.2:8081", Status: "active"},
+	} {
+		if _, err := client.RegisterPeer(ctx, &pb.RegisterPeerRequest{Peer: p}); err != nil {
+			t.Fatalf("RegisterPeer(%s): %v", p.Id, err)
+		}
+	}
+
+	resp, err := client.GetPeers(ctx, &pb.GetPeersRequest{RequesterId: "other"})
+	if err != nil {
+		t.Fatalf("GetPeers: %v", err)
+	}
+	got := make(map[string]string, len(resp.Peers))
+	for _, p := range resp.Peers {
+		got[p.Id] = p.NodeName
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d peers, want 2 — a peer without NodeName must still register", len(got))
+	}
+	if got["peer-node"] != "aks-gpu-000001" {
+		t.Errorf("node_name = %q, want %q", got["peer-node"], "aks-gpu-000001")
+	}
+	if got["peer-bare"] != "" {
+		t.Errorf("node_name = %q for a peer that sent none, want empty", got["peer-bare"])
+	}
+}
+
 func TestGRPC_UpdatePeerStatus(t *testing.T) {
 	client, cleanup := startTestGRPCServer(t)
 	defer cleanup()
@@ -137,6 +174,50 @@ func TestGRPC_FileLocation(t *testing.T) {
 	}
 	if resp.Locations[0].FileSize != 1024 {
 		t.Errorf("file_size = %d, want 1024", resp.Locations[0].FileSize)
+	}
+}
+
+// TestGRPC_DeleteFileLocation round-trips a retraction over the default
+// transport, in both the per-peer and whole-path forms.
+func TestGRPC_DeleteFileLocation(t *testing.T) {
+	client, cleanup := startTestGRPCServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	for _, peer := range []string{"peer-1", "peer-2"} {
+		if _, err := client.UpdateFileLocation(ctx, &pb.UpdateFileLocationRequest{
+			Location: &pb.FileLocation{
+				FilePath: "/doomed.bin", PeerId: peer, StorageTier: "nvme", FileSize: 64,
+			},
+		}); err != nil {
+			t.Fatalf("UpdateFileLocation(%s): %v", peer, err)
+		}
+	}
+
+	if _, err := client.DeleteFileLocation(ctx, &pb.DeleteFileLocationRequest{
+		FilePath: "/doomed.bin", PeerId: "peer-1",
+	}); err != nil {
+		t.Fatalf("DeleteFileLocation (per-peer): %v", err)
+	}
+	resp, err := client.GetFileLocation(ctx, &pb.GetFileLocationRequest{FilePath: "/doomed.bin"})
+	if err != nil {
+		t.Fatalf("GetFileLocation: %v", err)
+	}
+	if len(resp.Locations) != 1 || resp.Locations[0].PeerId != "peer-2" {
+		t.Fatalf("after per-peer retraction: %+v, want only peer-2", resp.Locations)
+	}
+
+	if _, err := client.DeleteFileLocation(ctx, &pb.DeleteFileLocationRequest{
+		FilePath: "/doomed.bin", PeerId: "peer-1", WholePath: true,
+	}); err != nil {
+		t.Fatalf("DeleteFileLocation (whole path): %v", err)
+	}
+	resp, err = client.GetFileLocation(ctx, &pb.GetFileLocationRequest{FilePath: "/doomed.bin"})
+	if err != nil {
+		t.Fatalf("GetFileLocation: %v", err)
+	}
+	if len(resp.Locations) != 0 {
+		t.Fatalf("whole-path retraction left %+v", resp.Locations)
 	}
 }
 

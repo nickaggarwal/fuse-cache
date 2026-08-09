@@ -28,6 +28,12 @@ type Store interface {
 	// filtered by prefix. Used for world-view aggregation; not a hot path.
 	RangeFileLocations(ctx context.Context, prefix string) (map[string][]*FileLocation, error)
 	PutFileLocation(ctx context.Context, loc *FileLocation) error
+	// DeleteFileLocation retracts location metadata for filePath. With
+	// wholePath the file is gone everywhere and every replica row goes with
+	// it; otherwise only peerID's own rows are dropped, which is the shape of
+	// a single node evicting its copy while the file lives on elsewhere.
+	// Deleting rows that do not exist is not an error.
+	DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error
 
 	Snapshot(ctx context.Context) (State, error)
 	Restore(ctx context.Context, state State) error
@@ -167,6 +173,43 @@ func (s *InMemoryStore) PutFileLocation(_ context.Context, loc *FileLocation) er
 	}
 	lc := *loc
 	s.fileLocations[loc.FilePath] = append(locs, &lc)
+	return nil
+}
+
+func (s *InMemoryStore) DeleteFileLocation(_ context.Context, filePath, peerID string, wholePath bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if wholePath {
+		delete(s.fileLocations, filePath)
+		// Chunk rows go with the parent, matching EtcdStore's prefix delete.
+		// The "_chunk_" suffix keeps this from eating "/a/b" when "/a" is
+		// removed — a plain prefix match would wipe a whole subtree.
+		chunkPrefix := filePath + chunkRowSuffix
+		for path := range s.fileLocations {
+			if strings.HasPrefix(path, chunkPrefix) {
+				delete(s.fileLocations, path)
+			}
+		}
+		return nil
+	}
+	locs, ok := s.fileLocations[filePath]
+	if !ok {
+		return nil
+	}
+	// A peer publishes one row per tier it holds the object in (nvme at write,
+	// cloud once persisted), so retracting "this peer's copy" means dropping
+	// every row it owns, not just one.
+	kept := locs[:0]
+	for _, loc := range locs {
+		if loc.PeerID != peerID {
+			kept = append(kept, loc)
+		}
+	}
+	if len(kept) == 0 {
+		delete(s.fileLocations, filePath)
+		return nil
+	}
+	s.fileLocations[filePath] = kept
 	return nil
 }
 

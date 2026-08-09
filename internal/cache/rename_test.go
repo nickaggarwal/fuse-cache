@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"fuse-client/internal/coordinator"
 )
 
 // renameTestManager builds a manager over a real NVMe directory, because the
@@ -398,5 +400,81 @@ func TestRename_CloudCopyFailureKeepsSources(t *testing.T) {
 	}
 	if !cloud.Exists(ctx, "/flat-new.bin") {
 		t.Fatal("destination not re-persisted from the local copy")
+	}
+}
+
+// TestRename_DropsSourceCoordinatorRows: etcd file rows carry no TTL, so a
+// source row left behind is permanent — the merged metadata view keeps serving
+// the old name as a file that still resolves and still reads. That ghost is
+// what the rename path could not fix before the coordinator had a delete.
+func TestRename_DropsSourceCoordinatorRows(t *testing.T) {
+	cm, _ := renameTestManager(t)
+	cm.tombstones = newDeleteTombstones()
+	coord := newDeleteCoordinator()
+	cm.config.Coordinator = coord
+	cm.config.LocalPeerID = "peer-a"
+	cloud := newCopyStorage()
+	cm.cloudStorage = cloud
+	seedRenameFile(t, cm, "/before.bin", 64)
+
+	ctx := context.Background()
+	cloud.Write(ctx, "/before.bin", make([]byte, 64))
+	coord.seed(&coordinator.FileLocation{
+		FilePath: "/before.bin", PeerID: "peer-a", StorageTier: "nvme", FileSize: 64,
+	})
+
+	if err := cm.Rename(ctx, "/before.bin", "/after.bin"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	cm.bgWg.Wait()
+
+	calls := coord.deleteCalls()
+	if len(calls) != 1 {
+		t.Fatalf("coordinator retractions = %v, want exactly one for the source", calls)
+	}
+	if calls[0].path != "/before.bin" || !calls[0].wholePath {
+		t.Fatalf("retraction = %+v, want whole-path on /before.bin", calls[0])
+	}
+
+	// The destination must still be published — retracting the source is not
+	// allowed to take the renamed file's own metadata with it.
+	published := false
+	for _, path := range coord.updateCalls() {
+		if path == "/after.bin" {
+			published = true
+		}
+		if path == "/before.bin" {
+			t.Fatal("source republished after the rename")
+		}
+	}
+	if !published {
+		t.Fatal("destination never published: the renamed file is invisible cluster-wide")
+	}
+}
+
+// TestRename_CloudCopyFailureKeepsSourceRows: the fallback deliberately leaves
+// the source objects in place, so their rows are still true and retracting
+// them would point readers at nothing.
+func TestRename_CloudCopyFailureKeepsSourceRows(t *testing.T) {
+	cm, _ := renameTestManager(t)
+	cm.tombstones = newDeleteTombstones()
+	coord := newDeleteCoordinator()
+	cm.config.Coordinator = coord
+	cm.config.LocalPeerID = "peer-a"
+	cloud := newCopyStorage()
+	cloud.failAll = true
+	cm.cloudStorage = cloud
+	seedRenameFile(t, cm, "/keep.bin", 64)
+
+	ctx := context.Background()
+	cloud.Write(ctx, "/keep.bin", make([]byte, 64))
+
+	if err := cm.Rename(ctx, "/keep.bin", "/keep-new.bin"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	cm.bgWg.Wait()
+
+	if calls := coord.deleteCalls(); len(calls) != 0 {
+		t.Fatalf("source rows retracted despite the copy failing: %v", calls)
 	}
 }

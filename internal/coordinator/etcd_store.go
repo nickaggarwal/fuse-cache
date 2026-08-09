@@ -21,6 +21,9 @@ const (
 	defaultPeerLeaseTTLSec = 90
 	defaultEtcdRequestTimeout = 5 * time.Second
 	maxFileLocationCASRetries = 8
+	// chunkRowSuffix is how a chunk's location key is derived from its
+	// parent's, matching the cache's "<parent>_chunk_<N>" object naming.
+	chunkRowSuffix = "_chunk_"
 )
 
 // Compile-time check that EtcdStore satisfies Store.
@@ -276,6 +279,91 @@ func (s *EtcdStore) PutFileLocation(ctx context.Context, loc *FileLocation) erro
 		}
 	}
 	return errors.New("PutFileLocation: too many CAS retries")
+}
+
+// DeleteFileLocation retracts location metadata for filePath.
+//
+// wholePath removes the file's own key and its chunk rows unconditionally —
+// no CAS. The file is gone, so there is no state to preserve, and a compare
+// would only create a window for a replica published between the read and the
+// delete to survive the retraction. The per-peer form does use CAS, since it
+// edits a list other peers are concurrently editing.
+func (s *EtcdStore) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
+	key := s.fileKey(filePath)
+
+	if wholePath {
+		if _, err := s.client.Delete(ctx, key); err != nil {
+			return err
+		}
+		// Chunked files carry a row per chunk, because the cloud persist
+		// publishes one row per cloud key and those keys are the chunk paths.
+		// A prefix delete removes all of them in one round trip; enumerating
+		// them would be ~12,800 RPCs for a 100 GB file at the 8 MiB stride.
+		//
+		// The "_chunk_" suffix on the prefix is load-bearing: a bare prefix
+		// delete on the file key would also erase /fuse/files/a/b when
+		// someone removes /a, silently wiping a whole subtree's metadata.
+		if _, err := s.client.Delete(ctx, key+chunkRowSuffix, clientv3.WithPrefix()); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	for attempt := 0; attempt < maxFileLocationCASRetries; attempt++ {
+		resp, err := s.client.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if len(resp.Kvs) == 0 {
+			// Already absent: deleting what is not there is a success.
+			return nil
+		}
+		modRev := resp.Kvs[0].ModRevision
+
+		var locs []*FileLocation
+		if err := json.Unmarshal(resp.Kvs[0].Value, &locs); err != nil {
+			return fmt.Errorf("decode file locations: %w", err)
+		}
+		kept := make([]*FileLocation, 0, len(locs))
+		for _, loc := range locs {
+			if loc.PeerID != peerID {
+				kept = append(kept, loc)
+			}
+		}
+		if len(kept) == len(locs) {
+			return nil
+		}
+
+		var op clientv3.Op
+		if len(kept) == 0 {
+			// Drop the key rather than storing "[]": an empty array still
+			// answers Get and still shows up in RangeFileLocations, so it
+			// would masquerade as a live file forever.
+			op = clientv3.OpDelete(key)
+		} else {
+			data, err := json.Marshal(kept)
+			if err != nil {
+				return err
+			}
+			op = clientv3.OpPut(key, string(data))
+		}
+
+		txnResp, err := s.client.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(key), "=", modRev)).
+			Then(op).
+			Commit()
+		if err != nil {
+			return err
+		}
+		if txnResp.Succeeded {
+			return nil
+		}
+
+		if err := sleepJitteredBackoff(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return errors.New("DeleteFileLocation: too many CAS retries")
 }
 
 // sleepJitteredBackoff sleeps for a crypto/rand-jittered, linearly growing

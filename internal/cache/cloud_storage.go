@@ -239,15 +239,30 @@ func (cs *CloudStorage) CopyObject(ctx context.Context, srcPath, dstPath string)
 	return s3CopyObject(ctx, cs.s3Client, cs.bucket, srcPath, dstPath, cs.timeout)
 }
 
+// Delete removes the object under every spelling of path that Read, Exists,
+// Size, and CopyObject are willing to find it under. Deleting only the
+// normalized key while Exists tries both would report success on an object
+// that still answers Exists — for a delete, "gone under one spelling" is not
+// gone. S3 delete is idempotent, so the extra call on the common path is a
+// no-op rather than an error.
 func (cs *CloudStorage) Delete(ctx context.Context, path string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
-	_, err := cs.s3Client.DeleteObjectWithContext(timeoutCtx, &s3.DeleteObjectInput{
-		Bucket: aws.String(cs.bucket),
-		Key:    aws.String(normalizeS3Key(path)),
-	})
-	return err
+	var firstErr error
+	for _, key := range keyCandidates(path) {
+		_, err := cs.s3Client.DeleteObjectWithContext(timeoutCtx, &s3.DeleteObjectInput{
+			Bucket: aws.String(cs.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if timeoutCtx.Err() != nil {
+			break
+		}
+	}
+	return firstErr
 }
 
 func (cs *CloudStorage) Exists(ctx context.Context, path string) bool {

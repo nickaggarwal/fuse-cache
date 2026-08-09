@@ -54,10 +54,10 @@ type renamedEntry struct {
 // Rename moves oldPath to newPath without reading or rewriting file data.
 //
 // Coordination is advisory here, as everywhere else: the coordinator learns
-// about the destination, but the source's location rows are left to age out —
-// there is no delete in the Coordinator interface, and a stale row costs one
-// miss on a peer that no longer holds the object, which the fetch path already
-// treats as stale routing rather than failure.
+// about the destination, and the source's rows are retracted best-effort. The
+// retraction matters — etcd file rows carry no TTL, so a source row left
+// behind is permanent, and the merged metadata view keeps serving the old name
+// as a file that still resolves and still reads.
 func (cm *DefaultCacheManager) Rename(ctx context.Context, oldPath, newPath string) error {
 	oldPath = strings.TrimSpace(oldPath)
 	newPath = strings.TrimSpace(newPath)
@@ -198,6 +198,9 @@ func (cm *DefaultCacheManager) moveNVMePath(ctx context.Context, oldKey, newKey 
 // because a rename must never be the reason the only durable copy disappears.
 func (cm *DefaultCacheManager) moveCloudObjects(ctx context.Context, oldPath, newPath string, parent CacheEntry) {
 	if cm.cloudStorage == nil {
+		// No durable copy to move, so nothing can be left dangling by
+		// retracting now — and the source rows are stale either way.
+		cm.retractRenamedSource(ctx, oldPath)
 		return
 	}
 	oldKeys := cloudObjectKeys(oldPath, &parent)
@@ -242,6 +245,26 @@ func (cm *DefaultCacheManager) moveCloudObjects(ctx context.Context, oldPath, ne
 		if err := cm.cloudStorage.Delete(ctx, key); err != nil && !isCloudMiss(err) && !isDeleteNotFoundError(err) {
 			cm.logger.Printf("Cloud rename left %s behind: %v", key, err)
 		}
+	}
+
+	// Source rows last, and only on the path where the copy was confirmed and
+	// the originals removed. On the repersistRenamed fallback the source
+	// objects are deliberately still there, so its rows are still true.
+	cm.retractRenamedSource(ctx, oldPath)
+}
+
+// retractRenamedSource drops the old name's coordinator rows once the rename
+// has fully resolved. Best-effort: a coordinator outage must not fail a
+// rename, per the advisory-coordination invariant.
+func (cm *DefaultCacheManager) retractRenamedSource(ctx context.Context, oldPath string) {
+	if cm.config.Coordinator == nil {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, coordinatorCallTimeout)
+	defer cancel()
+	if err := cm.config.Coordinator.DeleteFileLocation(callCtx, oldPath, cm.config.LocalPeerID, true); err != nil {
+		cm.deleteStats.coordinatorFailures.Add(1)
+		cm.logger.Printf("Rename left source rows for %s behind: %v", oldPath, err)
 	}
 }
 

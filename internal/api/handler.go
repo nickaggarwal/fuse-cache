@@ -164,6 +164,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarm).Methods("POST")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
+	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
 	router.HandleFunc("/api/fs/restore", h.handleFSRestore).Methods("POST")
 
@@ -397,6 +398,37 @@ func (h *Handler) handlePeerLatency(w http.ResponseWriter, r *http.Request) {
 		"peer_id": h.peerID,
 		"pairs":   pairs,
 	})
+}
+
+// handleCacheResidency reports how much of a prefix this node currently holds
+// on local NVMe. This is the node-local half of the cluster residency query;
+// the coordinator's /api/residency fans out to every peer and aggregates.
+//
+// The measurement is a stat per enumerated file rather than a read of
+// coordinator location metadata, because eviction does not retract location
+// rows — see internal/cache/residency.go. A caller that wanted the claim
+// already has /api/worldview.
+func (h *Handler) handleCacheResidency(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "residency not supported by this cache manager", http.StatusNotImplemented)
+		return
+	}
+	prefix := r.URL.Query().Get("prefix")
+	if strings.TrimSpace(prefix) == "" {
+		http.Error(w, "prefix is required", http.StatusBadRequest)
+		return
+	}
+	rep, err := dcm.PrefixResidency(r.Context(), prefix)
+	if err != nil {
+		// A coordinator failure means we could not enumerate, so we do not know
+		// the denominator. Reporting 0/0 would read as "node holds nothing",
+		// which is the misreading this endpoint exists to prevent.
+		http.Error(w, fmt.Sprintf("residency unavailable: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rep)
 }
 
 // handlePeer handles requests for specific peer info
@@ -871,6 +903,23 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)
+	// Declarative warmup reconciliation. rewarms/files_warmed climbing in
+	// steady state means declared-resident bytes keep being evicted — the
+	// divergence the reconciler exists to catch, and a sign the node is
+	// oversubscribed rather than a sign the loop is working.
+	fmt.Fprintf(w, "fuse_warm_reconcile_runs_total %d\n", hc.WarmReconcileRunsTotal)
+	fmt.Fprintf(w, "fuse_warm_reconcile_rewarms_total %d\n", hc.WarmReconcileRewarmsTotal)
+	fmt.Fprintf(w, "fuse_warm_reconcile_files_warmed_total %d\n", hc.WarmReconcileFilesWarmedTotal)
+	fmt.Fprintf(w, "fuse_warm_reconcile_skipped_busy_total %d\n", hc.WarmReconcileSkippedBusyTotal)
+	fmt.Fprintf(w, "fuse_warm_intents_active %d\n", len(dcm.WarmIntents()))
+	// Cluster-wide delete: every tier that can silently keep a copy after an
+	// rm. Non-zero means orphaned bytes somewhere, which is unenumerable
+	// otherwise.
+	ds := dcm.DeleteSnapshot()
+	fmt.Fprintf(w, "fuse_delete_peer_failures_total %d\n", ds.PeerFailuresTotal)
+	fmt.Fprintf(w, "fuse_delete_cloud_failures_total %d\n", ds.CloudFailuresTotal)
+	fmt.Fprintf(w, "fuse_delete_coordinator_failures_total %d\n", ds.CoordinatorFailuresTotal)
+	fmt.Fprintf(w, "fuse_delete_resurrection_suppressed_total %d\n", ds.ResurrectionSuppressedTotal)
 	fmt.Fprintf(w, "fuse_chunk_completion_assembled_total %d\n", cmx.ChunkCompletionAssembled.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_fetched_total %d\n", cmx.ChunkCompletionFetched.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", cmx.ChunkCompletionSkipped.Load())

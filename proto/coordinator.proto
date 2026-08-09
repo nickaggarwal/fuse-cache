@@ -13,6 +13,7 @@ service CoordinatorService {
   rpc UpdatePeerStatus(UpdatePeerStatusRequest) returns (UpdatePeerStatusResponse);
   rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationResponse);
   rpc UpdateFileLocation(UpdateFileLocationRequest) returns (UpdateFileLocationResponse);
+  rpc DeleteFileLocation(DeleteFileLocationRequest) returns (DeleteFileLocationResponse);
   rpc GetPeerStats(GetPeerStatsRequest) returns (GetPeerStatsResponse);
 }
 
@@ -28,6 +29,12 @@ message PeerInfo {
   // Operator-assigned labels (e.g. pool=gpu, zone=a) used for targeted
   // cache-warm fan-out and other node selection.
   map<string, string> labels = 9;
+  // Kubernetes node name (downward API NODE_NAME). Peers are keyed by
+  // POD_IP:port, which nothing outside the cluster network can join back to a
+  // Node or a scheduled Pod; this is the join key an external scheduler needs
+  // to prefer nodes that already hold a dataset. Empty on older clients and
+  // outside Kubernetes — never required for registration or selection.
+  string node_name = 10;
 }
 
 message ChunkInfo {
@@ -86,6 +93,17 @@ message UpdateFileLocationRequest {
 }
 
 message UpdateFileLocationResponse {}
+
+// DeleteFileLocationRequest retracts location metadata. With whole_path set the
+// file is gone everywhere and every replica row is dropped; otherwise only the
+// calling peer's own rows are removed (it evicted its copy, the file lives on).
+message DeleteFileLocationRequest {
+  string file_path = 1;
+  string peer_id = 2;
+  bool whole_path = 3;
+}
+
+message DeleteFileLocationResponse {}
 
 message GetPeerStatsRequest {}
 

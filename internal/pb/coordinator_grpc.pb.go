@@ -24,6 +24,7 @@ const (
 	CoordinatorService_UpdatePeerStatus_FullMethodName   = "/pb.CoordinatorService/UpdatePeerStatus"
 	CoordinatorService_GetFileLocation_FullMethodName    = "/pb.CoordinatorService/GetFileLocation"
 	CoordinatorService_UpdateFileLocation_FullMethodName = "/pb.CoordinatorService/UpdateFileLocation"
+	CoordinatorService_DeleteFileLocation_FullMethodName = "/pb.CoordinatorService/DeleteFileLocation"
 	CoordinatorService_GetPeerStats_FullMethodName       = "/pb.CoordinatorService/GetPeerStats"
 )
 
@@ -36,6 +37,7 @@ type CoordinatorServiceClient interface {
 	UpdatePeerStatus(ctx context.Context, in *UpdatePeerStatusRequest, opts ...grpc.CallOption) (*UpdatePeerStatusResponse, error)
 	GetFileLocation(ctx context.Context, in *GetFileLocationRequest, opts ...grpc.CallOption) (*GetFileLocationResponse, error)
 	UpdateFileLocation(ctx context.Context, in *UpdateFileLocationRequest, opts ...grpc.CallOption) (*UpdateFileLocationResponse, error)
+	DeleteFileLocation(ctx context.Context, in *DeleteFileLocationRequest, opts ...grpc.CallOption) (*DeleteFileLocationResponse, error)
 	GetPeerStats(ctx context.Context, in *GetPeerStatsRequest, opts ...grpc.CallOption) (*GetPeerStatsResponse, error)
 }
 
@@ -92,6 +94,15 @@ func (c *coordinatorServiceClient) UpdateFileLocation(ctx context.Context, in *U
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) DeleteFileLocation(ctx context.Context, in *DeleteFileLocationRequest, opts ...grpc.CallOption) (*DeleteFileLocationResponse, error) {
+	out := new(DeleteFileLocationResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_DeleteFileLocation_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *coordinatorServiceClient) GetPeerStats(ctx context.Context, in *GetPeerStatsRequest, opts ...grpc.CallOption) (*GetPeerStatsResponse, error) {
 	out := new(GetPeerStatsResponse)
 	err := c.cc.Invoke(ctx, CoordinatorService_GetPeerStats_FullMethodName, in, out, opts...)
@@ -110,6 +121,7 @@ type CoordinatorServiceServer interface {
 	UpdatePeerStatus(context.Context, *UpdatePeerStatusRequest) (*UpdatePeerStatusResponse, error)
 	GetFileLocation(context.Context, *GetFileLocationRequest) (*GetFileLocationResponse, error)
 	UpdateFileLocation(context.Context, *UpdateFileLocationRequest) (*UpdateFileLocationResponse, error)
+	DeleteFileLocation(context.Context, *DeleteFileLocationRequest) (*DeleteFileLocationResponse, error)
 	GetPeerStats(context.Context, *GetPeerStatsRequest) (*GetPeerStatsResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
@@ -132,6 +144,9 @@ func (UnimplementedCoordinatorServiceServer) GetFileLocation(context.Context, *G
 }
 func (UnimplementedCoordinatorServiceServer) UpdateFileLocation(context.Context, *UpdateFileLocationRequest) (*UpdateFileLocationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateFileLocation not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) DeleteFileLocation(context.Context, *DeleteFileLocationRequest) (*DeleteFileLocationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteFileLocation not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) GetPeerStats(context.Context, *GetPeerStatsRequest) (*GetPeerStatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPeerStats not implemented")
@@ -239,6 +254,24 @@ func _CoordinatorService_UpdateFileLocation_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_DeleteFileLocation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteFileLocationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).DeleteFileLocation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_DeleteFileLocation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).DeleteFileLocation(ctx, req.(*DeleteFileLocationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _CoordinatorService_GetPeerStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetPeerStatsRequest)
 	if err := dec(in); err != nil {
@@ -283,6 +316,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateFileLocation",
 			Handler:    _CoordinatorService_UpdateFileLocation_Handler,
+		},
+		{
+			MethodName: "DeleteFileLocation",
+			Handler:    _CoordinatorService_DeleteFileLocation_Handler,
 		},
 		{
 			MethodName: "GetPeerStats",

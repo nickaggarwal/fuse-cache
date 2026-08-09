@@ -68,6 +68,13 @@ func (s *GRPCServer) UpdateFileLocation(ctx context.Context, req *pb.UpdateFileL
 	return &pb.UpdateFileLocationResponse{}, nil
 }
 
+func (s *GRPCServer) DeleteFileLocation(ctx context.Context, req *pb.DeleteFileLocationRequest) (*pb.DeleteFileLocationResponse, error) {
+	if err := s.service.DeleteFileLocation(ctx, req.FilePath, req.PeerId, req.WholePath); err != nil {
+		return nil, err
+	}
+	return &pb.DeleteFileLocationResponse{}, nil
+}
+
 func (s *GRPCServer) GetPeerStats(ctx context.Context, req *pb.GetPeerStatsRequest) (*pb.GetPeerStatsResponse, error) {
 	stats := s.service.GetPeerStats()
 	return &pb.GetPeerStatsResponse{
@@ -93,6 +100,7 @@ func peerInfoToProto(p *PeerInfo) *pb.PeerInfo {
 		Status:         p.Status,
 		LastHeartbeat:  timestamppb.New(p.LastHeartbeat),
 		Labels:         p.Labels,
+		NodeName:       p.NodeName,
 	}
 }
 
@@ -111,6 +119,7 @@ func peerInfoFromProto(p *pb.PeerInfo) *PeerInfo {
 		Status:         p.Status,
 		LastHeartbeat:  lastHB,
 		Labels:         p.Labels,
+		NodeName:       p.NodeName,
 	}
 }
 

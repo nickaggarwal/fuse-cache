@@ -399,6 +399,27 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"success": true}`))
 
+		case http.MethodDelete:
+			filePath := r.URL.Query().Get("path")
+			if filePath == "" {
+				http.Error(w, "File path is required", http.StatusBadRequest)
+				return
+			}
+			wholePath := r.URL.Query().Get("whole_path") == "true"
+			peerID := r.URL.Query().Get("peer_id")
+			if !wholePath && peerID == "" {
+				http.Error(w, "peer_id is required unless whole_path is set", http.StatusBadRequest)
+				return
+			}
+
+			if err := coordinatorService.DeleteFileLocation(r.Context(), filePath, peerID, wholePath); err != nil {
+				http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"success": true}`))
+
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -616,6 +637,36 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			return
 		}
 		writeJSONResponse(w, result)
+	})
+
+	// Cluster-wide residency: which nodes currently hold a prefix, measured by
+	// asking each node's own disk rather than reading location metadata (which
+	// over-claims, because eviction never retracts it). This is the routing
+	// signal an external scheduler scores on.
+	mux.HandleFunc("/api/residency", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		prefix := r.URL.Query().Get("prefix")
+		if strings.TrimSpace(prefix) == "" {
+			http.Error(w, "prefix is required", http.StatusBadRequest)
+			return
+		}
+		// Peers may require X-API-Key. Forward the caller's own key rather than
+		// holding one here: it is the same cluster key, and a caller that could
+		// not authenticate to a peer directly should not get to do so via the
+		// coordinator.
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("api_key")
+		}
+		res, err := coordinatorService.PrefixResidency(r.Context(), prefix, apiKey)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Residency query failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, res)
 	})
 
 	// Get statistics endpoint

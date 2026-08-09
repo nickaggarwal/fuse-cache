@@ -71,8 +71,8 @@ func (m *mockStorage) Size(ctx context.Context, path string) (int64, error) {
 
 type recordingDeleteStorage struct {
 	*mockStorage
-	mu          sync.Mutex
-	lastDeleted string
+	mu      sync.Mutex
+	deleted []string
 }
 
 func newRecordingDeleteStorage() *recordingDeleteStorage {
@@ -81,7 +81,7 @@ func newRecordingDeleteStorage() *recordingDeleteStorage {
 
 func (r *recordingDeleteStorage) Delete(ctx context.Context, path string) error {
 	r.mu.Lock()
-	r.lastDeleted = path
+	r.deleted = append(r.deleted, path)
 	r.mu.Unlock()
 	if path == "" {
 		return fmt.Errorf("empty path delete")
@@ -89,10 +89,21 @@ func (r *recordingDeleteStorage) Delete(ctx context.Context, path string) error 
 	return r.mockStorage.Delete(ctx, path)
 }
 
-func (r *recordingDeleteStorage) LastDeleted() string {
+func (r *recordingDeleteStorage) DeletedPaths() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.lastDeleted
+	return append([]string(nil), r.deleted...)
+}
+
+// DeletedPath reports whether path was passed to Delete. The delete path also
+// removes the ".sha256" sidecar, so callers must not assume a single call.
+func (r *recordingDeleteStorage) DeletedPath(path string) bool {
+	for _, p := range r.DeletedPaths() {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 func newTestCacheManager() *DefaultCacheManager {
@@ -116,6 +127,7 @@ func newTestCacheManager() *DefaultCacheManager {
 		peerStorage:    peer,
 		cloudStorage:   cloud,
 		entries:        newEntryTable(),
+		tombstones:     newDeleteTombstones(),
 		logger:         log.New(log.Writer(), "[CACHE-TEST] ", log.LstdFlags),
 		metrics:        NewCacheMetrics(),
 		rangeChunks:    make(map[string]*chunkFileCache),
@@ -300,8 +312,8 @@ func TestCacheManager_DeleteFallsBackToFilePathWhenStoragePathMissing(t *testing
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if got := rec.LastDeleted(); got != filePath {
-		t.Fatalf("delete path = %q, want %q", got, filePath)
+	if !rec.DeletedPath(filePath) {
+		t.Fatalf("delete paths = %v, want to include %q", rec.DeletedPaths(), filePath)
 	}
 	if rec.Exists(ctx, filePath) {
 		t.Fatalf("file still exists in storage after delete: %s", filePath)

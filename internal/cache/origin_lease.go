@@ -42,6 +42,14 @@ type herdControlStats struct {
 	reconcileReplications atomic.Int64
 	reconcileSkippedBusy  atomic.Int64
 	reconcileHeatBoosts   atomic.Int64
+	// Declarative warmup reconciliation (warm_reconciler.go): passes run,
+	// passes that had to move bytes, files re-warmed, passes cut short by
+	// peer busy. Rewarms climbing in steady state means something is
+	// evicting warmed bytes as fast as they land.
+	warmReconcileRuns        atomic.Int64
+	warmReconcileRewarms     atomic.Int64
+	warmReconcileFilesWarmed atomic.Int64
+	warmReconcileSkippedBusy atomic.Int64
 	// Ordered chunk fallback: busy-peer retries attempted / recovered
 	// (each hit is a cloud round-trip avoided).
 	busyChunkRetries   atomic.Int64
@@ -62,6 +70,11 @@ type HerdControlSnapshot struct {
 	ReconcileHeatBoostsTotal   int64
 	BusyChunkRetriesTotal      int64
 	BusyChunkRetryHitsTotal    int64
+
+	WarmReconcileRunsTotal        int64
+	WarmReconcileRewarmsTotal     int64
+	WarmReconcileFilesWarmedTotal int64
+	WarmReconcileSkippedBusyTotal int64
 }
 
 // HerdControlSnapshot returns Phase 2/3 counters.
@@ -79,6 +92,11 @@ func (cm *DefaultCacheManager) HerdControlSnapshot() HerdControlSnapshot {
 		ReconcileHeatBoostsTotal:   cm.herdStats.reconcileHeatBoosts.Load(),
 		BusyChunkRetriesTotal:      cm.herdStats.busyChunkRetries.Load(),
 		BusyChunkRetryHitsTotal:    cm.herdStats.busyChunkRetryHits.Load(),
+
+		WarmReconcileRunsTotal:        cm.herdStats.warmReconcileRuns.Load(),
+		WarmReconcileRewarmsTotal:     cm.herdStats.warmReconcileRewarms.Load(),
+		WarmReconcileFilesWarmedTotal: cm.herdStats.warmReconcileFilesWarmed.Load(),
+		WarmReconcileSkippedBusyTotal: cm.herdStats.warmReconcileSkippedBusy.Load(),
 	}
 }
 

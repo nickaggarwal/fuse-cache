@@ -32,11 +32,12 @@ type Session struct {
 
 // Manager tracks active CSI mount sessions on this node.
 type Manager struct {
-	mu         sync.Mutex
-	sessions   map[string]*Session // keyed by VolumeID
-	fuseRoot   string              // e.g. "/host/mnt/fuse"
-	logger     *log.Logger
-	warmupHook func(WarmupRequest)
+	mu           sync.Mutex
+	sessions     map[string]*Session // keyed by VolumeID
+	fuseRoot     string              // e.g. "/host/mnt/fuse"
+	logger       *log.Logger
+	warmupHook   func(WarmupRequest)
+	teardownHook func(volumeID string)
 }
 
 // WarmupRequest describes a newly created session whose cache policy asks for
@@ -57,6 +58,23 @@ type WarmupRequest struct {
 func (m *Manager) SetWarmupHook(fn func(WarmupRequest)) {
 	m.mu.Lock()
 	m.warmupHook = fn
+	m.mu.Unlock()
+}
+
+// SetTeardownHook registers fn to run when a session's refcount reaches 0 and
+// the session is removed — the counterpart to SetWarmupHook. A declarative
+// warmup is an obligation held for as long as the volume is mounted, so
+// whatever took the obligation on needs to know when it is discharged.
+// Refcount decrements that leave the session alive do not fire it, and a
+// repeat Delete of an already-removed volume does not re-fire it.
+//
+// Called synchronously with the manager lock held, so it must be cheap and
+// must not call back into the Manager. Synchronous on purpose: it runs while
+// the session is provably gone from the map, which is what makes "hook fired"
+// equivalent to "obligation discharged" for the caller's bookkeeping.
+func (m *Manager) SetTeardownHook(fn func(volumeID string)) {
+	m.mu.Lock()
+	m.teardownHook = fn
 	m.mu.Unlock()
 }
 
@@ -143,6 +161,9 @@ func (m *Manager) Delete(_ context.Context, volumeID string) (bool, error) {
 
 	delete(m.sessions, volumeID)
 	m.logger.Printf("Session deleted: volume=%s", volumeID)
+	if m.teardownHook != nil {
+		m.teardownHook(volumeID)
+	}
 	return true, nil
 }
 

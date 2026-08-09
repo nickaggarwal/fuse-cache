@@ -56,6 +56,12 @@ type PeerInfo struct {
 	// targeted cache-warm fan-out and other selection. Set at registration
 	// via the client's -peer-labels flag / FUSE_PEER_LABELS env.
 	Labels map[string]string `json:"labels,omitempty"`
+	// NodeName is the Kubernetes node this peer runs on (downward API
+	// NODE_NAME). Peers are keyed by POD_IP:port, which no external scheduler
+	// can join back to a Node or a scheduled Pod — this is that join key.
+	// Advisory and best-effort: empty outside Kubernetes and on older clients,
+	// and never required for registration or peer selection.
+	NodeName string `json:"node_name,omitempty"`
 }
 
 // ChunkInfo represents a file chunk
@@ -93,6 +99,9 @@ type CoordinatorService struct {
 	// shutdown path can otherwise write the same temp file concurrently and
 	// rename a torn snapshot into place.
 	saveMu sync.Mutex
+	// residency memoizes the per-prefix peer fan-out behind a short TTL and
+	// coalesces concurrent queries. See residency.go.
+	residency residencyCache
 }
 
 // WorldView captures global metadata state across peers and files.
@@ -243,6 +252,21 @@ func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *
 		return err
 	}
 	cs.logger.Printf("Updated file location: %s on peer %s", location.FilePath, location.PeerID)
+	return nil
+}
+
+// DeleteFileLocation retracts file location metadata. Callers use wholePath
+// when the file itself is gone; without it only peerID's own replica rows are
+// dropped.
+func (cs *CoordinatorService) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
+	if err := cs.store.DeleteFileLocation(ctx, filePath, peerID, wholePath); err != nil {
+		return err
+	}
+	if wholePath {
+		cs.logger.Printf("Deleted file location: %s (all replicas)", filePath)
+	} else {
+		cs.logger.Printf("Deleted file location: %s on peer %s", filePath, peerID)
+	}
 	return nil
 }
 

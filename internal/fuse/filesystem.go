@@ -449,6 +449,13 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	fullPath := filepath.Join(d.path, req.Name)
 
 	if err := d.fs.cacheManager.Delete(ctx, fullPath); err != nil {
+		// ENOENT, not EIO: `rm -f` treats the former as the ignorable case,
+		// and a missing path is a reachable outcome now that delete resolves
+		// through the merged coordinator view.
+		if errors.Is(err, cache.ErrNotFound) {
+			return fuse.ENOENT
+		}
+		d.fs.logger.Printf("Remove %s failed: %v", fullPath, err)
 		return fuse.EIO
 	}
 

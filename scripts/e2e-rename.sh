@@ -81,12 +81,11 @@ else
   bad "RN-1 md5 changed: $before_md5 -> $after_md5"
 fi
 
-# The source name lingers in readdir because the coordinator has no
-# location-delete: its rows have no TTL, so the merged metadata view keeps
-# serving the old path. This is pre-existing (plain `rm` leaves the same ghost)
-# and not something rename introduced, so it is reported, not failed.
+# The source name must stop resolving. It used to linger: coordinator file rows
+# carry no TTL, and the merged metadata view kept serving the old path forever.
+# Rename now retracts the source rows, so this is a hard assertion again.
 if kx "$A" "test -e $MOUNT/rn-$RUN/src.bin" 2>/dev/null; then
-  echo "NOTE  RN-1 source name still resolves — stale coordinator row (pre-existing, see 'rm' ghost)"
+  bad "RN-1 source name still resolves after the rename (stale coordinator row)"
 else
   ok "RN-1 source path gone"
 fi
@@ -96,21 +95,27 @@ echo "inode before=$ino_before after=$ino_after (FUSE inode numbers are syntheti
 
 # ---------------------------------------------------------------- RN-2
 # The destination must be republished to the coordinator as a chunked file,
-# with a chunk row per chunk. Note /api/cache MERGES the coordinator view with
-# the local table, so old-name rows appearing here are stale remote metadata,
-# not orphaned local entries — the local count is in the "Renamed ..." log line.
+# with a chunk row per chunk, and the source must be retracted. Note /api/cache
+# MERGES the coordinator view with the local table, so old-name keys here mean
+# remote rows survived the rename — exactly the ghost RN-1 checks from the
+# filesystem side, seen from the metadata side.
 echo
-echo "--- RN-2: destination republished with every chunk key"
+echo "--- RN-2: destination republished with every chunk key, source retracted"
 cache_json=$(api "$A" "/api/cache")
 old_keys=$(echo "$cache_json" | grep -o "/rn-$RUN/src.bin[^\"]*" | sort -u)
 new_keys=$(echo "$cache_json" | grep -o "/rn-$RUN/dst.bin[^\"]*" | sort -u)
-echo "keys still under old name (stale coordinator rows expected):"; echo "${old_keys:-  (none)}"
+echo "keys still under old name:"; echo "${old_keys:-  (none)}"
 echo "keys under new name:"; echo "${new_keys:-  (none)}"
 n_new=$(echo "$new_keys" | grep -c "dst.bin_chunk_" || true)
 if [ "${n_new:-0}" -ge 5 ]; then
   ok "RN-2 destination republished with $n_new chunk keys"
 else
   bad "RN-2 destination has only ${n_new:-0} chunk keys, want >= 5"
+fi
+if [ -z "$old_keys" ]; then
+  ok "RN-2 source keys retracted from the merged view"
+else
+  bad "RN-2 source keys survived the rename: $(echo "$old_keys" | tr '\n' ' ')"
 fi
 
 # ---------------------------------------------------------------- RN-3
