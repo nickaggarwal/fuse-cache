@@ -165,6 +165,15 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
+	// Declarative warm intents: the non-CSI entrance to the same registry the
+	// session hook writes to, so the reconciler is reachable on a cluster
+	// without the CSI node plugin. /reconcile is registered before the
+	// {volumeID} route because mux matches in order and would otherwise treat
+	// "reconcile" as a volume ID.
+	router.HandleFunc("/api/cache/intents", h.handleWarmIntentList).Methods("GET")
+	router.HandleFunc("/api/cache/intents", h.handleWarmIntentCreate).Methods("POST")
+	router.HandleFunc("/api/cache/intents/reconcile", h.handleWarmIntentReconcile).Methods("POST")
+	router.HandleFunc("/api/cache/intents/{volumeID}", h.handleWarmIntentDelete).Methods("DELETE")
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
 	router.HandleFunc("/api/fs/restore", h.handleFSRestore).Methods("POST")
 

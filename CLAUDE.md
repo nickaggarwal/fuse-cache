@@ -326,6 +326,8 @@ load-bearing ones:
 -nvme-max-gb       10                  NVMe cache capacity
 -agent-socket      /var/run/fuse-client/agent.sock   CSI agent gRPC socket
 -enable-agent-server true              Run the CSI agent gRPC server
+-warm-reconcile-interval-sec 0         Re-assert declared CSI warmup intents; 0 = default
+                                       (120s), negative disables re-assertion
 ```
 
 Other flag families: `-s3-*` / `-azure-*` / `-gcp-*` (per-provider creds and
@@ -361,6 +363,7 @@ Environment variables: `POD_IP` / `NODE_NAME` (Kubernetes downward API),
 - `POST /api/cache/warm` — warm a prefix on this node (`async` ⇒ 202 + `job_id`)
 - `GET /api/cache/warm` — list async warm jobs; `GET /api/cache/warm/{id}` — one job's live progress
 - `GET /api/cache/residency?prefix=<p>` — measured local residency for a prefix (stats the disk, not location metadata)
+- `GET/POST /api/cache/intents`, `DELETE /api/cache/intents/{volumeID}`, `POST /api/cache/intents/reconcile` — declarative warm intents without CSI (same registry the session hook writes to); `/reconcile` forces one synchronous re-assert pass
 - `POST /api/fs/snapshot` — build a cache-warming manifest of known files
 - `POST /api/fs/restore` — rehydrate peer NVMe caches from cloud using a manifest
 - `GET /metrics` — Prometheus metrics (incl. go-fuse write-path counters)
@@ -614,6 +617,67 @@ Conventions the endpoint enforces, each guarding a distinct silent failure:
   for seeding and would let one wedged peer hold a routing query open.
 - Same 75s staleness filter as warm fan-out, so a crashed-but-unexpired pod
   isn't kept in the candidate set costing a full timeout per query.
+
+**Live validation** (`stargz-test`, nodepool `ckpt2404`):
+
+```bash
+scripts/deploy-ckpt2404.sh [ns]     # buildx+push, then roll client DS + coordinator
+WITH_CSI=1 scripts/deploy-ckpt2404.sh   # also stands up a pool-scoped CSI DaemonSet
+scripts/e2e-residency.sh [ns]       # 7 sections, exit code = failure count
+```
+
+Build is local `docker buildx build --platform linux/amd64 --push`, not
+`az acr build`: ACR's classic build agent runs a pre-BuildKit dependency
+scanner that rejects `FROM --platform=$BUILDPLATFORM golang:1.23 AS builder`
+outright ("unable to understand line ... failed to scan dependencies"), and the
+Dockerfile needs BUILDPLATFORM for the cross-compile.
+
+The deploy script patches only the image and `-warm-reconcile-interval-sec`
+(new flag; default 120s ±50% jitter is too slow to observe in a test run, so it
+sets 30s). It does **not** `kubectl apply -f k8s/`: those manifests still pin
+`nodeSelector: agentpool: userpool`, which no longer matches the cluster — the
+live client DaemonSet was moved to a nodeAffinity list covering
+userpool/gpuckpt/ckpt2404, and userpool is scaled to 0, so applying the repo
+manifests would deschedule every client pod. The script refuses to run if any
+client pod sits outside the target pool, since rolling a test image would then
+restart production nodes as a side effect.
+
+`e2e-residency.sh` checks the properties, not the endpoints: measured residency
+diverges from coordinator metadata after an off-metadata eviction (the
+over-claim); the fraction is byte-weighted (a 4MiB + 12MiB pair reads 0.75, not
+the 0.5 a file count would give); an unreachable peer is `unknown` rather than
+0; repeat polls hit the TTL cache; a declared warmup's deleted file comes back
+and `last_verified` advances; and a peer registered without `NODE_NAME` still
+registers and is still selected by warm fan-out. It reads each node's cache dir
+from `node-init.json` rather than assuming `/mnt/nvme/cache` — node-init
+discovers it per node (`/fuse-cache` on ckpt2404), and a hardcoded path
+silently no-ops the eviction sections.
+
+Section 6 runs the reconciler twice against the two entrances to the same
+intent registry — 6a via `POST /api/cache/intents`, 6b via a CSI
+`warmup: full` mount — through one shared `reconcile_check` helper, so both
+assert an identical contract and only 6b needs `WITH_CSI=1`. Both force the
+pass with `POST /api/cache/intents/reconcile` rather than waiting out the
+jittered tick: mutate, force, assert is causal, whereas polling a deadline
+tests the clock as much as the code.
+
+Two findings from the first live run, both fixed:
+- **Section 5's `>=4/5 cached` assertion assumed a single coordinator.** The
+  TTL cache is per-process and the Service load-balances across 3 replicas, so
+  the first poll to reach each replica necessarily misses. The honest bound is
+  R misses, not one; the check now reads `readyReplicas` and allows `R+1`.
+- **An identity field dropped at registration is never repaired.** Heartbeats
+  carry only status and space, and the coordinator's update path rewrites the
+  record it already holds, so `NodeName` lost once stays lost for the pod's
+  lifetime — and the re-register path only fires when a heartbeat *fails*.
+  Observed during the rolling upgrade itself: one client registered against an
+  old coordinator replica whose proto predated field 10, and the residency
+  query had no join key to its Node until the pod was restarted by hand. The
+  client now re-registers every 10th heartbeat (5 min at the 30s tick);
+  registration is idempotent, so this heals any such skew at one RPC per node
+  per 5 minutes.
+
+Result: 7/7 sections pass on `stargz-test` (`resid-intents2`, 2026-08-09).
 
 Phase 4 (llm-d EPP plugin — an Affinity-category `Scorer` returning
 `fraction`, in a separate out-of-tree module) is designed but deliberately not

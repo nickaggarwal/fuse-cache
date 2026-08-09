@@ -98,6 +98,7 @@ func main() {
 		reconcileTarget      = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
 		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
 		reconcileMaxTarget   = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
+		warmReconcileSec     = flag.Int("warm-reconcile-interval-sec", 0, "How often declared CSI warmup intents are re-asserted against actual residency; 0 uses the default (120s), negative disables re-assertion (first pass at mount still runs)")
 		peerLabelsFlag       = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
 		peerLabelsFromNode   = flag.String("peer-labels-from-node", "", "Comma-separated node label keys to import as peer labels, each optionally renamed peerKey=nodeKey (e.g. pool=agentpool,topology.kubernetes.io/zone); needs NODE_NAME and RBAC get on nodes. FUSE_PEER_LABELS_FROM_NODE env overrides; imported keys win over -peer-labels")
 		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
@@ -240,6 +241,11 @@ func main() {
 		ReplicaReconcileTarget:     *reconcileTarget,
 		ReplicaReconcileMaxPerRun:  *reconcileMaxPerRun,
 		ReplicaReconcileMaxTarget:  *reconcileMaxTarget,
+		// Negative disables the loop; 0 leaves the cache default in place.
+		// Separating "off" from "unset" matters because the zero value has to
+		// mean "use the default" for every caller that never sets it.
+		WarmReconcileInterval: time.Duration(*warmReconcileSec) * time.Second,
+		WarmReconcileDisabled: *warmReconcileSec < 0,
 
 		CloudProvider:                 *cloudProvider,
 		S3Bucket:                      *s3Bucket,
@@ -805,6 +811,12 @@ func resolvePeerLabels(ctx context.Context, static, fromNode string, logger *log
 	return labels
 }
 
+// peerReregisterEveryHeartbeats re-asserts the full PeerInfo every Nth
+// heartbeat. At the 30s heartbeat tick this is one extra RPC per node every 5
+// minutes — negligible next to the heartbeat itself, and it bounds how long an
+// identity field can stay wrong after a coordinator-side skew.
+const peerReregisterEveryHeartbeats = 10
+
 func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()
 	availableSpace := capacity - used
@@ -893,8 +905,27 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 			} else {
 				err = coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used)
 			}
-			if err != nil {
-				logger.Printf("Failed to update peer status: %v (attempting re-register)", err)
+			// Re-register periodically, not only after a heartbeat failure.
+			// A heartbeat carries status and space; every identity field
+			// (NodeName, Labels, addresses) is written once, at registration,
+			// and the coordinator's update path rewrites the stored record it
+			// already has. So a field the coordinator dropped at registration
+			// time is never repaired for the lifetime of the pod.
+			//
+			// That is not hypothetical: during a rolling upgrade a client can
+			// register against an old coordinator replica whose proto lacks a
+			// newer field, and NodeName silently stays empty afterwards even
+			// though every replica understands it minutes later. Observed on
+			// stargz-test — one of two clients registered mid-roll and the
+			// residency query had no join key to its Node until the pod was
+			// restarted by hand. Registration is idempotent (PutPeer), so
+			// re-asserting it costs one RPC per node per 5 minutes and heals
+			// any such skew.
+			periodic := heartbeatCount%peerReregisterEveryHeartbeats == 0
+			if err != nil || periodic {
+				if err != nil {
+					logger.Printf("Failed to update peer status: %v (attempting re-register)", err)
+				}
 				peerInfo.AvailableSpace = capacity - used
 				peerInfo.UsedSpace = used
 				if regErr := coordClient.RegisterPeer(ctx, peerInfo); regErr != nil {

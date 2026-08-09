@@ -147,6 +147,24 @@ type WarmIntentStatus struct {
 	LastResult   *WarmupResult `json:"last_result,omitempty"`
 }
 
+// WarmIntentController is the declarative-warmup control surface: declare an
+// intent, drop it, read what is declared, force a re-assert.
+//
+// Two callers share this registry. The CSI session hook is the production one
+// — a volume with warmup=full declares an intent on first mount. The HTTP API
+// is the other, and it exists because the CSI path is only reachable from a
+// scheduled pod on a node running the CSI node plugin: without a second
+// entrance, the reconciler cannot be exercised on a cluster that has the
+// client DaemonSet but no CSI DaemonSet, which is exactly the configuration
+// most easily stood up for testing. Both paths land in the same registry and
+// run the same loop, so verifying one is evidence about the other.
+type WarmIntentController interface {
+	RegisterWarmIntent(volumeID, prefix string, opts WarmupOptions)
+	ForgetWarmIntent(volumeID string)
+	WarmIntents() []WarmIntentStatus
+	ReconcileWarmNow(ctx context.Context)
+}
+
 // WarmIntents returns the declared warmup intents and their last-pass state.
 // This is the node-local half of the residency signal an external router
 // consumes; the coordinator aggregates it across peers.
@@ -218,6 +236,16 @@ func (cm *DefaultCacheManager) startWarmReconciler(ctx context.Context) {
 			cm.reconcileWarmOnce(ctx)
 		}
 	})
+}
+
+// ReconcileWarmNow runs one re-assert pass synchronously, out of band with the
+// ticker. The loop's cadence is minutes with ±50% jitter — deliberately, since
+// this is drift correction — but that makes "evict a warmed file, watch it come
+// back" a multi-minute wait keyed off a timer nobody can observe. Forcing a
+// pass turns that into a causal check: mutate, force, assert. The ticker keeps
+// running; a forced pass is just an extra one.
+func (cm *DefaultCacheManager) ReconcileWarmNow(ctx context.Context) {
+	cm.reconcileWarmOnce(ctx)
 }
 
 // reconcileWarmOnce re-asserts every declared intent once.

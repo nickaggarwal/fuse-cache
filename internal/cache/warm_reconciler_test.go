@@ -224,6 +224,59 @@ func TestWarmIntentRegistry_RejectsNoOpIntents(t *testing.T) {
 	}
 }
 
+// The HTTP intent surface and the CSI session hook are two entrances to one
+// registry; the whole reason the HTTP one exists is that verifying it should be
+// evidence about the CSI path. Pin that they are interchangeable — a
+// controller-registered intent is reconciled by the same loop, reported by the
+// same status call, and dropped the same way — so the two cannot drift into
+// separate mechanisms that merely look alike.
+func TestWarmReconcile_ControllerSurfaceSharesTheRegistry(t *testing.T) {
+	ctx := context.Background()
+	cm, cloud, _ := warmReconcileManager(t, 1<<30, []*coordinator.FileLocation{
+		{FilePath: "/models/a.bin", PeerID: "p1", StorageTier: "cloud", FileSize: 300},
+	})
+	cloud.Write(ctx, "/models/a.bin", make([]byte, 300))
+
+	var ctrl WarmIntentController = cm
+
+	ctrl.RegisterWarmIntent("vol-http", "/models", WarmupOptions{Mode: "full", Source: "cloud-only"})
+	cm.bgWg.Wait() // registration runs its first pass in the background
+
+	if _, ok := cm.LocalFilePath(ctx, "/models/a.bin"); !ok {
+		t.Fatal("registration did not run a first pass")
+	}
+	st := ctrl.WarmIntents()
+	if len(st) != 1 || st[0].VolumeID != "vol-http" || st[0].LastVerified.IsZero() {
+		t.Fatalf("WarmIntents = %+v, want one verified vol-http intent", st)
+	}
+	verifiedAt := st[0].LastVerified
+
+	// Same divergence as the eviction test, but driven through the forced pass
+	// the API exposes rather than the ticker.
+	local, _ := cm.LocalFilePath(ctx, "/models/a.bin")
+	if err := os.Remove(local); err != nil {
+		t.Fatalf("remove warmed file: %v", err)
+	}
+	ctrl.ReconcileWarmNow(ctx)
+	cm.bgWg.Wait()
+	if _, ok := cm.LocalFilePath(ctx, "/models/a.bin"); !ok {
+		t.Fatal("forced pass did not re-fetch the removed file")
+	}
+	if st = ctrl.WarmIntents(); len(st) != 1 || !st[0].LastVerified.After(verifiedAt) {
+		t.Fatalf("last_verified did not advance across the forced pass: %+v", st)
+	}
+
+	// Forget is the CSI teardown's job in production; through this surface the
+	// caller owns it. Either way the bytes stay — only the obligation ends.
+	ctrl.ForgetWarmIntent("vol-http")
+	if got := ctrl.WarmIntents(); len(got) != 0 {
+		t.Fatalf("WarmIntents = %+v after forget, want empty", got)
+	}
+	if _, ok := cm.LocalFilePath(ctx, "/models/a.bin"); !ok {
+		t.Fatal("forget deleted warmed bytes")
+	}
+}
+
 func TestWarmReconcile_LoopStopsOnShutdown(t *testing.T) {
 	cm, _, _ := warmReconcileManager(t, 1<<30, nil)
 	ctx, cancel := context.WithCancel(context.Background())

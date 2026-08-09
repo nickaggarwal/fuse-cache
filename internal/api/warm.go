@@ -239,6 +239,135 @@ func (h *Handler) handleCacheWarm(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+// Declarative warm intents over HTTP.
+//
+// An intent is normally declared by a CSI session (volumeAttributes
+// warmup=full), which is the production path and the only one that carries a
+// real volume lifecycle. These endpoints are the second entrance to the same
+// registry, and they exist for a specific reason: the CSI path requires a
+// scheduled pod on a node running the CSI node plugin, so on a cluster with
+// the client DaemonSet but no CSI DaemonSet the reconciler is unreachable and
+// therefore untestable. Both entrances register the same warmIntent and are
+// re-asserted by the same loop, so exercising this one is evidence about the
+// CSI one.
+//
+// The volume ID is caller-supplied here rather than minted, so a test can
+// declare, force a pass, and forget deterministically. Intents declared this
+// way are not tied to any mount and so are never dropped by a teardown hook —
+// the caller owns the DELETE.
+
+// warmIntentRequest is the JSON body for POST /api/cache/intents.
+type warmIntentRequest struct {
+	VolumeID  string `json:"volume_id"`
+	Prefix    string `json:"prefix"`
+	Mode      string `json:"mode,omitempty"` // default "full"
+	Source    string `json:"source,omitempty"`
+	Bandwidth string `json:"bandwidth,omitempty"`
+}
+
+// warmIntentController resolves the cache manager to the intent surface.
+func (h *Handler) warmIntentController(w http.ResponseWriter) (cache.WarmIntentController, bool) {
+	ctrl, ok := h.cacheManager.(cache.WarmIntentController)
+	if !ok {
+		http.Error(w, "warm intents not supported by this cache manager", http.StatusNotImplemented)
+		return nil, false
+	}
+	return ctrl, true
+}
+
+// handleWarmIntentList serves GET /api/cache/intents.
+func (h *Handler) handleWarmIntentList(w http.ResponseWriter, r *http.Request) {
+	ctrl, ok := h.warmIntentController(w)
+	if !ok {
+		return
+	}
+	intents := ctrl.WarmIntents()
+	if intents == nil {
+		// Encode [] rather than null: a client that distinguishes "no intents"
+		// from "field absent" should not have to special-case Go's nil slice.
+		intents = []cache.WarmIntentStatus{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"peer_id": h.peerID,
+		"intents": intents,
+	})
+}
+
+// handleWarmIntentCreate serves POST /api/cache/intents. It returns once the
+// intent is registered, not once it is satisfied — the first pass runs in the
+// background exactly as it does for a CSI mount. Poll GET /api/cache/intents
+// for last_verified, or /api/cache/residency for measured bytes.
+func (h *Handler) handleWarmIntentCreate(w http.ResponseWriter, r *http.Request) {
+	ctrl, ok := h.warmIntentController(w)
+	if !ok {
+		return
+	}
+	var req warmIntentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Prefix == "" {
+		http.Error(w, "prefix is required", http.StatusBadRequest)
+		return
+	}
+	if req.VolumeID == "" {
+		http.Error(w, "volume_id is required", http.StatusBadRequest)
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = "full"
+	}
+	ctrl.RegisterWarmIntent(req.VolumeID, req.Prefix, cache.WarmupOptions{
+		Mode: req.Mode, Source: req.Source, Bandwidth: req.Bandwidth,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"registered": true, "volume_id": req.VolumeID, "prefix": req.Prefix,
+		"mode": req.Mode, "source": req.Source, "bandwidth": req.Bandwidth,
+	})
+}
+
+// handleWarmIntentDelete serves DELETE /api/cache/intents/{volumeID}.
+// Idempotent, and like a CSI teardown it leaves the warmed bytes in place —
+// only the obligation to keep re-asserting them goes away.
+func (h *Handler) handleWarmIntentDelete(w http.ResponseWriter, r *http.Request) {
+	ctrl, ok := h.warmIntentController(w)
+	if !ok {
+		return
+	}
+	volumeID := mux.Vars(r)["volumeID"]
+	if volumeID == "" {
+		http.Error(w, "volume_id is required", http.StatusBadRequest)
+		return
+	}
+	ctrl.ForgetWarmIntent(volumeID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"forgotten": true, "volume_id": volumeID})
+}
+
+// handleWarmIntentReconcile serves POST /api/cache/intents/reconcile: run one
+// re-assert pass now and block until it finishes.
+//
+// Synchronous on purpose. The whole point is to replace "wait out a jittered
+// multi-minute tick and hope" with a causal check — mutate residency, force a
+// pass, assert. An async trigger would put the race straight back.
+func (h *Handler) handleWarmIntentReconcile(w http.ResponseWriter, r *http.Request) {
+	ctrl, ok := h.warmIntentController(w)
+	if !ok {
+		return
+	}
+	before := ctrl.WarmIntents()
+	ctrl.ReconcileWarmNow(r.Context())
+	after := ctrl.WarmIntents()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"peer_id": h.peerID, "intents_reconciled": len(before), "intents": after,
+	})
+}
+
 // handleCacheWarmStatus serves GET /api/cache/warm/{id}.
 func (h *Handler) handleCacheWarmStatus(w http.ResponseWriter, r *http.Request) {
 	job, ok := h.warmJobs.get(mux.Vars(r)["id"])
