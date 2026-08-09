@@ -1,0 +1,45 @@
+# Seeds Qwen2.5-1.5B-Instruct into the FUSE mount from HuggingFace.
+#
+# Pinned to ONE GPU node on purpose. Writing through the mount lands the bytes
+# on that node's NVMe (write path: NVMe first, then background cloud persist),
+# so the other GPU node starts cold. That asymmetry is the whole point — a
+# residency scorer with identical residency everywhere has nothing to say.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-seeder
+  namespace: fuse-system
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: aks-gpuckpt-13588264-vmss00000e
+  containers:
+    - name: seed
+      image: curlimages/curl:8.5.0
+      securityContext:
+        runAsUser: 0
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          BASE=https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/main
+          DEST=/mnt/fuse/models/Qwen2.5-1.5B-Instruct
+          mkdir -p "$DEST"
+          # The full set vLLM needs to load without touching the network.
+          for f in config.json generation_config.json merges.txt \
+                   model.safetensors tokenizer.json tokenizer_config.json vocab.json; do
+            echo "==> $f"
+            curl -fSL --retry 3 --retry-delay 2 -o "$DEST/$f" "$BASE/$f"
+            ls -l "$DEST/$f"
+          done
+          echo "=== seeded ==="
+          ls -l "$DEST"
+      volumeMounts:
+        - name: fuse-mount
+          mountPath: /mnt/fuse
+          mountPropagation: HostToContainer
+  volumes:
+    - name: fuse-mount
+      hostPath:
+        path: /mnt/fuse
+        type: Directory

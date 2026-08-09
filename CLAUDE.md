@@ -745,5 +745,68 @@ does not exist there. Current interface is
   flow-control/saturation default graph and would fail on llm-d bumps for
   reasons unrelated to this config.
 
-Not yet done: no image has been built or deployed, and no live vLLM/Qwen
-routing test has been run.
+**Live validation with real vLLM on A100** (`stargz-test`, nodepool `gpuckpt`,
+2× NC24ads_A100_v4, 2026-08-09). Qwen2.5-1.5B-Instruct (3.08GB) seeded onto one
+GPU node's NVMe, then two vLLM v0.6.3 pods — same manifest, image, and model
+path, one per node via `podAntiAffinity` — load it straight off `/mnt/fuse`
+with `HF_HUB_OFFLINE=1`, so a missing-weights case fails loudly instead of
+silently downloading and erasing the difference being measured.
+
+```bash
+scripts/llmd-seed-model.yaml   # seed weights onto ONE GPU node (asymmetry is the point)
+scripts/llmd-vllm.yaml         # 2 vLLM pods, one per A100
+scripts/llmd-epp.yaml          # custom EPP + SA/Role/RoleBinding/ConfigMap
+scripts/e2e-llmd-routing.sh    # 5 sections, exit code = failure count
+```
+
+**The payoff number: 1.48s warm vs 3.26s cold** to load the safetensors
+checkpoint — 2.2×, with the only difference being local NVMe residency.
+
+EPP runs in **standalone mode** — `--endpoint-selector` instead of
+`--pool-name` sets `startCrdReconcilers := opts.EndpointSelector == nil`, so no
+Gateway API / InferencePool / InferenceObjective CRDs are needed (this cluster
+has none) and RBAC is just namespaced `pods` get/watch/list. Three things bite
+on first deploy: `POD_NAME` is **required** (the runner extracts its GKNN from
+it and exits otherwise), the ext_proc port is **TLS by default**
+(`--secure-serving`, self-signed — clients need `InsecureSkipVerify`), and EPP
+**does not answer the headers phase until the body arrives** because it parses
+the model out of the OpenAI JSON, so a Send/Recv ping-pong deadlocks.
+
+`cmd/scoreprobe` speaks ext_proc directly rather than standing up an Envoy: it
+sends both phases, then reads `x-gateway-destination-endpoint-scores` from the
+`envoy.lb` dynamic metadata (needs `--emit-endpoint-scores`). That key carries
+a score for **every** candidate including ones the picker rejected — the
+difference between observing the scorer's contribution and inferring it from
+which pod won.
+
+Measured scores match the arithmetic exactly at `queue`×1 + `residency`×2:
+fully resident `1.0 + 1.0×2 = 3.0`; 99.86% resident `2.99713`; 0.37% resident
+`1.00741`. So residency is provably the term that moves the decision.
+
+The decisive assertion is not "the warm node was picked" — a single reading can
+be right by accident — but that the decision **follows** residency: evicting
+`model.safetensors` on the winner flips the pick to the other endpoint, and
+`e2e-llmd-routing.sh` polls for that flip rather than sleeping past the
+extractor's interval.
+
+Two behaviors worth knowing before re-running:
+- **A cold node warms itself** by serving one vLLM load — reading through the
+  mount promotes the bytes to its NVMe. After both pods started, residency was
+  1.0 vs 0.9986 and the score gap nearly vanished. Any repeat run must
+  re-establish the asymmetry deliberately; the script evicts to do so.
+- **Mount reads promote as individual `_chunk_N` files** that take further
+  passes to coalesce, and residency reads ~0 until they do even though `du`
+  shows full size. `POST /api/cache/warm` lands the whole file in one job and
+  is the supported operator path — section 4 evicts a non-GPU node to 0.0037,
+  warms it via the API, and asserts measured residency returns to 1.0
+  (`files=7/7 warmed=1 already_local=6 failed=0`).
+
+Byte-weighting earned its keep live: nodes holding **6 of 7 files (86% by
+count) were 0.37% by bytes**, lacking only the 3GB safetensors. A file-counted
+metric would have routed to them.
+
+Result: 5/5 sections pass, 0 failures (2026-08-09).
+
+Not yet done: the EPP image is deployed but not wired behind a real Envoy /
+Gateway — traffic is driven through `cmd/scoreprobe`, not a live inference
+request path.

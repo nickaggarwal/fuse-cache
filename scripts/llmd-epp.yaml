@@ -1,0 +1,152 @@
+# Custom llm-d EndpointPicker with the fuse residency plugins compiled in.
+#
+# Runs in "standalone mode": --endpoint-selector instead of --pool-name. The
+# runner reads `startCrdReconcilers := opts.EndpointSelector == nil`, so passing
+# a selector skips every CRD reconciler — no Gateway API, no InferencePool, no
+# InferenceObjective needed on this cluster. RBAC is correspondingly just
+# namespaced pod get/watch/list.
+#
+# --emit-endpoint-scores is what makes this observable: it publishes the
+# per-endpoint scores under x-gateway-destination-endpoint-scores in the
+# request-path dynamic metadata, *including candidates the picker rejected*.
+# Without it we could only see which endpoint won and would have to infer the
+# scorer's contribution.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fuse-epp
+  namespace: fuse-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fuse-epp
+  namespace: fuse-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fuse-epp
+  namespace: fuse-system
+subjects:
+  - kind: ServiceAccount
+    name: fuse-epp
+    namespace: fuse-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fuse-epp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuse-epp-config
+  namespace: fuse-system
+data:
+  epp-config.yaml: |
+    apiVersion: llm-d.ai/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+      - type: fuse-residency-extractor
+        parameters:
+          coordinatorURL: http://coordinator.fuse-system.svc.cluster.local:8080
+          models:
+            - model: Qwen/Qwen2.5-1.5B-Instruct
+              prefix: models/Qwen2.5-1.5B-Instruct/
+          pollIntervalSec: 10
+          staleAfterSec: 90
+      - type: fuse-residency-scorer
+        parameters:
+          unknownScore: 0.4
+          pinnedBonus: 0.05
+      - type: queue-scorer
+      - type: max-score-picker
+      - type: single-profile-handler
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - pluginRef: max-score-picker
+          - pluginRef: queue-scorer
+            weight: 1
+          - pluginRef: fuse-residency-scorer
+            weight: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuse-epp
+  namespace: fuse-system
+  labels:
+    app: fuse-epp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fuse-epp
+  template:
+    metadata:
+      labels:
+        app: fuse-epp
+    spec:
+      serviceAccountName: fuse-epp
+      nodeSelector:
+        pool: ckpt2404
+      containers:
+        - name: epp
+          image: stargzrepo.azurecr.io/fuse-residency-epp:latest
+          imagePullPolicy: Always
+          args:
+            - --config-file=/config/epp-config.yaml
+            # Both fuse plugins register Alpha, so the operator has to opt in.
+            - --allow-experimental-plugins
+            # Standalone discovery: match model-server pods by label.
+            - --endpoint-selector=llmd.ai/inference-server=true
+            - --endpoint-target-ports=8000
+            - --emit-endpoint-scores
+            - --pool-namespace=fuse-system
+            - -v=3
+          env:
+            # The runner derives its own GKNN identity from these at startup and
+            # exits if POD_NAME is unset — it is required, not informational.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 9002
+              name: grpc-extproc
+            - containerPort: 9003
+              name: grpc-health
+            - containerPort: 9090
+              name: metrics
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: fuse-epp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuse-epp
+  namespace: fuse-system
+spec:
+  selector:
+    app: fuse-epp
+  ports:
+    - port: 9002
+      targetPort: 9002
+      name: grpc-extproc
+    - port: 9090
+      targetPort: 9090
+      name: metrics
