@@ -126,7 +126,7 @@ func seedDeletable(t *testing.T, cm *DefaultCacheManager, path string, data []by
 		PersistedToCloud: persisted,
 		LastAccessed:     time.Now(),
 	})
-	cm.nvmeUsed += int64(len(data))
+	cm.accountNVMeLocked(path, int64(len(data)))
 	cm.mu.Unlock()
 }
 

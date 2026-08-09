@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/metrics"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -319,8 +320,27 @@ type DefaultCacheManager struct {
 	// nvmeVerify remembers which local files have had their sidecar checksum
 	// checked, so serving a file through many small FUSE reads hashes it once
 	// rather than once per read.
-	nvmeVerify   nvmeVerifier
-	nvmeUsed     int64
+	nvmeVerify nvmeVerifier
+	// nvmeUsed is maintained as the exact sum of nvmeBytes. Never adjust it
+	// directly — go through accountNVMeLocked/unaccountNVMeLocked, which make
+	// every update idempotent in the key. Deriving the delta from the entry
+	// table instead (read old size, subtract, add new) is not safe: callers
+	// install the table row *after* the bytes land, so two concurrent writers
+	// to one path both saw "no existing entry", both added a full size, and
+	// only one row landed. The surplus was unreclaimable — eviction can only
+	// free what an entry claims — so a node drifted toward permanently "full"
+	// on a nearly empty disk and then refused every write.
+	nvmeBytes map[string]int64
+	nvmeUsed  int64
+	// nvmeKeyMu serializes whole mutations of one NVMe key. Making the ledger
+	// idempotent in the key is not sufficient on its own: touching the disk and
+	// updating the ledger are two separate critical sections, so a delete and a
+	// write on one key interleave as (delete bytes) → (write bytes, credit) →
+	// (unaccount) → (install row), leaving bytes and a row on disk with no
+	// credit. That undercount lets the cache overfill. Held across both steps by
+	// putToNVMeWithEviction and deleteLocalNVMeFootprint; a fixed array so a
+	// zero-value manager built by a test helper is usable without construction.
+	nvmeKeyMu    [nvmeKeyStripes]sync.Mutex
 	mu           sync.RWMutex
 	rangeMu      sync.RWMutex
 	fetchMu      sync.Mutex
@@ -332,18 +352,18 @@ type DefaultCacheManager struct {
 	// rangeTotalBytes tracks the sum of all per-file cache bytes so the
 	// global budget check is O(1) per insert instead of an O(files) scan
 	// under rangeMu on every cached chunk.
-	rangeTotalBytes  int64
-	hybridHints      map[string]hybridReadHint
-	chunkFetches     map[string]*chunkFetchState
-	hedgeLimiter     chan struct{}
-	peerServeGate    *peerServeGate
-	herdStats        herdControlStats
-	deleteStats      deleteStats
+	rangeTotalBytes int64
+	hybridHints     map[string]hybridReadHint
+	chunkFetches    map[string]*chunkFetchState
+	hedgeLimiter    chan struct{}
+	peerServeGate   *peerServeGate
+	herdStats       herdControlStats
+	deleteStats     deleteStats
 	// tombstones suppress this node's own metadata publishes for recently
 	// deleted paths, so a background persist or chunk completion that was
 	// already in flight cannot re-advertise a file that is gone.
 	tombstones *deleteTombstones
-	readerHeat       readerHeat
+	readerHeat readerHeat
 	// warmIntents holds declarative CSI warmup intents this node must keep
 	// re-asserting (warm_reconciler.go).
 	warmIntents      *warmIntentRegistry
@@ -514,6 +534,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	cm := &DefaultCacheManager{
 		config:           config,
 		entries:          newEntryTable(),
+		nvmeBytes:        make(map[string]int64),
 		logger:           log.New(log.Writer(), "[CACHE] ", log.LstdFlags),
 		metrics:          NewCacheMetrics(),
 		rangeChunks:      make(map[string]*chunkFileCache),
@@ -1514,7 +1535,7 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	cm.mu.Lock()
 	cm.removeChunkEntriesLocked(filePath)
 	cm.entries.put(entry)
-	cm.nvmeUsed += size
+	cm.accountNVMeLocked(filePath, size)
 	cm.mu.Unlock()
 	cm.metrics.RecordWrite(size)
 
@@ -1605,6 +1626,88 @@ func (cm *DefaultCacheManager) collectLocalDeleteTargets(filePath string, includ
 	return targets
 }
 
+// nvmeKeyStripes is the width of the per-key mutation lock. Sized to be wide
+// enough that unrelated paths rarely collide, small enough to stay inline in
+// the manager.
+const nvmeKeyStripes = 64
+
+// lockNVMeKey serializes one key's disk-plus-ledger mutation against any other
+// mutation of the same key. Returns the unlock.
+func (cm *DefaultCacheManager) lockNVMeKey(key string) func() {
+	m := &cm.nvmeKeyMu[nvmeKeyStripe(key)]
+	m.Lock()
+	return m.Unlock
+}
+
+// lockNVMeKeys locks a set of keys, deduped and in a canonical order so two
+// callers holding overlapping sets can never deadlock against each other.
+func (cm *DefaultCacheManager) lockNVMeKeys(keys []string) func() {
+	stripes := make([]int, 0, len(keys))
+	seen := make(map[int]bool, len(keys))
+	for _, k := range keys {
+		s := nvmeKeyStripe(k)
+		if !seen[s] {
+			seen[s] = true
+			stripes = append(stripes, s)
+		}
+	}
+	sort.Ints(stripes)
+	for _, s := range stripes {
+		cm.nvmeKeyMu[s].Lock()
+	}
+	return func() {
+		for i := len(stripes) - 1; i >= 0; i-- {
+			cm.nvmeKeyMu[stripes[i]].Unlock()
+		}
+	}
+}
+
+func nvmeKeyStripe(key string) int {
+	// FNV-1a, inlined to avoid allocating a hash per call on the write path.
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h % nvmeKeyStripes)
+}
+
+// accountNVMeLocked records that key currently occupies size bytes on NVMe,
+// replacing whatever it was previously credited with. Idempotent in key: two
+// concurrent writers of the same path converge on one contribution instead of
+// each adding their own. Caller holds cm.mu for writing.
+func (cm *DefaultCacheManager) accountNVMeLocked(key string, size int64) {
+	if key == "" {
+		return
+	}
+	if size < 0 {
+		size = 0
+	}
+	if cm.nvmeBytes == nil {
+		cm.nvmeBytes = make(map[string]int64)
+	}
+	cm.nvmeUsed += size - cm.nvmeBytes[key]
+	if cm.nvmeUsed < 0 {
+		cm.nvmeUsed = 0
+	}
+	cm.nvmeBytes[key] = size
+}
+
+// unaccountNVMeLocked drops key's contribution and reports what it was, so
+// callers can log the bytes actually reclaimed. Caller holds cm.mu for writing.
+func (cm *DefaultCacheManager) unaccountNVMeLocked(key string) int64 {
+	prev, ok := cm.nvmeBytes[key]
+	if !ok {
+		return 0
+	}
+	delete(cm.nvmeBytes, key)
+	cm.nvmeUsed -= prev
+	if cm.nvmeUsed < 0 {
+		cm.nvmeUsed = 0
+	}
+	return prev
+}
+
 func (cm *DefaultCacheManager) deleteLocalNVMeFootprint(ctx context.Context, filePath string, includeChildren bool, ignoreMissing bool) (int64, error) {
 	targets := cm.collectLocalDeleteTargets(filePath, includeChildren)
 	if len(targets) == 0 {
@@ -1615,6 +1718,14 @@ func (cm *DefaultCacheManager) deleteLocalNVMeFootprint(ctx context.Context, fil
 	}
 
 	storage := cm.getStorageForTier(TierNVMe)
+	// Same-key exclusion as the write path, for the same reason, held across
+	// both the removal and the ledger release.
+	keys := make([]string, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.key)
+	}
+	defer cm.lockNVMeKeys(keys)()
+
 	counted := make(map[string]bool, len(targets))
 	for _, target := range targets {
 		// Every removal of a local copy goes through here — delete, overwrite,
@@ -1631,18 +1742,18 @@ func (cm *DefaultCacheManager) deleteLocalNVMeFootprint(ctx context.Context, fil
 	var freed int64
 	cm.mu.Lock()
 	for _, target := range targets {
+		// Drop the ledger credit whether or not a table row survives: the
+		// bytes are gone from disk either way, and a credit with no way left
+		// to reclaim it is exactly the leak this accounting exists to avoid.
+		released := cm.unaccountNVMeLocked(target.key)
+		if counted[target.key] {
+			freed += released
+		}
 		entry, ok := cm.entries.get(target.key)
 		if !ok || entry == nil || entry.Tier != TierNVMe {
 			continue
 		}
-		if counted[target.key] {
-			freed += entry.Size
-		}
 		cm.entries.del(target.key)
-	}
-	cm.nvmeUsed -= freed
-	if cm.nvmeUsed < 0 {
-		cm.nvmeUsed = 0
 	}
 	cm.mu.Unlock()
 
@@ -1904,8 +2015,18 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 // Unpersisted entries are only evictable if the cloud tier independently has
 // the object (covers restarts, where the in-memory bit is lost).
 func (cm *DefaultCacheManager) evictionSafe(ctx context.Context, key string, entry *CacheEntry) bool {
-	if entry != nil && entry.PersistedToCloud {
-		return true
+	// entry is a pointer the caller collected under RLock and then released
+	// it. markPersistedToCloud mutates these same fields under the write lock,
+	// so take one locked snapshot and read only from the copy — reading them
+	// off the live pointer races the cloud-persist path.
+	if entry != nil {
+		cm.mu.RLock()
+		snapshot := *entry
+		cm.mu.RUnlock()
+		entry = &snapshot
+		if entry.PersistedToCloud {
+			return true
+		}
 	}
 	if cm.cloudStorage == nil {
 		return false
@@ -2064,48 +2185,39 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 
 // putToNVMeWithEviction tries NVMe write, evicting if necessary
 func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry *CacheEntry) error {
+	// What this write replaces is whatever the ledger already credits to this
+	// key — not what the entry table says. The table row is installed by our
+	// caller after we return, so on a concurrent same-path write it is not yet
+	// there to read.
 	cm.mu.RLock()
-	existingLocalSize := int64(0)
-	if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
-		if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
-			existingLocalSize = existing.Size
-		}
-	}
-	wouldExceed := cm.nvmeUsed-existingLocalSize+entry.Size > cm.config.MaxNVMeSize
+	wouldExceed := cm.nvmeUsed-cm.nvmeBytes[entry.FilePath]+entry.Size > cm.config.MaxNVMeSize
 	cm.mu.RUnlock()
 
 	if wouldExceed {
 		cm.Evict(ctx, TierNVMe)
 		// Re-check after eviction
 		cm.mu.RLock()
-		existingLocalSize = 0
-		if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
-			if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
-				existingLocalSize = existing.Size
-			}
-		}
-		stillExceed := cm.nvmeUsed-existingLocalSize+entry.Size > cm.config.MaxNVMeSize
+		stillExceed := cm.nvmeUsed-cm.nvmeBytes[entry.FilePath]+entry.Size > cm.config.MaxNVMeSize
 		cm.mu.RUnlock()
 		if stillExceed {
 			return errors.New("NVMe storage full after eviction")
 		}
 	}
 
+	// Landing the bytes and crediting them must be one step with respect to
+	// this key: a concurrent delete that removed the old bytes between them
+	// would drop the credit for the new ones, leaving accounted-for bytes on
+	// disk that eviction can never reclaim.
+	unlock := cm.lockNVMeKey(entry.FilePath)
 	if err := cm.putToTier(ctx, entry, TierNVMe); err != nil {
+		unlock()
 		return err
 	}
 
 	cm.mu.Lock()
-	if existing, ok := cm.entries.get(entry.FilePath); ok && existing != nil && existing.Tier == TierNVMe {
-		if cm.nvmeStorage.Exists(ctx, entry.FilePath) {
-			cm.nvmeUsed -= existing.Size
-			if cm.nvmeUsed < 0 {
-				cm.nvmeUsed = 0
-			}
-		}
-	}
-	cm.nvmeUsed += entry.Size
+	cm.accountNVMeLocked(entry.FilePath, entry.Size)
 	cm.mu.Unlock()
+	unlock()
 	// Hand the next eviction to the background evictor while there is still
 	// headroom, so the write after this one is less likely to run one inline.
 	cm.maybeSignalEvictionPressure()
@@ -2246,6 +2358,9 @@ func (cm *DefaultCacheManager) putToTier(ctx context.Context, entry *CacheEntry,
 
 func (cm *DefaultCacheManager) removeChunkEntriesLocked(filePath string) {
 	for _, key := range cm.entries.chunkKeys(filePath) {
+		// Retiring the row without releasing the credit leaked the chunk's
+		// bytes on every overwrite of a chunked file.
+		cm.unaccountNVMeLocked(key)
 		cm.entries.del(key)
 	}
 }

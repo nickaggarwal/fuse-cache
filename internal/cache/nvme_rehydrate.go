@@ -110,7 +110,7 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 			Tier:         TierNVMe,
 			// Not marked persisted: evictionSafe's cloud probe decides.
 		})
-		cm.nvmeUsed += f.size
+		cm.accountNVMeLocked(f.key, f.size)
 		adopted++
 		bytes += f.size
 	}

@@ -224,6 +224,7 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 
 	// Whole file is live: account it, then retire the chunk files.
 	now := time.Now()
+	parentUnlock := cm.lockNVMeKey(filePath)
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil {
 		parent.Tier = TierNVMe
@@ -239,27 +240,28 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 			ChunkSize: chunkSize,
 		})
 	}
-	cm.nvmeUsed += size
+	cm.accountNVMeLocked(filePath, size)
 	cm.mu.Unlock()
+	parentUnlock()
 
 	for i := int64(0); i < numChunks; i++ {
 		cp := chunkPathFor(filePath, i)
-		chunkBytes, serr := cm.nvmeStorage.Size(ctx, cp)
-		if derr := cm.nvmeStorage.Delete(ctx, cp); derr != nil {
-			continue
-		}
-		// Checksum sidecars ride along with chunk files; without this every
-		// completed file leaked numChunks orphan .sha256 files on NVMe.
-		_ = cm.nvmeStorage.Delete(ctx, cp+".sha256")
-		cm.mu.Lock()
-		cm.entries.del(cp)
-		if serr == nil {
-			cm.nvmeUsed -= chunkBytes
-			if cm.nvmeUsed < 0 {
-				cm.nvmeUsed = 0
+		// Removing the bytes and releasing their credit is one mutation of this
+		// key; a concurrent write landing between the two would have its credit
+		// dropped, or leave one behind for bytes this loop already removed.
+		func() {
+			defer cm.lockNVMeKey(cp)()
+			if derr := cm.nvmeStorage.Delete(ctx, cp); derr != nil {
+				return
 			}
-		}
-		cm.mu.Unlock()
+			// Checksum sidecars ride along with chunk files; without this every
+			// completed file leaked numChunks orphan .sha256 files on NVMe.
+			_ = cm.nvmeStorage.Delete(ctx, cp+".sha256")
+			cm.mu.Lock()
+			cm.entries.del(cp)
+			cm.unaccountNVMeLocked(cp)
+			cm.mu.Unlock()
+		}()
 	}
 
 	cm.metrics.ChunkCompletionAssembled.Add(1)

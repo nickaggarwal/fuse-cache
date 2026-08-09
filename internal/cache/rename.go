@@ -86,6 +86,17 @@ func (cm *DefaultCacheManager) Rename(ctx context.Context, oldPath, newPath stri
 	// Local bytes first: if this fails the metadata still describes the old
 	// path, which is a rename that did not happen rather than one that half
 	// happened.
+	//
+	// The moves and the credit transfer below are one mutation of both keys
+	// (see nvmeKeyMu): a concurrent write to either path landing between them
+	// would have its credit carried away by this rename, or leave one behind
+	// on a key whose bytes have moved.
+	renameKeys := make([]string, 0, len(moves)*2)
+	for i := range moves {
+		renameKeys = append(renameKeys, moves[i].oldKey, moves[i].newKey)
+	}
+	defer cm.lockNVMeKeys(renameKeys)()
+
 	for i := range moves {
 		if moves[i].entry.Tier != TierNVMe {
 			continue
@@ -101,8 +112,14 @@ func (cm *DefaultCacheManager) Rename(ctx context.Context, oldPath, newPath stri
 		moved.FilePath = moves[i].newKey
 		moved.StoragePath = moves[i].newKey
 		moved.LastAccessed = time.Now()
+		// The bytes moved, they did not disappear: carry the credit to the new
+		// key so a rename is accounting-neutral.
+		released := cm.unaccountNVMeLocked(moves[i].oldKey)
 		cm.entries.del(moves[i].oldKey)
 		cm.entries.put(&moved)
+		if moved.Tier == TierNVMe && released > 0 {
+			cm.accountNVMeLocked(moves[i].newKey, released)
+		}
 	}
 	cm.mu.Unlock()
 
@@ -153,6 +170,7 @@ func (cm *DefaultCacheManager) dropEntries(path string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.removeChunkEntriesLocked(path)
+	cm.unaccountNVMeLocked(path)
 	cm.entries.del(path)
 }
 

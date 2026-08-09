@@ -34,6 +34,57 @@ forever, one that undercounts tears a live pod's mount out from under it.
 Reconcile the journal against actual mountpoints at startup rather than
 trusting it.
 
+### 1.1b Fixed this session: NVMe accounting drift and a torn-write boundary
+
+Recorded here because two are shipped fixes worth not re-litigating, and the
+third is a live constraint on what the cache promises.
+
+**`nvmeUsed` drifted, and the surplus was unreclaimable.** The counter derived
+its delta from the entry table (read old size, subtract, add new), but every
+caller installs the table row *after* `putToNVMeWithEviction` returns. Two
+concurrent writers to one path therefore both read "no existing entry", both
+added a full size, and only one row landed. Eviction can only free what an entry
+claims, so the surplus survived for the process lifetime: a node drifts toward
+apparently "full" and starts refusing writes with `NVMe storage full after
+eviction` on a nearly empty disk. Four distinct sites had the same shape
+(derived-delta race; `removeChunkEntriesLocked` dropping chunk rows without
+releasing bytes; chunk completion double-counting an already-accounted parent;
+rename releasing without re-crediting).
+
+Fixed with an explicit per-key ledger, `nvmeBytes map[string]int64`, where
+`nvmeUsed` is always exactly its sum and every update is idempotent in the key
+(`accountNVMeLocked` / `unaccountNVMeLocked`).
+
+That alone was not sufficient, which is the part worth remembering: idempotence
+*in the key* does not compose when the disk mutation and the ledger update are
+two separate critical sections. A delete and a write on one key interleave as
+(delete bytes) → (write bytes, credit) → (unaccount) → (install row), leaving
+bytes and a row with no credit — a silent undercount that lets the cache
+overfill. The mutation, not just the ledger write, has to be the atom, so a
+striped `nvmeKeyMu` now spans both steps in `putToNVMeWithEviction`,
+`deleteLocalNVMeFootprint`, and the chunk-retire loop in `chunk_complete.go`.
+Regression coverage in `nvme_accounting_test.go`, including the consequence test
+(a 256B write into a 16KB cache must still succeed after concurrent churn).
+
+**A pre-existing data race in `evictionSafe`**, found by the same tests and
+confirmed against unmodified source before being attributed: `evictToTarget`
+collects `*CacheEntry` pointers under RLock, releases it, then reads
+`PersistedToCloud`/`IsChunked`/`NumChunks`/`Size` off the live pointer while
+`markPersistedToCloud` writes them under the write lock. Fixed with a locked
+snapshot.
+
+**Chunked overwrite is not atomic** — measured, not fixed, and now documented in
+`docs/SEMANTICS.md`. `putChunked` writes chunks in parallel with no version
+barrier, so a concurrent reader assembles a mix of old and new chunks in ~93% of
+reads under a tight overwrite loop; the unchunked path is atomic (0 torn in
+214,181). The old semantics doc asserted same-node writers "serialize through
+the FUSE layer", which is true of the FUSE entrance only — the HTTP API, warm,
+and promote all bypass it. `TestConcurrentWrite_ChunkedOverwriteTears` pins the
+length property that does hold and logs the tearing without failing, so a future
+fix shows up as the log going quiet. A real fix means versioned chunk names or a
+staged-then-renamed directory; worth doing only if a workload overwrites large
+files in place, which the checkpoint/model workloads do not.
+
 ### 1.2 Remote chunk reads verify size, not content
 
 `fetchAndLandChunkOrdered` (`internal/cache/chunk_complete.go:336`) lands
@@ -61,25 +112,35 @@ chunk-and-cloud-persist pipeline, **not** FUSE flags — those were already A/B'
 
 ### 1.4 Phase 5 read-path levers (from the JuiceFS write-up)
 
-Confirmed absent in the tree; each is small and independent:
+**Two of the three items previously listed here were already implemented.** The
+error came from grepping for the literal string `singleflight`, which appears
+nowhere in the tree — the mechanism is hand-rolled under a different name. A
+name search is not an existence check; corrected against the call sites:
 
-- **Client-side location-metadata TTL cache.** Every location lookup hits the
-  coordinator today — `GetFileLocation` is called from five separate paths
-  (`cache.go:964`, `cache.go:2816`, `peer_storage.go:606`,
-  `replica_reconciler.go:165`, `delete.go:361`) with no cache in front of any of
-  them. A model directory is hundreds of files. Pairs naturally with
-  `cacheMode: readonly`, where a long TTL is safe by construction.
-- **Request coalescing on the demand path.** There is no `singleflight` anywhere
-  in the tree. Chunk *completion* dedupes by file (`chunk_complete.go:58`) and
-  *prefetch* dedupes by chunk (`cache.go:3495`), but two concurrent demand reads
-  of the same cold chunk still issue two fetches. Under a herd that is exactly
-  the traffic admission control is there to shed.
-- **Read-ahead ratio.** `adaptive_window.go` sizes the window in whole chunks;
-  there is no sub-chunk ratio. Matters for random-access formats
-  (TFRecord/HDF5/LMDB) where whole-chunk prefetch is read amplification. Lowest
-  confidence of the three — verify against a real random-read workload before
-  building it, since our adaptive window may already cover the sequential case
-  that motivated theirs.
+- ~~**Request coalescing on the demand path.**~~ **Already present.**
+  `startChunkFetch`/`completeChunkFetch` (`cache.go:3000`) is a singleflight in
+  everything but name: first caller for a chunk key becomes leader, the rest
+  wait on `state.done` and share the result. It is on the demand path —
+  `cache.go:2976`, immediately after the range-cache miss — with a wait timeout
+  and a `clearStaleChunkFetch` retry so a wedged leader cannot strand followers.
+- ~~**Client-side location-metadata TTL cache.**~~ **Already present**, in two
+  layers. `metadata_lookup.go` answers FUSE lookup/readdir/getattr from the
+  entry table's indexes and only falls through to the coordinator's cached
+  metadata view past `MetadataRefreshTTL` (default 5s). The two hot
+  `GetFileLocation` call sites each sit behind their own TTL memo —
+  `hybridHints` (`cache.go:977`) and the chunk-stride resolver
+  (`cache.go:2905`). The three remaining callers are cold paths: delete,
+  replica reconcile, and a peer fallback.
+
+  Left open: the TTL is uniform. JuiceFS's actual prescription was a *longer*
+  TTL for read-only mounts, which we could take safely under
+  `cacheMode: readonly` — cheap, and the one part of this item still unbuilt.
+- **Read-ahead ratio** — genuinely absent, and now the only real item here.
+  `adaptive_window.go` sizes the window in whole chunks; there is no sub-chunk
+  ratio. Matters for random-access formats (TFRecord/HDF5/LMDB) where
+  whole-chunk prefetch is read amplification. Verify against a real random-read
+  workload before building it: our adaptive window may already cover the
+  sequential case that motivated theirs.
 
 ### 1.5 Fetch leases still ride the HTTP fallback
 
@@ -138,7 +199,26 @@ intent and asserts anything about what comes back. Whatever the fix, this is the
 test that proves it. Follow the project rule — key the handoff off observed
 state (intent count, a counter), never a sleep against real I/O.
 
-### 2.4 Cold-vs-warm needs a repeatable harness, not one run
+### 2.4 Concurrency coverage exists now; the gap moved up a layer
+
+`internal/cache/concurrent_rw_test.go` (12 tests) and
+`nvme_accounting_test.go` (7) now cover many-requests-at-once against one
+manager: overlapping `ReadRange` windows straddling chunk edges, whole-file read
+herds, atomic-vs-torn overwrite, mixed read/write/delete load, the same under
+continuous eviction, range boundaries, degenerate sizes across
+`Get`/`ReadRange`/`WriteTo`, and all-or-nothing delete visibility. They found
+both bugs in 1.1b. Verified with `-race -count=10`.
+
+Two things they deliberately do not cover, both now the real gap:
+- **Single-manager only.** Every test drives one `DefaultCacheManager` with mock
+  tiers. Concurrent *cross-node* writers — the case `docs/SEMANTICS.md` says is
+  uncoordinated — are untested; that needs the in-process gRPC peer harness
+  (`startHerdPeer`) rather than mocks.
+- **Concurrency against the FUSE entrance.** The tests enter at the cache API,
+  which is the entrance the HTTP path uses. The FUSE layer's own serialization
+  claim is therefore asserted by documentation, not by a test.
+
+### 2.5 Cold-vs-warm needs a repeatable harness, not one run
 
 1.48s vs 3.26s is a real number from a real run, but it is n=1 on one model at
 one size. A cold node warms itself just by serving one load, so every repeat
@@ -201,7 +281,8 @@ worth one profiling pass before anyone tunes on guesses.
    valid checksum is the worst-consequence bug in the list.
 3. **2.1 FL-3 and NI-1** — cheapest real risk reduction available; both are
    already written.
-4. **1.4 metadata cache + singleflight** — small, independent, directly cuts
-   coordinator load and herd traffic.
+4. **1.4 read-only metadata TTL** — the only part of 1.4 not already built;
+   small and independent. The read-ahead ratio waits on a random-read workload
+   to justify it.
 5. **1.3 streaming writes** — largest single perf number left, but a real
    refactor; do it when the above are stable.

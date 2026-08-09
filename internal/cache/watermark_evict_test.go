@@ -67,7 +67,7 @@ func seedNVMe(t *testing.T, cm *DefaultCacheManager, path string, size int, pers
 		LastAccessed: time.Now().Add(-age), Tier: TierNVMe,
 		PersistedToCloud: persisted,
 	})
-	cm.nvmeUsed += int64(size)
+	cm.accountNVMeLocked(path, int64(size))
 	cm.mu.Unlock()
 }
 

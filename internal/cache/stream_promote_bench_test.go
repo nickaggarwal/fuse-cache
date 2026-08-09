@@ -84,7 +84,7 @@ func BenchmarkPeerReceive_StreamingTee(b *testing.B) {
 		// same for both benchmarks' fairness since the old path overwrites.
 		cm.mu.Lock()
 		if e, ok := cm.entries.get(path); ok && e != nil {
-			cm.nvmeUsed -= e.Size
+			cm.unaccountNVMeLocked(path)
 			cm.entries.del(path)
 		}
 		cm.mu.Unlock()

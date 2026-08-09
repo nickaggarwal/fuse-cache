@@ -31,16 +31,32 @@ trade is a durability window (see Writes).
 - In-place partial rewrite of an existing chunked file is supported but
   slow (read-modify-write of affected chunks) — avoid for hot paths.
 - Concurrent writers to the same path from different nodes are NOT
-  coordinated: last publish wins, no merge. Concurrent writers on one node
-  serialize through the FUSE layer.
+  coordinated: last publish wins, no merge.
+- Concurrent writers on one node serialize only if they enter through the
+  FUSE layer. The HTTP API (`PUT /api/files/{path}`) does not, and neither
+  does a warm or a promote. For those entrances the atomicity depends on
+  size:
+  - **Unchunked** (payload ≤ chunk size): atomic. One object is swapped, so
+    a concurrent reader sees some whole version, never a mix. Measured 0
+    torn reads in 214,181 under a tight overwrite loop.
+  - **Chunked**: NOT atomic. `putChunked` writes chunks in parallel with no
+    version barrier, so a reader assembling the file mid-overwrite gets some
+    old chunks and some new. This is the common case under contention, not a
+    rare race — measured ~93% of reads. The length is always valid; the
+    contents may straddle two versions.
+
+  Pinned by `TestConcurrentWrite_{Unchunked,Chunked}OverwriteIsAtomic` /
+  `...Tears` in `internal/cache/concurrent_rw_test.go`. If you need an
+  atomic replace of a large file, write to a temporary path and rename.
 
 ## Deletes and renames
 
 - Delete removes local + peer + cloud copies (best-effort; cloud delete is
   asynchronous). Open handles on other nodes may keep serving cached chunks
   until their range caches expire.
-- Rename is a copy+delete at the cache layer — O(size), not atomic. Do not
-  build lock protocols on rename.
+- Rename is a metadata move (`os.Rename` locally, a location-metadata
+  rewrite cluster-wide) as of `19e069e`; it is no longer O(size). It is
+  still not atomic cluster-wide — do not build lock protocols on it.
 
 ## Metadata and permissions
 
@@ -57,8 +73,8 @@ trade is a durability window (see Writes).
   publish lands (typically sub-second). Reading a path on node B while node
   A is mid-write yields not-found or the previous version, never torn data
   at chunk granularity — but multi-chunk files can mix old/new chunks if
-  overwritten in place while being read remotely. Write-once-then-read
-  workloads (checkpoints, models) never see this.
+  overwritten in place while being read, remotely *or locally* (see Writes).
+  Write-once-then-read workloads (checkpoints, models) never see this.
 - **Cache staleness**: range caches expire after 30s idle; NVMe entries
   revalidate against cloud (existence + size) on the eviction path after
   restart. There is no per-read etag check against cloud (perf trade;

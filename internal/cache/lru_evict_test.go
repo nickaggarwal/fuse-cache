@@ -270,7 +270,7 @@ func benchEvictManager(b *testing.B, n int) *DefaultCacheManager {
 			Tier: TierNVMe, PersistedToCloud: true,
 			LastAccessed: time.Unix(int64(i), 0),
 		})
-		cm.nvmeUsed += 100
+		cm.accountNVMeLocked(path, 100)
 	}
 	cm.mu.Unlock()
 	// Only the coldest entry is actually reclaimed, so only it needs to exist.

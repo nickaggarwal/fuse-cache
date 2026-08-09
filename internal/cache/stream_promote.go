@@ -110,6 +110,10 @@ func (sp *streamPromotion) Commit() {
 		sp.w.Abort()
 		return
 	}
+	// Publishing the bytes and crediting them is one mutation of this key —
+	// see nvmeKeyMu. A delete landing between the two would drop the credit
+	// for bytes that are still on disk.
+	defer sp.cm.lockNVMeKey(sp.path)()
 	if err := sp.w.Commit(); err != nil {
 		sp.cm.logger.Printf("Streaming promotion commit failed for %s: %v", sp.path, err)
 		return
@@ -123,14 +127,8 @@ func (sp *streamPromotion) Commit() {
 		Tier:         TierNVMe,
 	}
 	sp.cm.mu.Lock()
-	if existing, ok := sp.cm.entries.get(sp.path); ok && existing != nil && existing.Tier == TierNVMe {
-		// Replaced an object we were already accounting for.
-		sp.cm.nvmeUsed -= existing.Size
-		if sp.cm.nvmeUsed < 0 {
-			sp.cm.nvmeUsed = 0
-		}
-	}
-	sp.cm.nvmeUsed += sp.size
+	// Replaces whatever this key was already credited with, if anything.
+	sp.cm.accountNVMeLocked(sp.path, sp.size)
 	sp.cm.entries.put(meta)
 	sp.cm.mu.Unlock()
 }

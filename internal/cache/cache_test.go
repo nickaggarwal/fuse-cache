@@ -305,7 +305,7 @@ func TestCacheManager_DeleteFallsBackToFilePathWhenStoragePathMissing(t *testing
 		LastAccessed: time.Now(),
 		Tier:         TierNVMe,
 	})
-	cm.nvmeUsed = 1
+	cm.accountNVMeLocked(filePath, 1)
 	cm.mu.Unlock()
 
 	if err := cm.Delete(ctx, filePath); err != nil {
@@ -374,7 +374,7 @@ func TestCacheManager_Evict(t *testing.T) {
 		cm.mu.Lock()
 		cm.entries.put(entry)
 		entry.Tier = TierNVMe
-		cm.nvmeUsed += entry.Size
+		cm.accountNVMeLocked(entry.FilePath, entry.Size)
 		cm.mu.Unlock()
 	}
 
@@ -528,7 +528,7 @@ func TestCacheManager_PromoteToNVMeReplacesExistingSize(t *testing.T) {
 		LastAccessed: time.Now().Add(-1 * time.Hour),
 		Tier:         TierNVMe,
 	})
-	cm.nvmeUsed = 10
+	cm.accountNVMeLocked("/promote.txt", 10)
 	cm.mu.Unlock()
 
 	cm.promoteToNVMe(ctx, &CacheEntry{
@@ -580,6 +580,9 @@ func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
 			LastAccessed: time.Now().Add(-1 * time.Hour),
 			Tier:         TierNVMe,
 		})
+		// The bytes live in the chunk files; the parent row is metadata over
+		// them, so the ledger credits the chunks.
+		cm.accountNVMeLocked(chunkPath, int64(len(payload)))
 		cm.mu.Unlock()
 	}
 	cm.mu.Lock()
@@ -592,7 +595,6 @@ func TestCacheManager_PutFromFileReplacesChunkedLocalFootprint(t *testing.T) {
 		IsChunked:    true,
 		NumChunks:    2,
 	})
-	cm.nvmeUsed = 8
 	cm.mu.Unlock()
 
 	stagedPath := dir + "/stage.bin.new"
@@ -647,6 +649,7 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 			LastAccessed: old,
 			Tier:         TierNVMe,
 		})
+		cm.accountNVMeLocked(chunkPath, int64(len(payload)))
 		cm.mu.Unlock()
 	}
 	cm.mu.Lock()
@@ -661,7 +664,6 @@ func TestCacheManager_EvictDeletesFullChunkedFootprint(t *testing.T) {
 		// Durable in cloud: eviction refuses to delete the only copy.
 		PersistedToCloud: true,
 	})
-	cm.nvmeUsed = 8
 	cm.mu.Unlock()
 
 	if err := cm.Put(ctx, &CacheEntry{

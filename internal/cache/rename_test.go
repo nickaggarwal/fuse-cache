@@ -65,7 +65,7 @@ func seedRenameFile(t *testing.T, cm *DefaultCacheManager, path string, size int
 		FilePath: path, StoragePath: path, Size: int64(size),
 		Tier: TierNVMe, LastAccessed: time.Now(),
 	})
-	cm.nvmeUsed += int64(size)
+	cm.accountNVMeLocked(path, int64(size))
 	cm.mu.Unlock()
 	return data
 }

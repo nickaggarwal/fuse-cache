@@ -69,7 +69,7 @@ func completionTestManager(t *testing.T, numChunks int64, chunkSize int64, missi
 		if !missing[i] {
 			cp := fmt.Sprintf("%s_chunk_%d", parent, i)
 			cm.entries.put(&CacheEntry{FilePath: cp, Size: chunkSize, Tier: TierNVMe})
-			cm.nvmeUsed += chunkSize
+			cm.accountNVMeLocked(cp, chunkSize)
 		}
 	}
 	return cm, parent, full
