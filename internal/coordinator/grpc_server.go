@@ -101,6 +101,7 @@ func peerInfoToProto(p *PeerInfo) *pb.PeerInfo {
 		LastHeartbeat:  timestamppb.New(p.LastHeartbeat),
 		Labels:         p.Labels,
 		NodeName:       p.NodeName,
+		NodeIp:         p.NodeIP,
 	}
 }
 
@@ -120,6 +121,7 @@ func peerInfoFromProto(p *pb.PeerInfo) *PeerInfo {
 		LastHeartbeat:  lastHB,
 		Labels:         p.Labels,
 		NodeName:       p.NodeName,
+		NodeIP:         p.NodeIp,
 	}
 }
 

@@ -35,6 +35,15 @@ message PeerInfo {
   // to prefer nodes that already hold a dataset. Empty on older clients and
   // outside Kubernetes — never required for registration or selection.
   string node_name = 10;
+  // Node IP (downward API status.hostIP). The second half of the join key:
+  // node_name is what a human or a Kubernetes-aware controller joins on, but
+  // an llm-d EndpointPicker only ever sees pod.Status.HostIP on its endpoints
+  // (EndpointMetadata.NodeAddress) — it carries no node name at all. Without
+  // this a router cannot tell which fuse peer is co-located with a candidate
+  // model-server pod, since the two live in different pods and their pod IPs
+  // share nothing. Same contract as node_name: advisory, empty off-Kubernetes
+  // and on older clients, never required for registration or selection.
+  string node_ip = 11;
 }
 
 message ChunkInfo {

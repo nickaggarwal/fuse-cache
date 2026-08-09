@@ -289,6 +289,10 @@ Run a single test: `go test ./internal/session/ -run TestManager_RefCount -v`.
 Test coverage spans cache tiers, coordinator (incl. gRPC + manifest), API
 handlers, and the CSI subsystem (session manager, agent server, CSI driver).
 
+`integrations/llm-d-fuse-residency/` is a **separate Go module** and is not
+covered by `make test`. Test it from inside that directory:
+`cd integrations/llm-d-fuse-residency && go test -race ./...` (works on macOS).
+
 ## AKS Deployment
 
 ```bash
@@ -588,6 +592,15 @@ marshals the whole struct and no store rebuilds `PeerInfo` field-by-field, so
 only the two gRPC converters needed edits. Empty on older clients and outside
 Kubernetes — never required for registration or selection (pinned by test).
 
+`PeerInfo.NodeIP` (proto field 11, from `status.hostIP` via the downward API)
+was added later for Phase 4 and is a *different* join key, not a duplicate.
+`NodeName` is what anything that can read the Kubernetes API joins on; an
+llm-d EPP endpoint cannot — `EndpointMetadata` carries `NodeAddress`
+(= `pod.Status.HostIP`) and no node name at all, and the vLLM pod and the fuse
+client DaemonSet pod are different pods, so their pod IPs share nothing. Host
+IP is the only field both sides can see. Both are advisory and both may be
+empty.
+
 **Phase 3 — residency query** (`internal/cache/residency.go`,
 `internal/coordinator/residency.go`). `GET /api/residency?prefix=<p>` on the
 coordinator, `GET /api/cache/residency?prefix=<p>` on each client.
@@ -679,8 +692,58 @@ Two findings from the first live run, both fixed:
 
 Result: 7/7 sections pass on `stargz-test` (`resid-intents2`, 2026-08-09).
 
-Phase 4 (llm-d EPP plugin — an Affinity-category `Scorer` returning
-`fraction`, in a separate out-of-tree module) is designed but deliberately not
-built until 1–3 land. Note the landscape moved: EPP core left GIE for
-`github.com/llm-d/llm-d-router`, and docs showing
-`Score(ctx *types.SchedulingContext, ...)` are stale.
+**Phase 4 — llm-d routing plugin** (`integrations/llm-d-fuse-residency/`).
+A separate Go module (`github.com/nilesh/llm-d-fuse-residency`), deliberately
+*not* part of the `fuse-client` module: it talks to the coordinator only over
+HTTP, imports nothing from the parent repo, and therefore builds and tests on
+macOS. Run its suite from inside the directory (`go test ./...`), not via
+`make test`.
+
+```
+pkg/residency/   HTTP client for GET /api/residency — no llm-d dependency
+pkg/attribute/   shared FuseResidency attribute + the two plugin type names
+pkg/extractor/   background poller; joins reports onto endpoints by node IP
+pkg/scorer/      Affinity-category Scorer
+cmd/epp/         custom EPP binary: register two plugins, call upstream runner
+deploy/          EndpointPickerConfig wiring them beside the stock scorers
+```
+
+Landscape, verified against source rather than docs (web results were stale):
+EPP core left GIE for `github.com/llm-d/llm-d-router`, pinned at main commit
+`95625abee` — **not** a release tag. At `v0.9.0`, `Register` takes no stability
+argument and `EndpointMetadata` has no `NodeAddress` field, so the join key
+does not exist there. Current interface is
+`Category() ScorerCategory` + `Score(ctx, *InferenceRequest, []Endpoint) map[Endpoint]float64`.
+
+- **No fork of llm-d-router is required**, despite what the one-line
+  out-of-tree doc implies. There is no dynamic plugin loading, but
+  `fwkplugin.Register` is exported, the registry map is package-global and
+  never reset, and `runner.NewRunner().Run(ctx)` is public — so a ~20-line
+  `main()` that registers before `Run` is the whole integration. Everything is
+  additive: a config that omits the fuse plugins behaves like stock EPP.
+- **Unknown ≠ zero**, enforced at three layers (`Unknown` on the wire, `Known`
+  on the attribute, `unknownScore` at score time). The framework accumulates
+  `weightedScore[ep] += score * weight`, so an endpoint a scorer *omits* is
+  arithmetically identical to one scored 0 — "I don't know" cannot be said by
+  silence, and saying it with 0 punishes a briefly-unreachable node exactly as
+  hard as one verified to hold none of the model. Unreachable node, missing
+  `node_ip`, model not in `models[]`, and a reading past `staleAfterSec` all
+  score `unknownScore` (default 0.4); only a *measured* 0% scores 0.0. Same
+  rule as the tier-perf fix in `5ac933d`.
+- A failed poll retains the previous reading (blip resilience) but staleness
+  still expires it to unknown, never to zero.
+- Two configs are rejected at startup because they fail silently at runtime:
+  empty `models[]`, and `staleAfterSec <= pollIntervalSec` (every reading
+  expires before the next poll can replace it).
+- Both plugins register `StabilityAlpha`, so deployments need
+  `--allow-experimental-plugins` alongside `--config-file`.
+- `cmd/epp/config_test.go` validates the *shipped* YAML — every declared type
+  resolves in the registry and builds from its parameters, every `pluginRef`
+  resolves, and `fuse-residency-scorer` carries a non-zero weight (a config
+  that declares it but forgets the ref loads perfectly and changes nothing).
+  It stops short of `InstantiateAndConfigure`, which drags in upstream's whole
+  flow-control/saturation default graph and would fail on llm-d bumps for
+  reasons unrelated to this config.
+
+Not yet done: no image has been built or deployed, and no live vLLM/Qwen
+routing test has been run.

@@ -1,0 +1,79 @@
+# EndpointPickerConfig wiring the fuse residency plugins alongside the stock
+# llm-d scorers.
+#
+# The two scorers answer different questions and are meant to coexist:
+#
+#   prefix-cache-scorer     "who already has this conversation's KV blocks?"
+#   fuse-residency-scorer   "who can load this model's weights at NVMe speed
+#                            instead of pulling them from object storage?"
+#
+# The first is about a warm request, the second about a warm node. Weights below
+# reflect that: prefix-cache dominates for steady-state traffic, and residency
+# only decides between endpoints the prefix scorer is indifferent about — which
+# is exactly the cold-start case where it matters. Raise the residency weight if
+# your pods are short-lived enough that most requests hit a cold node anyway.
+#
+# Requires an EPP binary that registers these plugin types
+# (integrations/llm-d-fuse-residency/cmd/epp) started with
+# --allow-experimental-plugins, since both are registered Alpha.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: fuse-residency-extractor
+    parameters:
+      # In-cluster DNS of the fuse coordinator. Its ClusterIP service fronts
+      # 3 stateless replicas; any of them can answer.
+      coordinatorURL: http://coordinator.fuse-system.svc.cluster.local:8080
+      # Only needed if the coordinator runs with -api-key. Prefer sourcing this
+      # from a Secret via envsubst or a Helm value rather than committing it.
+      # apiKey: ""
+
+      # Every model the router may be asked for needs an entry: the model name
+      # as it arrives in the request, and the cache prefix its weights live
+      # under. A model missing from this list scores neutral everywhere, not
+      # zero — the plugin never pretends to know something it was not told to
+      # measure.
+      models:
+        - model: Qwen/Qwen2.5-7B-Instruct
+          prefix: models/Qwen2.5-7B-Instruct/
+
+      # Residency moves on the timescale of a warm or an eviction, so 10s is
+      # already faster than the signal changes. The coordinator's own 5s TTL
+      # cache absorbs anything tighter.
+      pollIntervalSec: 10
+      # How long a reading stays trusted after the last successful poll. Must
+      # exceed pollIntervalSec — the plugin refuses to start otherwise, because
+      # a shorter window expires every reading before it can be refreshed and
+      # the scorer would silently never fire.
+      staleAfterSec: 90
+
+  - type: fuse-residency-scorer
+    parameters:
+      # What an endpoint scores when its residency could not be measured.
+      # Deliberately NOT 0: the framework sums `score * weight` across scorers,
+      # so 0 would punish a node for a transient coordinator blip exactly as
+      # hard as one verified to hold none of the model. 0.4 loses to any node
+      # measured above 40% resident and beats anything colder.
+      unknownScore: 0.4
+      # Added to a fully-resident node whose prefix is pinned by a warm intent,
+      # then clamped to 1. Pinning predicts residency will persist, which breaks
+      # ties between two equally-warm nodes.
+      pinnedBonus: 0.05
+
+  - type: prefix-cache-scorer
+  - type: queue-scorer
+  - type: decode-filter
+  - type: max-score-picker
+  - type: single-profile-handler
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: max-score-picker
+      - pluginRef: prefix-cache-scorer
+        weight: 3
+      - pluginRef: queue-scorer
+        weight: 1
+      - pluginRef: fuse-residency-scorer
+        weight: 2

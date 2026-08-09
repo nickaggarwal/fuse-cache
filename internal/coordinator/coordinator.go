@@ -62,6 +62,16 @@ type PeerInfo struct {
 	// Advisory and best-effort: empty outside Kubernetes and on older clients,
 	// and never required for registration or peer selection.
 	NodeName string `json:"node_name,omitempty"`
+	// NodeIP is the IP of the node this peer runs on (downward API
+	// status.hostIP). NodeName is the join key for anything that can read the
+	// Kubernetes API; NodeIP is the join key for anything that cannot. An
+	// llm-d EndpointPicker sees only pod.Status.HostIP on its candidate
+	// endpoints and no node name, so this is the field that lets it match a
+	// model-server pod to the fuse peer on the same node — their pod IPs
+	// differ, being separate pods. Advisory and best-effort, exactly like
+	// NodeName: empty outside Kubernetes and on older clients, never required
+	// for registration or peer selection.
+	NodeIP string `json:"node_ip,omitempty"`
 }
 
 // ChunkInfo represents a file chunk

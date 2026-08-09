@@ -63,8 +63,12 @@ type NodeResidency struct {
 	// NodeName is the Kubernetes node name, the join key an external scheduler
 	// needs. Empty on peers registered outside Kubernetes or by older clients.
 	NodeName string `json:"node_name,omitempty"`
-	PeerID   string `json:"peer_id"`
-	Address  string `json:"address,omitempty"`
+	// NodeIP is the same join key for consumers that cannot read the
+	// Kubernetes API. An llm-d EndpointPicker matches on this: its candidate
+	// endpoints carry pod.Status.HostIP and no node name.
+	NodeIP  string `json:"node_ip,omitempty"`
+	PeerID  string `json:"peer_id"`
+	Address string `json:"address,omitempty"`
 
 	Files         int     `json:"files"`
 	ResidentFiles int     `json:"resident_files"`
@@ -245,7 +249,7 @@ func (cs *CoordinatorService) queryPrefixResidency(ctx context.Context, prefix, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			n := NodeResidency{NodeName: p.NodeName, PeerID: p.ID, Address: p.Address}
+			n := NodeResidency{NodeName: p.NodeName, NodeIP: p.NodeIP, PeerID: p.ID, Address: p.Address}
 			rep, err := fetchPeerResidency(ctx, p.Address, prefix, apiKey)
 			if err != nil {
 				n.Unknown = true

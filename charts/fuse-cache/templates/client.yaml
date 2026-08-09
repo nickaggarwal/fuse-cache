@@ -248,6 +248,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # status.hostIP, not status.podIP: the join key an external router
+            # uses to match a model-server pod to the fuse peer on its node.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: FUSE_PEER_READ_MBPS
               value: {{ .Values.config.peerReadMBps | quote }}
           ports:

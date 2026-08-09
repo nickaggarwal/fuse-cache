@@ -839,6 +839,11 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		Labels:         labels,
 		// Empty outside Kubernetes; nothing downstream may require it.
 		NodeName: os.Getenv("NODE_NAME"),
+		// NODE_IP is status.hostIP, not POD_IP. It is the only join key an
+		// llm-d EndpointPicker can use: its endpoints carry pod.Status.HostIP
+		// and no node name, and the model-server pod's own IP has nothing in
+		// common with this daemon's. Also empty outside Kubernetes.
+		NodeIP: os.Getenv("NODE_IP"),
 	}
 
 	// Keep retrying registration until success or shutdown.

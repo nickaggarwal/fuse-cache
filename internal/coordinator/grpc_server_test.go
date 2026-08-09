@@ -80,17 +80,24 @@ func TestGRPC_RegisterAndGetPeers(t *testing.T) {
 	}
 }
 
-// TestGRPC_PeerNodeNameRoundTrip: NodeName is the join key an external
-// scheduler uses to map a Kubernetes node to a fuse peer, so it has to survive
-// the proto round-trip — and its absence has to stay harmless, since peers
-// outside Kubernetes and clients older than the field will never send it.
-func TestGRPC_PeerNodeNameRoundTrip(t *testing.T) {
+// TestGRPC_PeerNodeIdentityRoundTrip: NodeName and NodeIP are the two join
+// keys an external scheduler uses to map a Kubernetes node to a fuse peer, so
+// both have to survive the proto round-trip — and their absence has to stay
+// harmless, since peers outside Kubernetes and clients older than the fields
+// will never send them.
+//
+// Both are carried because consumers differ in what they can see. A controller
+// with Kubernetes API access joins on NodeName; an llm-d EndpointPicker cannot,
+// because its candidate endpoints carry only pod.Status.HostIP and no node name
+// at all, so it joins on NodeIP. Dropping either one silently strands that class
+// of consumer.
+func TestGRPC_PeerNodeIdentityRoundTrip(t *testing.T) {
 	client, cleanup := startTestGRPCServer(t)
 	defer cleanup()
 	ctx := context.Background()
 
 	for _, p := range []*pb.PeerInfo{
-		{Id: "peer-node", Address: "10.0.0.1:8081", Status: "active", NodeName: "aks-gpu-000001"},
+		{Id: "peer-node", Address: "10.0.0.1:8081", Status: "active", NodeName: "aks-gpu-000001", NodeIp: "10.224.0.7"},
 		{Id: "peer-bare", Address: "10.0.0.2:8081", Status: "active"},
 	} {
 		if _, err := client.RegisterPeer(ctx, &pb.RegisterPeerRequest{Peer: p}); err != nil {
@@ -102,18 +109,19 @@ func TestGRPC_PeerNodeNameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPeers: %v", err)
 	}
-	got := make(map[string]string, len(resp.Peers))
+	type identity struct{ name, ip string }
+	got := make(map[string]identity, len(resp.Peers))
 	for _, p := range resp.Peers {
-		got[p.Id] = p.NodeName
+		got[p.Id] = identity{p.NodeName, p.NodeIp}
 	}
 	if len(got) != 2 {
-		t.Fatalf("got %d peers, want 2 — a peer without NodeName must still register", len(got))
+		t.Fatalf("got %d peers, want 2 — a peer without node identity must still register", len(got))
 	}
-	if got["peer-node"] != "aks-gpu-000001" {
-		t.Errorf("node_name = %q, want %q", got["peer-node"], "aks-gpu-000001")
+	if want := (identity{"aks-gpu-000001", "10.224.0.7"}); got["peer-node"] != want {
+		t.Errorf("peer-node identity = %+v, want %+v", got["peer-node"], want)
 	}
-	if got["peer-bare"] != "" {
-		t.Errorf("node_name = %q for a peer that sent none, want empty", got["peer-bare"])
+	if got["peer-bare"] != (identity{}) {
+		t.Errorf("identity = %+v for a peer that sent none, want both empty", got["peer-bare"])
 	}
 }
 
