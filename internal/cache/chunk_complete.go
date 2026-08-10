@@ -358,14 +358,11 @@ func (cm *DefaultCacheManager) fetchAndLandChunkOrdered(ctx context.Context, chu
 			Size: int64(len(entry.Data)), LastAccessed: time.Now(),
 			Tier: TierNVMe, Data: entry.Data,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, landed); err != nil {
-			return 0, err
-		}
 		meta := *landed
 		meta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&meta)
-		cm.mu.Unlock()
+		if err := cm.putToNVMeWithEviction(ctx, landed, &meta); err != nil {
+			return 0, err
+		}
 		cm.metrics.RecordWrite(landed.Size)
 		cm.advertisePromoted(chunkPath)
 		return landed.Size, nil

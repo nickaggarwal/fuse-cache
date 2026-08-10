@@ -205,14 +205,11 @@ func TestCacheManager_DeleteChunkedParentRemovesChunks(t *testing.T) {
 			Tier:         TierNVMe,
 			Data:         payload,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
-			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
-		}
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&chunkMeta)
-		cm.mu.Unlock()
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry, &chunkMeta); err != nil {
+			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
+		}
 	}
 
 	parent := &CacheEntry{
@@ -440,14 +437,11 @@ func TestCacheManager_ReadRangeTouchesParentAndChunk(t *testing.T) {
 			Tier:         TierNVMe,
 			Data:         payload,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
-			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
-		}
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&chunkMeta)
-		cm.mu.Unlock()
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry, &chunkMeta); err != nil {
+			t.Fatalf("putToNVMeWithEviction(%s): %v", chunkPath, err)
+		}
 	}
 
 	cm.mu.Lock()

@@ -66,6 +66,37 @@ striped `nvmeKeyMu` now spans both steps in `putToNVMeWithEviction`,
 Regression coverage in `nvme_accounting_test.go`, including the consequence test
 (a 256B write into a 16KB cache must still succeed after concurrent churn).
 
+Widening the atom once was still not enough, for the same reason a third time:
+the *row install* was left outside it. Every caller wrote bytes and credited
+them under the key lock, then installed the entry table row after releasing it.
+Eviction and overwrite-cleanup can only reclaim what a row claims, so in that
+window the bytes are charged to a key nothing can release. `putToNVMeWithEviction`
+now takes the row as a parameter and publishes it inside the same critical
+section, so bytes, credit, and row move together at all seven call sites. The
+general lesson, stated once: **an invariant spanning N pieces of state needs all
+N inside the atom.** Each partial fix looked complete because it closed the
+interleaving that happened to be reproducing at the time.
+
+Two methodology notes that cost the most time here:
+- **Vary `GOMAXPROCS`, don't just add load.** The remaining drift would not
+  reproduce in 25 consecutive full-package runs, but failed within 8 at
+  `GOMAXPROCS=2/3/8` and never at 1 or 4. Repetition explores one scheduler's
+  preferred interleavings; changing the processor count explores different ones.
+- **Instrument for the causal chain, not the symptom.** Naming the drifted key
+  was not enough — two different bugs produced the same key. Recording every
+  disk *and* ledger mutation on one timeline with its stack turned a week-shaped
+  guessing game into reading off the last event.
+
+**One reported drift was not a bug at all**, and the same instrumentation is
+what showed it. `deleteLocalNVMeFootprint` removes bytes *before* taking `cm.mu`
+to release their credit, so a snapshot taken under `cm.mu` mid-eviction
+legitimately observes credit whose bytes are gone. The ledger invariant is a
+*quiescent* one. Joining the test's own workers is insufficient because a read
+that misses schedules its promotion on a goroutine that outlives the worker that
+issued it — and that promotion evicts. `assertNoDrift` now drains `bgWg` first.
+Asserting an invariant in a state where it is not yet required is a test bug
+that reads exactly like a product bug.
+
 **A pre-existing data race in `evictionSafe`**, found by the same tests and
 confirmed against unmodified source before being attributed: `evictToTarget`
 collects `*CacheEntry` pointers under RLock, releases it, then reads
@@ -207,7 +238,19 @@ manager: overlapping `ReadRange` windows straddling chunk edges, whole-file read
 herds, atomic-vs-torn overwrite, mixed read/write/delete load, the same under
 continuous eviction, range boundaries, degenerate sizes across
 `Get`/`ReadRange`/`WriteTo`, and all-or-nothing delete visibility. They found
-both bugs in 1.1b. Verified with `-race -count=10`.
+both bugs in 1.1b. Verified with `-race -count=10`, plain `-count=12`, and
+across `GOMAXPROCS=1..8` — the last of which is what actually exposed the
+remaining drift, and is now the mode to run before believing a concurrency fix.
+
+The project's "never race a wall-clock timer against real I/O" rule needed one
+extension. Two of these tests ran their racing workers for a fixed 200ms and
+then asserted `reads > 0`, which bounds the test by the clock but bounds its
+*evidence* by whatever the scheduler granted: under full-package load at
+`GOMAXPROCS=2` the window intermittently yielded zero reads and the test failed
+with "proved nothing" — a starved machine reported as a product defect. They now
+run until a fixed sample size (`awaitReads`), with the deadline demoted to a
+hang backstop. **A timed window is only safe when the assertion doesn't depend
+on how much work fit inside it.**
 
 Two things they deliberately do not cover, both now the real gap:
 - **Single-manager only.** Every test drives one `DefaultCacheManager` with mock

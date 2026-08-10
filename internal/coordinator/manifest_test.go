@@ -329,7 +329,7 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 	if err := src.UpdateFileLocation(ctx, &FileLocation{
 		FilePath: "big.bin", PeerID: "p1", StorageTier: "nvme",
 		FileSize: 10, IsChunked: true,
-		Chunks:   []ChunkInfo{{Index: 0}, {Index: 1}},
+		Chunks: []ChunkInfo{{Index: 0}, {Index: 1}},
 	}); err != nil {
 		t.Fatal(err)
 	}

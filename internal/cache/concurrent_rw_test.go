@@ -171,15 +171,35 @@ func TestConcurrentWrite_UnchunkedOverwriteIsAtomic(t *testing.T) {
 		}()
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	awaitReads(t, &reads, minTornReads)
 	close(stop)
 	wg.Wait()
 
-	if reads.Load() == 0 {
-		t.Fatal("no reads completed; test proved nothing")
-	}
 	if n := mixed.Load(); n > 0 {
 		t.Errorf("torn read on unchunked overwrite: %d of %d reads mixed two versions", n, reads.Load())
+	}
+}
+
+// minTornReads is the sample size the two overwrite-atomicity tests need
+// before their verdict means anything.
+const minTornReads = 200
+
+// awaitReads runs the racing workers until they have completed want reads,
+// rather than for a fixed wall-clock window. A timed window bounds the *test*
+// by the clock but bounds its *evidence* by whatever the scheduler granted:
+// under full-package load at GOMAXPROCS=2 a 200ms window intermittently
+// produced zero reads, so the test failed with "proved nothing" — a starved
+// machine reported as a product defect. Making the sample size the exit
+// condition keeps the assertion meaningful at any speed; the deadline is only
+// a backstop against a genuine hang.
+func awaitReads(t *testing.T, reads *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for reads.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d reads completed in 30s; workers are stuck", reads.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -256,13 +276,10 @@ func TestConcurrentWrite_ChunkedOverwriteTears(t *testing.T) {
 		}()
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	awaitReads(t, &reads, minTornReads)
 	close(stop)
 	wg.Wait()
 
-	if reads.Load() == 0 {
-		t.Fatal("no reads completed; test proved nothing")
-	}
 	// The property that must hold: never a short or over-long file.
 	if n := wrongLen.Load(); n > 0 {
 		t.Errorf("chunked overwrite produced %d reads of the wrong length (of %d)", n, reads.Load())

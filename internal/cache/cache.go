@@ -1290,13 +1290,11 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		return cm.putChunked(ctx, entry)
 	}
 
-	// Try to store in NVME first (with eviction if needed)
-	if err := cm.putToNVMeWithEviction(ctx, entry); err == nil {
-		entry.Tier = TierNVMe
-		cm.mu.Lock()
-		cm.entries.put(entry)
-		cm.mu.Unlock()
-
+	// Try to store in NVME first (with eviction if needed). The tier is set
+	// before the attempt because entry doubles as the row installed under the
+	// key lock; the peer/cloud fallback below overwrites it on success.
+	entry.Tier = TierNVMe
+	if err := cm.putToNVMeWithEviction(ctx, entry, entry); err == nil {
 		cm.metrics.RecordWrite(int64(len(entry.Data)))
 
 		// Deep-copy data before launching goroutine to avoid race
@@ -1429,14 +1427,11 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 			Tier:         TierNVMe,
 			Data:         chunkData,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
-			return fmt.Errorf("failed to store chunk %d in NVMe for %s: %w", i, filePath, err)
-		}
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&chunkMeta)
-		cm.mu.Unlock()
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry, &chunkMeta); err != nil {
+			return fmt.Errorf("failed to store chunk %d in NVMe for %s: %w", i, filePath, err)
+		}
 		cm.metrics.RecordWrite(chunkEntry.Size)
 		remaining -= toRead
 	}
@@ -2183,12 +2178,23 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 	wg.Wait()
 }
 
-// putToNVMeWithEviction tries NVMe write, evicting if necessary
-func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry *CacheEntry) error {
+// putToNVMeWithEviction lands entry's bytes on NVMe, credits them to the
+// ledger, and installs row in the entry table — all three as one mutation of
+// this key.
+//
+// row is the metadata readers and eviction will see: usually a Data-less copy
+// of entry, or entry itself to keep the payload in the table. Passing it in
+// rather than letting the caller install it afterwards is the point. Eviction
+// and overwrite-cleanup can only reclaim what a row claims, so between the
+// credit and the row install the bytes are charged to a key nothing can
+// release, and anything that runs in that window leaves the credit behind for
+// good. Both drift signatures seen under concurrent load — credit with bytes
+// but no row, and credit with a row but no bytes — are that window.
+func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry, row *CacheEntry) error {
 	// What this write replaces is whatever the ledger already credits to this
-	// key — not what the entry table says. The table row is installed by our
-	// caller after we return, so on a concurrent same-path write it is not yet
-	// there to read.
+	// key — not what the entry table says. A concurrent same-path write may
+	// have landed bytes whose row is not installed until it reaches the
+	// critical section below, so the table under-reports what is on disk.
 	cm.mu.RLock()
 	wouldExceed := cm.nvmeUsed-cm.nvmeBytes[entry.FilePath]+entry.Size > cm.config.MaxNVMeSize
 	cm.mu.RUnlock()
@@ -2204,10 +2210,10 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 		}
 	}
 
-	// Landing the bytes and crediting them must be one step with respect to
-	// this key: a concurrent delete that removed the old bytes between them
-	// would drop the credit for the new ones, leaving accounted-for bytes on
-	// disk that eviction can never reclaim.
+	// Landing the bytes, crediting them, and publishing the row must be one
+	// step with respect to this key: a concurrent delete that removed the old
+	// bytes partway through would drop the credit for the new ones, leaving
+	// accounted-for bytes on disk that eviction can never reclaim.
 	unlock := cm.lockNVMeKey(entry.FilePath)
 	if err := cm.putToTier(ctx, entry, TierNVMe); err != nil {
 		unlock()
@@ -2216,6 +2222,9 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry 
 
 	cm.mu.Lock()
 	cm.accountNVMeLocked(entry.FilePath, entry.Size)
+	if row != nil {
+		cm.entries.put(row)
+	}
 	cm.mu.Unlock()
 	unlock()
 	// Hand the next eviction to the background evictor while there is still
@@ -2523,14 +2532,10 @@ func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEn
 		Data:         entry.Data,
 	}
 
-	if err := cm.putToNVMeWithEviction(ctx, newEntry); err != nil {
+	if err := cm.putToNVMeWithEviction(ctx, newEntry, newEntry); err != nil {
 		cm.logger.Printf("Promotion to NVMe failed for %s: %v", entry.FilePath, err)
 		return
 	}
-
-	cm.mu.Lock()
-	cm.entries.put(newEntry)
-	cm.mu.Unlock()
 	cm.touchEntries(entry.FilePath)
 	// These bytes came from a peer or the cloud and are now servable locally:
 	// join the swarm so the next requester can pull them from here.
@@ -2562,15 +2567,11 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 			Tier:         TierNVMe,
 			Data:         chunkData,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
-			return fmt.Errorf("failed to store chunk %d in NVMe for %s: %w", i, entry.FilePath, err)
-		}
-
 		chunkMeta := *chunkEntry
 		chunkMeta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&chunkMeta)
-		cm.mu.Unlock()
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry, &chunkMeta); err != nil {
+			return fmt.Errorf("failed to store chunk %d in NVMe for %s: %w", i, entry.FilePath, err)
+		}
 		cm.metrics.RecordWrite(chunkEntry.Size)
 	}
 

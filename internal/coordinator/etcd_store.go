@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	defaultEtcdPrefix         = "/fuse"
+	defaultEtcdPrefix = "/fuse"
 	// defaultPeerLeaseTTLSec must comfortably exceed the client heartbeat
 	// interval (30s) so a single delayed heartbeat doesn't expire the peer.
-	defaultPeerLeaseTTLSec = 90
+	defaultPeerLeaseTTLSec    = 90
 	defaultEtcdRequestTimeout = 5 * time.Second
 	maxFileLocationCASRetries = 8
 	// chunkRowSuffix is how a chunk's location key is derived from its
@@ -65,10 +65,10 @@ func NewEtcdStore(client *clientv3.Client, cfg EtcdStoreConfig) *EtcdStore {
 	}
 }
 
-func (s *EtcdStore) peerKey(id string) string  { return s.prefix + "/peers/" + id }
-func (s *EtcdStore) peersPrefix() string       { return s.prefix + "/peers/" }
+func (s *EtcdStore) peerKey(id string) string   { return s.prefix + "/peers/" + id }
+func (s *EtcdStore) peersPrefix() string        { return s.prefix + "/peers/" }
 func (s *EtcdStore) fileKey(path string) string { return s.prefix + "/files/" + path }
-func (s *EtcdStore) filesPrefix() string       { return s.prefix + "/files/" }
+func (s *EtcdStore) filesPrefix() string        { return s.prefix + "/files/" }
 
 func (s *EtcdStore) GetPeer(ctx context.Context, peerID string) (*PeerInfo, error) {
 	resp, err := s.client.Get(ctx, s.peerKey(peerID))

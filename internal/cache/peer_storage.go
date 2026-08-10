@@ -82,11 +82,11 @@ type PeerStorage struct {
 	pairLatency *peerLatencyTracker
 
 	// Thundering-herd control counters (exposed via PeerLoadSnapshot).
-	busySkipsTotal     atomic.Int64
+	busySkipsTotal atomic.Int64
 	// missSkipsTotal counts holder attempts that returned "not held". High
 	// values relative to reads mean the coordinator's location metadata is
 	// stale; they are deliberately kept out of the pairwise latency EWMA.
-	missSkipsTotal atomic.Int64
+	missSkipsTotal     atomic.Int64
 	jitterRetriesTotal atomic.Int64
 	replBusySkipsTotal atomic.Int64
 	replStaggersTotal  atomic.Int64

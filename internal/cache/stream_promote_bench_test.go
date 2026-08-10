@@ -56,7 +56,7 @@ func BenchmarkPeerReceive_BufferedThenPromote(b *testing.B) {
 			Size: int64(len(data)), LastAccessed: time.Now(),
 			Tier: TierNVMe, Data: data,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, entry); err != nil {
+		if err := cm.putToNVMeWithEviction(ctx, entry, entry); err != nil {
 			b.Fatalf("promote: %v", err)
 		}
 	}

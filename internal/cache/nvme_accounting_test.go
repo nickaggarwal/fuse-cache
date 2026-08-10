@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,12 +49,59 @@ func onDiskBytes(t *testing.T, cm *DefaultCacheManager, ctx context.Context) int
 	return truth
 }
 
+// quiesce waits for the manager's background goroutines — promote-after-read,
+// cloud persist, location publish — to finish. The ledger invariant is a
+// quiescent one and cannot be asserted before this: deleteLocalNVMeFootprint
+// removes bytes *before* it takes cm.mu to release their credit, so any
+// snapshot taken while an eviction is in flight legitimately sees credit whose
+// bytes are already gone. Joining only the test's own workers is not enough —
+// a read that missed schedules its promotion on a goroutine that outlives the
+// worker that issued it, and that promotion evicts.
+func quiesce(cm *DefaultCacheManager) {
+	cm.bgWg.Wait()
+}
+
 func assertNoDrift(t *testing.T, cm *DefaultCacheManager, ctx context.Context, when string) {
 	t.Helper()
+	quiesce(cm)
 	used, truth := nvmeSnapshot(cm, ctx)
-	if used != truth {
-		t.Errorf("%s: nvmeUsed = %d, want %d (drift %+d)", when, used, truth, used-truth)
+	if used == truth {
+		return
 	}
+	t.Errorf("%s: nvmeUsed = %d, want %d (drift %+d)%s",
+		when, used, truth, used-truth, driftDetail(cm, ctx))
+}
+
+// driftDetail names the keys responsible, because the totals alone do not say
+// whether the ledger over- or under-claims, and the two have opposite causes:
+// a credit with no bytes means a release was lost, a row with no credit means
+// a credit was dropped while its bytes stayed.
+func driftDetail(cm *DefaultCacheManager, ctx context.Context) string {
+	var b strings.Builder
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, e := range cm.entries.snapshot() {
+		if e == nil || e.Tier != TierNVMe || !cm.nvmeStorage.Exists(ctx, e.FilePath) {
+			continue
+		}
+		if _, ok := cm.nvmeBytes[e.FilePath]; !ok {
+			fmt.Fprintf(&b, "\n  row with no credit: %s (%d bytes on disk)", e.FilePath, e.Size)
+		}
+	}
+	for k, credit := range cm.nvmeBytes {
+		e, hasRow := cm.entries.get(k)
+		onDisk := cm.nvmeStorage.Exists(ctx, k)
+		if hasRow && onDisk && e != nil && e.Tier == TierNVMe {
+			continue
+		}
+		tier := "-"
+		if hasRow && e != nil {
+			tier = fmt.Sprint(e.Tier)
+		}
+		fmt.Fprintf(&b, "\n  credit with no bytes: %s (credit=%d row=%v tier=%s onDisk=%v)",
+			k, credit, hasRow, tier, onDisk)
+	}
+	return b.String()
 }
 
 func accountingTestManager(chunkSize, maxNVMe int64) *DefaultCacheManager {

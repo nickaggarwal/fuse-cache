@@ -93,15 +93,12 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 			Tier:         TierNVMe,
 			Data:         data,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, chunkEntry); err != nil {
+		chunkMeta := *chunkEntry
+		chunkMeta.Data = nil
+		if err := cm.putToNVMeWithEviction(ctx, chunkEntry, &chunkMeta); err != nil {
 			cm.logger.Printf("Chunk promote to NVMe failed for %s: %v", chunkPath, err)
 			return
 		}
-		chunkMeta := *chunkEntry
-		chunkMeta.Data = nil
-		cm.mu.Lock()
-		cm.entries.put(&chunkMeta)
-		cm.mu.Unlock()
 	}
 
 	cm.advertiseChunkParent(ctx, filePath)
