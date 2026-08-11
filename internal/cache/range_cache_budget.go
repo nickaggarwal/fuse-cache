@@ -103,7 +103,7 @@ func (cm *DefaultCacheManager) startRangeCacheSweeper(interval time.Duration) {
 	if interval <= 0 {
 		interval = rangeCacheSweepInterval
 	}
-	cm.goBackground(func() {
+	cm.goLoop(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

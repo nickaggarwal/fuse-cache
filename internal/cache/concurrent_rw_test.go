@@ -125,9 +125,14 @@ func TestConcurrentWrite_UnchunkedOverwriteIsAtomic(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	var mixed, reads atomic.Int64
+	var mixed, reads, writes atomic.Int64
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	// Deferred as well as called explicitly, so the workers are joined on every
+	// exit path including a fatal: leaving a writer and four readers spinning
+	// for the rest of the binary starves whatever test runs next.
+	halt := haltOnce(stop, &wg)
+	defer halt()
 
 	wg.Add(1)
 	go func() {
@@ -138,9 +143,11 @@ func TestConcurrentWrite_UnchunkedOverwriteIsAtomic(t *testing.T) {
 				return
 			default:
 			}
-			_ = cm.Put(ctx, &CacheEntry{
+			if err := cm.Put(ctx, &CacheEntry{
 				FilePath: "/atomic", Data: mkBytes(byte('A'+i%26), size), LastAccessed: time.Now(),
-			})
+			}); err == nil {
+				writes.Add(1)
+			}
 		}
 	}()
 	for r := 0; r < 4; r++ {
@@ -171,35 +178,80 @@ func TestConcurrentWrite_UnchunkedOverwriteIsAtomic(t *testing.T) {
 		}()
 	}
 
-	awaitReads(t, &reads, minTornReads)
-	close(stop)
-	wg.Wait()
+	awaitOverlap(t, &reads, &writes, minTornReads, minTornWrites)
+	halt()
 
+	assertOverlapped(t, reads.Load(), writes.Load())
 	if n := mixed.Load(); n > 0 {
 		t.Errorf("torn read on unchunked overwrite: %d of %d reads mixed two versions", n, reads.Load())
 	}
 }
 
-// minTornReads is the sample size the two overwrite-atomicity tests need
-// before their verdict means anything.
-const minTornReads = 200
+// The sample sizes the two overwrite-atomicity tests need before their verdict
+// means anything. Both matter, and the write floor is the load-bearing one: a
+// read is a map hit while a write is delete-footprint + temp-file + rename, so
+// reads outrun writes by roughly 40:1. Gating on reads alone let the unchunked
+// test finish after 2-8 completed overwrites (measured, GOMAXPROCS=2, -race) —
+// enough reads to look thorough, too few overwrites to have raced against. A
+// read that lands between two Puts sees a static file and cannot detect
+// tearing however torn the write path is, so the sample has to be bounded by
+// the scarce event, not the plentiful one.
+const (
+	minTornReads  = 200
+	minTornWrites = 20
+)
 
-// awaitReads runs the racing workers until they have completed want reads,
-// rather than for a fixed wall-clock window. A timed window bounds the *test*
-// by the clock but bounds its *evidence* by whatever the scheduler granted:
-// under full-package load at GOMAXPROCS=2 a 200ms window intermittently
-// produced zero reads, so the test failed with "proved nothing" — a starved
-// machine reported as a product defect. Making the sample size the exit
-// condition keeps the assertion meaningful at any speed; the deadline is only
-// a backstop against a genuine hang.
-func awaitReads(t *testing.T, reads *atomic.Int64, want int64) {
+// haltOnce returns a func that signals the racing workers to stop and joins
+// them, safe to call more than once. Callers both defer it and call it
+// explicitly at the end of the racing phase, so cleanup happens exactly once
+// on the normal path and still happens on a fatal one.
+func haltOnce(stop chan struct{}, wg *sync.WaitGroup) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			wg.Wait()
+		})
+	}
+}
+
+// awaitOverlap runs the racing workers until they have completed enough reads
+// *and* enough writes to have actually overlapped, rather than for a fixed
+// wall-clock window. A timed window bounds the *test* by the clock but bounds
+// its *evidence* by whatever the scheduler granted: under full-package load at
+// GOMAXPROCS=2 a 200ms window intermittently produced zero reads, so the test
+// failed with "proved nothing" — a starved machine reported as a product
+// defect. Making the sample sizes the exit condition keeps the assertion
+// meaningful at any speed.
+//
+// Returns rather than fataling when it runs out of time: the caller must still
+// close(stop) and join its workers, and it is the caller that knows whether a
+// thin sample is worth failing over. A t.Fatalf here would Goexit past that
+// cleanup and leave a writer plus four readers spinning for the rest of the
+// binary — which then starves whatever runs next into its own timeout. The
+// budget is generous because it is not an assertion: the chunked test's own
+// tail reaches ~24s at GOMAXPROCS=2 under -race on an idle machine.
+func awaitOverlap(t *testing.T, reads, writes *atomic.Int64, wantReads, wantWrites int64) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for reads.Load() < want {
+	deadline := time.Now().Add(120 * time.Second)
+	for reads.Load() < wantReads || writes.Load() < wantWrites {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d reads completed in 30s; workers are stuck", reads.Load(), want)
+			t.Logf("gave up waiting for overlap: %d/%d reads, %d/%d writes",
+				reads.Load(), wantReads, writes.Load(), wantWrites)
+			return
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// assertOverlapped fails the test when the workload never actually raced, so
+// an absence-of-tearing verdict is never rendered on a sample that could not
+// have shown tearing in the first place.
+func assertOverlapped(t *testing.T, reads, writes int64) {
+	t.Helper()
+	if reads < minTornReads || writes < minTornWrites {
+		t.Errorf("workload never overlapped: %d reads, %d overwrites (want >=%d and >=%d); the test proved nothing",
+			reads, writes, minTornReads, minTornWrites)
 	}
 }
 
@@ -228,9 +280,11 @@ func TestConcurrentWrite_ChunkedOverwriteTears(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	var mixed, reads, wrongLen atomic.Int64
+	var mixed, reads, wrongLen, writes atomic.Int64
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	halt := haltOnce(stop, &wg)
+	defer halt()
 
 	wg.Add(1)
 	go func() {
@@ -241,9 +295,11 @@ func TestConcurrentWrite_ChunkedOverwriteTears(t *testing.T) {
 				return
 			default:
 			}
-			_ = cm.Put(ctx, &CacheEntry{
+			if err := cm.Put(ctx, &CacheEntry{
 				FilePath: "/torn", Data: mkBytes(byte('A'+i%26), size), LastAccessed: time.Now(),
-			})
+			}); err == nil {
+				writes.Add(1)
+			}
 		}
 	}()
 	for r := 0; r < 4; r++ {
@@ -276,10 +332,10 @@ func TestConcurrentWrite_ChunkedOverwriteTears(t *testing.T) {
 		}()
 	}
 
-	awaitReads(t, &reads, minTornReads)
-	close(stop)
-	wg.Wait()
+	awaitOverlap(t, &reads, &writes, minTornReads, minTornWrites)
+	halt()
 
+	assertOverlapped(t, reads.Load(), writes.Load())
 	// The property that must hold: never a short or over-long file.
 	if n := wrongLen.Load(); n > 0 {
 		t.Errorf("chunked overwrite produced %d reads of the wrong length (of %d)", n, reads.Load())

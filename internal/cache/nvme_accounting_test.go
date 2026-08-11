@@ -42,13 +42,6 @@ func nvmeSnapshot(cm *DefaultCacheManager, ctx context.Context) (used, truth int
 	return used, truth
 }
 
-// onDiskBytes is the ground truth alone, for callers that only need it.
-func onDiskBytes(t *testing.T, cm *DefaultCacheManager, ctx context.Context) int64 {
-	t.Helper()
-	_, truth := nvmeSnapshot(cm, ctx)
-	return truth
-}
-
 // quiesce waits for the manager's background goroutines — promote-after-read,
 // cloud persist, location publish — to finish. The ledger invariant is a
 // quiescent one and cannot be asserted before this: deleteLocalNVMeFootprint
@@ -57,13 +50,31 @@ func onDiskBytes(t *testing.T, cm *DefaultCacheManager, ctx context.Context) int
 // bytes are already gone. Joining only the test's own workers is not enough —
 // a read that missed schedules its promotion on a goroutine that outlives the
 // worker that issued it, and that promotion evicts.
-func quiesce(cm *DefaultCacheManager) {
-	cm.bgWg.Wait()
+//
+// This waits on bgWg only, which is why bgWg holds one-shot work exclusively
+// and the perpetual loops live in loopWg: a wait that also joined the
+// watermark evictor or the warm reconciler would never return for a manager
+// built by NewCacheManager, and the caller would see a package timeout and a
+// goroutine dump instead of the drift it asked about. The deadline is a
+// backstop for a genuinely stuck goroutine, so one hang fails this test
+// rather than the whole binary.
+func quiesce(t *testing.T, cm *DefaultCacheManager) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		cm.bgWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("background goroutines did not drain in 30s")
+	}
 }
 
 func assertNoDrift(t *testing.T, cm *DefaultCacheManager, ctx context.Context, when string) {
 	t.Helper()
-	quiesce(cm)
+	quiesce(t, cm)
 	used, truth := nvmeSnapshot(cm, ctx)
 	if used == truth {
 		return
@@ -91,15 +102,33 @@ func driftDetail(cm *DefaultCacheManager, ctx context.Context) string {
 	for k, credit := range cm.nvmeBytes {
 		e, hasRow := cm.entries.get(k)
 		onDisk := cm.nvmeStorage.Exists(ctx, k)
-		if hasRow && onDisk && e != nil && e.Tier == TierNVMe {
-			continue
-		}
 		tier := "-"
 		if hasRow && e != nil {
 			tier = fmt.Sprint(e.Tier)
 		}
-		fmt.Fprintf(&b, "\n  credit with no bytes: %s (credit=%d row=%v tier=%s onDisk=%v)",
-			k, credit, hasRow, tier, onDisk)
+		countedAsTruth := hasRow && onDisk && e != nil && e.Tier == TierNVMe
+		switch {
+		case countedAsTruth && credit == e.Size:
+			// Row, bytes, tier and magnitude all agree: this key is not the
+			// one drifting.
+			continue
+		case countedAsTruth:
+			// The shape a key-presence check cannot see. accountNVMeLocked
+			// overwrites rather than adds, so a lost release leaves a stale
+			// magnitude on a key that still has its row and its bytes —
+			// healthy under every predicate except the totals, which is
+			// exactly why it has to be named here.
+			fmt.Fprintf(&b, "\n  credit disagrees with row: %s (credit=%d row size=%d)", k, credit, e.Size)
+		case !onDisk:
+			fmt.Fprintf(&b, "\n  credit with no bytes: %s (credit=%d row=%v tier=%s)", k, credit, hasRow, tier)
+		default:
+			// Bytes are there; what is missing is the row (or its tier is
+			// wrong), so nothing can ever reclaim them. Calling this "no
+			// bytes" would point a debugger at a lost release when the fault
+			// is a dropped row.
+			fmt.Fprintf(&b, "\n  credit with bytes but no usable row: %s (credit=%d row=%v tier=%s)",
+				k, credit, hasRow, tier)
+		}
 	}
 	return b.String()
 }

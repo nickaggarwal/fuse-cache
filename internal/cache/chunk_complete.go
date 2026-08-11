@@ -39,10 +39,20 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 	if cm.config.ChunkCompletionDisabled {
 		return
 	}
+	// Snapshot the fields under the lock rather than holding the pointer past
+	// it. The entry table stores rows by pointer, and completeChunkedFile
+	// mutates a live parent row (Tier, Size, LastAccessed, ChunkSize) under
+	// cm.mu — so dereferencing out here is a read of memory another goroutine
+	// is writing, not a stale-but-safe read.
 	cm.mu.RLock()
 	entry, _ := cm.entries.get(filePath)
+	var isChunked bool
+	var numChunks, entrySize int64
+	if entry != nil {
+		isChunked, numChunks, entrySize = entry.IsChunked, entry.NumChunks, entry.Size
+	}
 	cm.mu.RUnlock()
-	if entry == nil || !entry.IsChunked || entry.NumChunks <= 0 || entry.Size <= 0 {
+	if entry == nil || !isChunked || numChunks <= 0 || entrySize <= 0 {
 		return
 	}
 	if _, whole := cm.LocalFilePath(context.Background(), filePath); whole {
@@ -78,7 +88,7 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 	}
 	st.mu.Unlock()
 
-	numChunks, size := entry.NumChunks, entry.Size
+	size := entrySize
 	cm.goBackground(func() {
 		defer func() {
 			st.mu.Lock()
@@ -218,17 +228,30 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 		w.Abort()
 		return fmt.Errorf("assembled %d bytes, want %d", w.BytesWritten(), size)
 	}
+	// Publishing the bytes, crediting them, and installing the row is one
+	// mutation of this key — the lock is taken *before* Commit for the same
+	// reason stream_promote.go does it. A delete or eviction landing between
+	// the rename and the accounting below would remove the just-committed
+	// bytes and release nothing (the key has no credit yet), after which this
+	// function would credit size and install a TierNVMe row for a file that
+	// is not on disk.
+	parentUnlock := cm.lockNVMeKey(filePath)
 	if err := w.Commit(); err != nil {
+		parentUnlock()
 		return err
 	}
 
 	// Whole file is live: account it, then retire the chunk files.
 	now := time.Now()
-	parentUnlock := cm.lockNVMeKey(filePath)
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil {
 		parent.Tier = TierNVMe
 		parent.LastAccessed = now
+		// The credit below is the assembled size, so the row must claim it
+		// too. A row whose Size disagrees with its credit is drift that no
+		// per-key check can name: the key has a row, bytes, and TierNVMe, so
+		// it looks healthy under every predicate except the totals.
+		parent.Size = size
 		cm.entries.touch(filePath)
 		if parent.ChunkSize <= 0 {
 			parent.ChunkSize = chunkSize

@@ -41,7 +41,7 @@ func (cm *DefaultCacheManager) startWatermarkEvictor() {
 	if cm.config.MaxNVMeSize <= 0 || cm.config.WatermarkEvictDisabled {
 		return
 	}
-	cm.goBackground(func() {
+	cm.goLoop(func() {
 		for {
 			wait := jitteredDuration(watermarkSweepInterval)
 			select {

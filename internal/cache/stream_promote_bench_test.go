@@ -56,7 +56,12 @@ func BenchmarkPeerReceive_BufferedThenPromote(b *testing.B) {
 			Size: int64(len(data)), LastAccessed: time.Now(),
 			Tier: TierNVMe, Data: data,
 		}
-		if err := cm.putToNVMeWithEviction(ctx, entry, entry); err != nil {
+		// Data-less row, matching the production callers: publishing the entry
+		// itself would pin all 16MiB of payload in the entry table per iteration
+		// and measure that retention instead of the promotion it exists to time.
+		row := *entry
+		row.Data = nil
+		if err := cm.putToNVMeWithEviction(ctx, entry, &row); err != nil {
 			b.Fatalf("promote: %v", err)
 		}
 	}

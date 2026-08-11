@@ -226,7 +226,7 @@ func (cm *DefaultCacheManager) startWarmReconciler(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultWarmReconcileInterval
 	}
-	cm.goBackground(func() {
+	cm.goLoop(func() {
 		for {
 			select {
 			case <-ctx.Done():

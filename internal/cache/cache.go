@@ -376,7 +376,14 @@ type DefaultCacheManager struct {
 	evictSignal    chan struct{}
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
-	bgWg           sync.WaitGroup
+	// bgWg tracks one-shot background work (cloud persist, promote-after-read,
+	// location publish) — everything that finishes on its own. loopWg tracks
+	// the perpetual loops, which finish only once shutdownCtx is cancelled.
+	// Keeping them apart is what lets a caller wait for outstanding work to
+	// settle without also waiting for a loop that never ends; Shutdown waits
+	// on both, after cancelling.
+	bgWg   sync.WaitGroup
+	loopWg sync.WaitGroup
 }
 
 type chunkFileCache struct {
@@ -676,14 +683,29 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 // accepting requests to avoid losing writes or publishing stale metadata.
 func (cm *DefaultCacheManager) Shutdown() {
 	cm.shutdownCancel()
+	cm.loopWg.Wait()
 	cm.bgWg.Wait()
 }
 
-// goBackground tracks fn in bgWg so Shutdown can drain it.
+// goBackground tracks one-shot fn in bgWg so Shutdown can drain it. Work
+// registered here must return on its own; a loop that runs until shutdown
+// belongs in goLoop, or a caller waiting for outstanding work to settle waits
+// forever.
 func (cm *DefaultCacheManager) goBackground(fn func()) {
 	cm.bgWg.Add(1)
 	go func() {
 		defer cm.bgWg.Done()
+		fn()
+	}()
+}
+
+// goLoop tracks a perpetual background loop in loopWg. These exit only when
+// shutdownCtx is cancelled, so they are kept out of bgWg — see the field
+// comment.
+func (cm *DefaultCacheManager) goLoop(fn func()) {
+	cm.loopWg.Add(1)
+	go func() {
+		defer cm.loopWg.Done()
 		fn()
 	}()
 }
@@ -1290,11 +1312,20 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		return cm.putChunked(ctx, entry)
 	}
 
-	// Try to store in NVME first (with eviction if needed). The tier is set
-	// before the attempt because entry doubles as the row installed under the
-	// key lock; the peer/cloud fallback below overwrites it on success.
-	entry.Tier = TierNVMe
-	if err := cm.putToNVMeWithEviction(ctx, entry, entry); err == nil {
+	// Try to store in NVME first (with eviction if needed). The row is a
+	// Data-less copy, never entry itself: callers own their entry and keep it
+	// alive across writes (FUSE re-Puts the same *CacheEntry on every flush),
+	// so installing that pointer would publish a table row the caller mutates
+	// without cm.mu — and would pin the whole payload in the table for the
+	// row's lifetime.
+	nvmeRow := *entry
+	nvmeRow.Data = nil
+	nvmeRow.Tier = TierNVMe
+	if err := cm.putToNVMeWithEviction(ctx, entry, &nvmeRow); err == nil {
+		// Only now is the tier true. Stamping it before the attempt leaves a
+		// caller's entry claiming NVMe residency for a file that reached no
+		// tier at all when every fallback below also fails.
+		entry.Tier = TierNVMe
 		cm.metrics.RecordWrite(int64(len(entry.Data)))
 
 		// Deep-copy data before launching goroutine to avoid race
@@ -1353,9 +1384,14 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 	for i := 0; i < 2; i++ {
 		res := <-resultChan
 		if res.err == nil {
-			cm.mu.Lock()
 			entry.Tier = res.tier
-			cm.entries.put(entry)
+			// Same reason as the NVMe row above: the table gets a copy, so a
+			// caller that keeps writing through its own entry cannot mutate a
+			// published row out from under cm.mu.
+			row := *entry
+			row.Data = nil
+			cm.mu.Lock()
+			cm.entries.put(&row)
 			cm.mu.Unlock()
 			cm.metrics.RecordWrite(int64(len(entry.Data)))
 			tier := res.tier
@@ -1494,6 +1530,16 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return err
 	}
+	// Landing the bytes, crediting them, and publishing the row is one
+	// mutation of this key — same atom putToNVMeWithEviction enforces. A
+	// delete or eviction interleaving between the rename and the ledger
+	// update below finds no row to collect, so it releases nothing and the
+	// renamed bytes stay on disk uncredited and unreclaimable forever
+	// (collectLocalDeleteTargets only emits keys that have a TierNVMe row).
+	// Taken after the footprint delete above, which locks this key itself and
+	// the stripe mutexes are not reentrant.
+	unlock := cm.lockNVMeKey(filePath)
+	defer unlock()
 	if err := os.Rename(stagedPath, finalPath); err != nil {
 		return err
 	}
@@ -2182,15 +2228,28 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 // ledger, and installs row in the entry table — all three as one mutation of
 // this key.
 //
-// row is the metadata readers and eviction will see: usually a Data-less copy
-// of entry, or entry itself to keep the payload in the table. Passing it in
-// rather than letting the caller install it afterwards is the point. Eviction
-// and overwrite-cleanup can only reclaim what a row claims, so between the
-// credit and the row install the bytes are charged to a key nothing can
-// release, and anything that runs in that window leaves the credit behind for
-// good. Both drift signatures seen under concurrent load — credit with bytes
-// but no row, and credit with a row but no bytes — are that window.
+// row is the metadata readers and eviction will see, and is required: a
+// Data-less copy of entry, never entry itself. Two reasons it must be a copy.
+// The table hands the pointer to every reader under cm.mu, so a caller that
+// keeps its own entry alive across writes would be mutating a published row
+// unsynchronized. And the read path serves bytes from nvmeStorage, never from
+// entries[].Data, so a payload-carrying row is pure retention — it pins the
+// whole file in the heap for the row's lifetime and GET /api/cache
+// base64-encodes it into what callers expect to be a metadata listing.
+//
+// Passing the row in rather than letting the caller install it afterwards is
+// the point. Eviction and overwrite-cleanup can only reclaim what a row
+// claims, so between the credit and the row install the bytes are charged to
+// a key nothing can release, and anything that runs in that window leaves the
+// credit behind for good. Both drift signatures seen under concurrent load —
+// credit with bytes but no row, and credit with a row but no bytes — are that
+// window.
 func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry, row *CacheEntry) error {
+	if row == nil {
+		// Crediting bytes without publishing a row is exactly the drift this
+		// function exists to prevent; refuse rather than half-commit.
+		return errors.New("putToNVMeWithEviction: nil row")
+	}
 	// What this write replaces is whatever the ledger already credits to this
 	// key — not what the entry table says. A concurrent same-path write may
 	// have landed bytes whose row is not installed until it reaches the
@@ -2222,9 +2281,7 @@ func (cm *DefaultCacheManager) putToNVMeWithEviction(ctx context.Context, entry,
 
 	cm.mu.Lock()
 	cm.accountNVMeLocked(entry.FilePath, entry.Size)
-	if row != nil {
-		cm.entries.put(row)
-	}
+	cm.entries.put(row)
 	cm.mu.Unlock()
 	unlock()
 	// Hand the next eviction to the background evictor while there is still
@@ -2532,7 +2589,9 @@ func (cm *DefaultCacheManager) promoteToNVMe(ctx context.Context, entry *CacheEn
 		Data:         entry.Data,
 	}
 
-	if err := cm.putToNVMeWithEviction(ctx, newEntry, newEntry); err != nil {
+	meta := *newEntry
+	meta.Data = nil
+	if err := cm.putToNVMeWithEviction(ctx, newEntry, &meta); err != nil {
 		cm.logger.Printf("Promotion to NVMe failed for %s: %v", entry.FilePath, err)
 		return
 	}
