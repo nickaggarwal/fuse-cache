@@ -352,3 +352,33 @@ func isChunkObjectPath(path string) bool {
 	}
 	return true
 }
+
+// ListUnder returns blob names under prefix. It backs ModelKV's cross-node
+// recovery, which must enumerate the catalog on a node that holds no local
+// state and therefore has nothing else to enumerate from.
+//
+// Paging is followed to completion rather than capped: a truncated listing
+// would silently under-recover, which presents as "those blocks were never
+// durable" — the exact wrong answer for a durability store.
+func (as *AzureStorage) ListUnder(ctx context.Context, prefix string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, as.timeout)
+	defer cancel()
+
+	p := strings.TrimPrefix(prefix, "/")
+	pager := as.client.NewListBlobsFlatPager(as.containerName, &azblob.ListBlobsFlatOptions{
+		Prefix: &p,
+	})
+	var out []string
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("azure: list blobs under %s: %w", p, err)
+		}
+		for _, item := range page.Segment.BlobItems {
+			if item != nil && item.Name != nil {
+				out = append(out, *item.Name)
+			}
+		}
+	}
+	return out, nil
+}

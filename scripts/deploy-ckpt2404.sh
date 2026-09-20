@@ -21,6 +21,8 @@
 #                          section 6 of scripts/e2e-residency.sh needs
 #   WARM_RECONCILE_SEC=30  client -warm-reconcile-interval-sec (default 120 is
 #                          too slow to observe inside a test run)
+#   WITH_MODEL_KV=1        enable the durable Model KV store on the clients,
+#                          which scripts/e2e-modelkv-recovery.sh needs
 set -uo pipefail
 
 NS="${1:-fuse-system}"
@@ -28,6 +30,7 @@ POOL="${POOL:-ckpt2404}"
 REGISTRY="${REGISTRY:-stargzrepo}"
 WARM_RECONCILE_SEC="${WARM_RECONCILE_SEC:-30}"
 WITH_CSI="${WITH_CSI:-0}"
+WITH_MODEL_KV="${WITH_MODEL_KV:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
 if [ -z "${TAG:-}" ]; then
@@ -94,12 +97,12 @@ fi
 #   -fetch-lease / -fast-chunk-advertise are left exactly as found: they are
 #                                 orthogonal to residency and changing them
 #                                 would confound the run.
-step "2. patch client DaemonSet (image + -warm-reconcile-interval-sec ${WARM_RECONCILE_SEC})"
+step "2. patch client DaemonSet (image + -warm-reconcile-interval-sec ${WARM_RECONCILE_SEC}$([ "$WITH_MODEL_KV" = 1 ] && echo " + -enable-model-kv"))"
 # python3 -c, not `python3 - <<HEREDOC`: a heredoc becomes stdin and would
 # swallow the piped DaemonSet JSON, leaving the script reading its own source.
 patch=$(kubectl -n "$NS" get ds client -o json | python3 -c '
 import json, sys
-image, secs = sys.argv[1], sys.argv[2]
+image, secs, kv = sys.argv[1], sys.argv[2], sys.argv[3]
 ds = json.load(sys.stdin)
 spec = ds["spec"]["template"]["spec"]
 containers = []
@@ -111,6 +114,14 @@ for c in spec["containers"]:
             args[args.index("-warm-reconcile-interval-sec") + 1] = secs
         else:
             args += ["-warm-reconcile-interval-sec", secs]
+        if kv == "1" and "-enable-model-kv" not in args:
+            # Short batch/reap intervals for the same reason as the warm
+            # reconciler: the production defaults (30s batch, 5min reap) make a
+            # test run wait on a clock instead of on the code. The e2e script
+            # forces both explicitly, so these only bound the background path.
+            args += ["-enable-model-kv",
+                     "-model-kv-batch-interval-sec", "10",
+                     "-model-kv-reap-interval-sec", "30"]
         entry["args"] = args
     containers.append(entry)
 inits = [{"name": c["name"], "image": image} for c in spec.get("initContainers", [])]
@@ -118,7 +129,7 @@ out = {"spec": {"template": {"spec": {"containers": containers}}}}
 if inits:
     out["spec"]["template"]["spec"]["initContainers"] = inits
 print(json.dumps(out))
-' "$IMAGE" "$WARM_RECONCILE_SEC")
+' "$IMAGE" "$WARM_RECONCILE_SEC" "$WITH_MODEL_KV")
 [ -n "$patch" ] || die "failed to build the client patch"
 kubectl -n "$NS" patch ds client --type=strategic -p "$patch" >/dev/null || die "patch ds/client failed"
 

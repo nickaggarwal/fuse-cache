@@ -1,0 +1,129 @@
+# A pool-scoped, side-by-side DaemonSet for validating the Model KV store.
+#
+# Why a separate DaemonSet rather than patching `client`: the shared client
+# DaemonSet's nodeAffinity covers gpuckpt, where the vLLM pods run. Rolling it
+# to enable -enable-model-kv would restart those pods as a side effect, which
+# is exactly what scripts/deploy-ckpt2404.sh refuses to do. This copy is pinned
+# to ckpt2404 and coexists with the production pods on those two nodes.
+#
+# Everything that could collide with the production client is moved:
+#   ports        8091/9091   instead of 8081/9081
+#   mount        /mnt/fuse-kvtest
+#   nvme cache   /mnt/nvme-kvtest      (static; node-init is not used here, so
+#                                       the test does not depend on discovery)
+#   agent socket disabled (-enable-agent-server=false) so the CSI driver keeps
+#                talking to the production daemon's socket, not this one
+#
+# It registers with the same coordinator under a distinct peer ID, so it joins
+# the mesh as an ordinary peer without displacing anything.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: client-kvtest
+  namespace: fuse-system
+  labels:
+    app: client-kvtest
+    purpose: modelkv-validation
+spec:
+  selector:
+    matchLabels:
+      app: client-kvtest
+  template:
+    metadata:
+      labels:
+        app: client-kvtest
+        purpose: modelkv-validation
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: agentpool
+                    operator: In
+                    values: ["ckpt2404"]
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: client
+          image: stargzrepo.azurecr.io/fuse-client:modelkv-e0deccb-dirty
+          imagePullPolicy: IfNotPresent
+          # The image sets `ENTRYPOINT []` and `CMD ["coordinator"]`, so the
+          # binary has to be named explicitly; args alone would be exec'd as
+          # the command.
+          command: ["client"]
+          args:
+            - -mount
+            - /mnt/fuse-kvtest
+            - -nvme
+            - /mnt/nvme-kvtest
+            - -coordinator
+            - coordinator.fuse-system.svc.cluster.local:8080
+            - -coordinator-grpc
+            - coordinator.fuse-system.svc.cluster.local:9080
+            - -port
+            - "8091"
+            - -grpc-port
+            - "9091"
+            - -cloud-provider
+            - azure
+            - -fuse-backend
+            - gofuse
+            - -enable-agent-server=false
+            # The store under test. Short batch and reap intervals so the
+            # background paths actually run inside a test window; the e2e
+            # script forces both explicitly, so these only bound the timers.
+            - -enable-model-kv
+            - -model-kv-prefix
+            - kv
+            - -model-kv-promote-after-reads
+            - "2"
+            - -model-kv-batch-interval-sec
+            - "10"
+            - -model-kv-reap-interval-sec
+            - "30"
+            - -model-kv-ttl-min
+            - "120"
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: FUSE_PEER_LABELS
+              value: pool=ckpt2404,tier=nvme,role=kvtest
+          envFrom:
+            - configMapRef:
+                name: fuse-config
+            - secretRef:
+                name: azure-credentials
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["SYS_ADMIN", "MKNOD"]
+          volumeMounts:
+            - name: fuse-device
+              mountPath: /dev/fuse
+            - name: host-root
+              mountPath: /host
+            - name: kv-mount
+              mountPath: /mnt
+              mountPropagation: Bidirectional
+          resources:
+            requests: {cpu: "250m", memory: 512Mi}
+            limits: {cpu: "2", memory: 8Gi}
+      volumes:
+        - name: fuse-device
+          hostPath: {path: /dev/fuse}
+        - name: host-root
+          hostPath: {path: /, type: Directory}
+        - name: kv-mount
+          hostPath: {path: /mnt, type: Directory}

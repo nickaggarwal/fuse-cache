@@ -57,6 +57,10 @@ type Handler struct {
 	// client installs it after the API server is already accepting probes,
 	// and it is read from the probe path, so it must not block.
 	mountHealthy atomic.Pointer[func() bool]
+	// modelKV is the durable KV-block store, attached by the client when
+	// enabled. Atomic because it is installed after the API server is already
+	// serving and is read from request handlers.
+	modelKV atomic.Pointer[cache.ModelKVStore]
 }
 
 // SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
@@ -174,6 +178,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/intents", h.handleWarmIntentCreate).Methods("POST")
 	router.HandleFunc("/api/cache/intents/reconcile", h.handleWarmIntentReconcile).Methods("POST")
 	router.HandleFunc("/api/cache/intents/{volumeID}", h.handleWarmIntentDelete).Methods("DELETE")
+	h.registerModelKVRoutes(router)
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
 	router.HandleFunc("/api/fs/restore", h.handleFSRestore).Methods("POST")
 

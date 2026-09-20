@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // NVMeStorage implements TierStorage for NVME storage
@@ -220,4 +222,116 @@ func (ns *NVMeStorage) Size(ctx context.Context, path string) (int64, error) {
 		return 0, err
 	}
 	return info.Size(), nil
+}
+
+// WriteSync is Write plus durability barriers: the data file is fsynced before
+// the rename, and the containing directory is fsynced after it. Write alone is
+// atomic against a process crash — the rename either happened or it did not —
+// but on a power loss or node crash the rename can be durable while the bytes
+// it points at are still in the page cache, leaving a file of the right name
+// and the wrong (or zero) contents. Callers that must survive losing the node,
+// rather than just losing the process, use this.
+//
+// It costs two extra round trips to the device, so it is deliberately a
+// separate method rather than a change to Write: the weights path writes many
+// large files whose loss is recoverable from cloud, and making every one of
+// them durable would be paying for a guarantee it does not need.
+func (ns *NVMeStorage) WriteSync(ctx context.Context, path string, data []byte) error {
+	fullPath := filepath.Join(ns.basePath, strings.TrimPrefix(path, "/"))
+
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, ".nvme-dwrite-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// Barrier one: the bytes reach the device before anything points at them.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, fullPath); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// Barrier two: the directory entry created by the rename reaches the
+	// device. Without this the file can vanish entirely on power loss even
+	// though its data blocks were synced.
+	return syncDir(dir)
+}
+
+// syncDir fsyncs a directory so that renames within it are durable. A failure
+// to open the directory read-only is reported; some filesystems reject fsync
+// on a directory handle, and that case is tolerated rather than failing the
+// write, since the data fsync already happened.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		// EINVAL/ENOTSUP from filesystems that do not support directory fsync
+		// (some FUSE and network filesystems) is not a durability failure we
+		// can act on, and failing the write would make the store unusable
+		// there.
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// ListUnder returns paths (relative to the storage root, slash-separated) of
+// every regular file beneath prefix. It exists for index recovery, which must
+// enumerate journal rows without an external catalog — the whole point of the
+// journal is that it is readable when nothing else survived.
+//
+// Temp files from interrupted writes (".nvme-write-*", ".nvme-dwrite-*") are
+// skipped: they are by definition the writes that did not commit.
+func (ns *NVMeStorage) ListUnder(ctx context.Context, prefix string) ([]string, error) {
+	root := filepath.Join(ns.basePath, strings.TrimPrefix(prefix, "/"))
+	var out []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A missing root is an empty listing, not a failure: a node that
+			// has never written a block has nothing to recover.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, ".nvme-write-") || strings.HasPrefix(name, ".nvme-dwrite-") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(ns.basePath, p)
+		if rerr != nil {
+			return rerr
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

@@ -109,6 +109,18 @@ func main() {
 		agentSocket       = flag.String("agent-socket", "/var/run/fuse-client/agent.sock", "Unix socket path for CSI agent gRPC server")
 		enableAgentServer = flag.Bool("enable-agent-server", true, "Enable the agent gRPC server for CSI integration")
 
+		// Model KV store: a durable store for LLM KV-cache blocks with a write
+		// path deliberately unlike the weights path. Off by default because it
+		// is only useful to a KV connector, and an unused store still runs a
+		// reaper and holds an index.
+		enableModelKV       = flag.Bool("enable-model-kv", false, "Enable the durable Model KV store for LLM KV-cache blocks")
+		modelKVPrefix       = flag.String("model-kv-prefix", "kv", "Path prefix for Model KV blocks on NVMe and in cloud storage")
+		modelKVPromoteAfter = flag.Int("model-kv-promote-after-reads", 2, "Reads a KV block must serve before it is persisted to cloud")
+		modelKVTTLMin       = flag.Int("model-kv-ttl-min", 120, "Minutes since last access before a KV block is reaped; 0 disables")
+		modelKVBatchMB      = flag.Int("model-kv-batch-mb", 64, "Target size in MB for a coalesced KV cloud object")
+		modelKVBatchSec     = flag.Int("model-kv-batch-interval-sec", 30, "Max seconds an under-full KV batch waits before flushing")
+		modelKVReapSec      = flag.Int("model-kv-reap-interval-sec", 300, "Seconds between KV TTL sweeps; 0 disables")
+
 		help = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
@@ -591,6 +603,38 @@ func main() {
 
 	// Create API handler
 	apiHandler := api.NewHandler(cacheManager, coordClient, *peerID, *apiKey)
+
+	// Model KV store, built over the tiers the cache manager already
+	// configured so credentials and the node-init cache directory are
+	// resolved in exactly one place.
+	if *enableModelKV {
+		{
+			dcm := cacheManager
+			kvCfg := cache.ModelKVConfig{
+				Prefix:            *modelKVPrefix,
+				PromoteAfterReads: *modelKVPromoteAfter,
+				TTL:               time.Duration(*modelKVTTLMin) * time.Minute,
+				BatchBytes:        int64(*modelKVBatchMB) << 20,
+				BatchInterval:     time.Duration(*modelKVBatchSec) * time.Second,
+				ReapInterval:      time.Duration(*modelKVReapSec) * time.Second,
+			}
+			kvStore := cache.NewModelKVStore(kvCfg, dcm.NVMeTier(), dcm.CloudTier(),
+				log.New(log.Writer(), "", log.LstdFlags))
+
+			// Recover the index before serving. A daemon that starts with an
+			// empty index while blocks sit on disk is exactly the LMCache
+			// failure this store was built to avoid: the bytes are there and
+			// unreachable.
+			if err := kvStore.RecoverIndex(ctx); err != nil {
+				logger.Printf("[MODELKV] index recovery failed (continuing with empty index): %v", err)
+			}
+			kvStore.Start(ctx)
+			apiHandler.SetModelKVStore(kvStore)
+			defer kvStore.Close()
+			logger.Printf("[MODELKV] enabled: prefix=%s promote-after=%d ttl=%v batch=%dMB",
+				kvCfg.Prefix, kvCfg.PromoteAfterReads, kvCfg.TTL, *modelKVBatchMB)
+		}
+	}
 
 	// Start API server
 	go func() {
