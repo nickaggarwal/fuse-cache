@@ -1,0 +1,75 @@
+# SkyServe service: vLLM serving Qwen2.5-1.5B off the FUSE cache mount.
+#
+# The point of this file is that the model is NOT downloaded and NOT baked into
+# an image -- it is read from /mnt/fuse, the distributed cache, whose weights
+# are already resident on both A100 nodes. HF_HUB_OFFLINE=1 makes a missing
+# mount fail loudly instead of silently downloading from the Hub and erasing
+# the difference being measured.
+#
+# Two non-obvious details, both load-bearing:
+#
+#  1. mountPropagation: HostToContainer. /mnt/fuse on the host is a FUSE mount
+#     created by the fuse-client DaemonSet. Without propagation the pod
+#     captures the directory at container start and sees the EMPTY underlying
+#     dir, not the filesystem mounted over it. SkyPilot never emits this field
+#     itself (zero occurrences in its source), but it is a valid V1VolumeMount
+#     field so the client-side validator accepts it, and volumeMounts
+#     patch-merge by mountPath so it survives the merge intact.
+#
+#  2. The container entry has no `name:`. SkyPilot merges containers by name;
+#     an unnamed entry merges into container[0] (`ray-node`), which is the one
+#     that actually runs the task. Naming it would append a second container.
+
+service:
+  readiness_probe:
+    path: /v1/models
+    # Loading 3GB of safetensors off the cache takes a while on a cold node,
+    # and a probe that gives up early looks identical to a broken service.
+    initial_delay_seconds: 600
+  replicas: 1
+
+resources:
+  infra: k8s
+  accelerators: A100-80GB:1
+  image_id: docker:vllm/vllm-openai:v0.9.2
+  ports: 8000
+
+envs:
+  MODEL_PATH: /mnt/fuse/models/Qwen2.5-1.5B-Instruct
+  SERVED_NAME: Qwen/Qwen2.5-1.5B-Instruct
+  HF_HUB_OFFLINE: "1"
+
+run: |
+  set -e
+  echo "[check] weights visible through the FUSE mount:"
+  ls -la "$MODEL_PATH"
+  # Fail loudly and early rather than letting vLLM report a confusing
+  # tokenizer error when the mount propagated as an empty directory.
+  test -f "$MODEL_PATH/model.safetensors" || {
+    echo "FATAL: model.safetensors not visible at $MODEL_PATH" >&2
+    echo "The FUSE mount likely did not propagate into this pod." >&2
+    exit 1
+  }
+
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_PATH" \
+    --served-model-name "$SERVED_NAME" \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 4096
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        containers:
+          - volumeMounts:
+              - mountPath: /mnt/fuse
+                name: fuse-mount
+                readOnly: true
+                mountPropagation: HostToContainer
+        volumes:
+          - name: fuse-mount
+            hostPath:
+              path: /mnt/fuse
+              type: Directory
