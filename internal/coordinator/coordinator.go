@@ -105,6 +105,15 @@ var _ Coordinator = (*CoordinatorService)(nil)
 type CoordinatorService struct {
 	store  Store
 	logger *log.Logger
+	// global, when set, mirrors a subset of this cluster's location table
+	// into a global control plane. Held as a narrow interface rather than
+	// a *globalsync.Agent so the coordinator keeps no dependency on the
+	// global path: nil is the normal, fully-functional configuration, and
+	// every call site below is a nil check away from today's behavior.
+	//
+	// Declared as an atomic-free plain field because it is set once during
+	// startup, before the service serves anything.
+	global GlobalPublisher
 	// saveMu serializes SaveStateToPath: the periodic save goroutine and the
 	// shutdown path can otherwise write the same temp file concurrently and
 	// rename a torn snapshot into place.
@@ -167,6 +176,23 @@ func NewCoordinatorServiceWithStore(store Store) *CoordinatorService {
 		store:  store,
 		logger: log.New(log.Writer(), "[COORDINATOR] ", log.LstdFlags),
 	}
+}
+
+// GlobalPublisher receives location changes that may be worth publishing to
+// the global control plane. Implemented by *globalsync.Agent.
+//
+// Both methods are advisory and must not block: they are called from the
+// coordinator's metadata write path, which clients wait on. An
+// implementation that cannot reach the global CP is expected to queue or
+// drop, never to return an error -- which is why neither method has one.
+type GlobalPublisher interface {
+	OnCloudPersist(filePath, storageTier string, fileSize int64, isChunked bool, chunkSize int64)
+	OnDelete(filePath string)
+}
+
+// SetGlobalPublisher attaches a global sync agent. Call before serving.
+func (cs *CoordinatorService) SetGlobalPublisher(p GlobalPublisher) {
+	cs.global = p
 }
 
 // RegisterPeer registers a new peer in the system
@@ -262,6 +288,14 @@ func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *
 		return err
 	}
 	cs.logger.Printf("Updated file location: %s on peer %s", location.FilePath, location.PeerID)
+	// After the store write, so the global index never advertises a path
+	// this cluster's own coordinator failed to record. The agent filters
+	// on tier and allowlist; this call site deliberately does not
+	// duplicate that logic.
+	if cs.global != nil {
+		cs.global.OnCloudPersist(location.FilePath, location.StorageTier, location.FileSize,
+			location.IsChunked, location.ChunkSize)
+	}
 	return nil
 }
 
@@ -274,6 +308,14 @@ func (cs *CoordinatorService) DeleteFileLocation(ctx context.Context, filePath, 
 	}
 	if wholePath {
 		cs.logger.Printf("Deleted file location: %s (all replicas)", filePath)
+		// Only a whole-path delete retracts the global row. One peer
+		// dropping its replica says nothing about the object in cloud
+		// storage, which is the only thing another cluster can read -- so
+		// withdrawing on a per-peer delete would un-advertise a file that
+		// is still perfectly fetchable.
+		if cs.global != nil {
+			cs.global.OnDelete(filePath)
+		}
 	} else {
 		cs.logger.Printf("Deleted file location: %s on peer %s", filePath, peerID)
 	}
