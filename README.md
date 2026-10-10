@@ -298,8 +298,8 @@ Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
 
 ## Cross-Cluster (Global Control Plane)
 
-**Status: stages 0-4 of 5 complete. Usable across a real network as of stage 4
-(mTLS); the Helm chart for the control plane is stage 5 and not written yet.**
+**Status: complete (stages 0-5). Usable across a real network as of stage 4
+(mTLS); stage 5 adds the Helm charts.**
 
 Each cluster is a complete, self-sufficient coordinated cache. A separate
 global control plane (`cmd/globalcp`) makes an explicitly published *subset*
@@ -364,8 +364,37 @@ cross-node figure. It inherits every weakness in `docs/SEMANTICS.md`:
 concurrent writers in different clusters are no better coordinated than
 concurrent writers on different nodes (last publish wins).
 
+**Deploying it.** The control plane is its own chart, installed once per
+federation rather than once per cluster (`charts/fuse-globalcp/README.md`).
+The member half is values on the existing chart:
+
+```bash
+# The federation's control plane, in its own cluster.
+helm install globalcp charts/fuse-globalcp \
+  --set tls.secretName=globalcp-server-tls --set service.type=LoadBalancer
+
+# Each member cluster. cloud.keyPrefix MUST differ per cluster when they
+# share a bucket -- they silently overwrite each other otherwise.
+helm install fuse charts/fuse-cache \
+  --set globalCP.enabled=true \
+  --set globalCP.clusterId=cluster-a \
+  --set globalCP.endpoint=globalcp.example:9090 \
+  --set 'globalCP.publishPrefixes={/models/,/checkpoints/}' \
+  --set 'globalCP.subscribePrefixes={/models/}' \
+  --set globalCP.tls.secretName=cluster-a-globalcp \
+  --set globalCP.read=true \
+  --set cloud.keyPrefix=cluster-a
+```
+
+Both charts refuse to render configurations that would start a pod and then
+do the wrong thing quietly: a control plane with neither mTLS nor an explicit
+insecure opt-in, a member with no cluster ID, an embedded control plane
+alongside an unused TLS secret, a membership that publishes and subscribes to
+nothing, or `globalCP.read` without membership.
+
 ```bash
 scripts/ops/e2e-global-mtls.sh   # stage 4 gate: startup refusals, real mTLS, autonomy
+scripts/ops/e2e-global-chart.sh  # stage 5: the charts' own args/env, fed to the real binaries
 ```
 
 ## Operating Modes

@@ -560,7 +560,7 @@ func main() {
 		enabledState(cacheConfig.FastChunkAdvertise),
 		intervalState(cacheConfig.ReplicaReconcileInterval),
 		cacheConfig.PeerServeMaxInflight)
-	logger.Printf("Cross-cluster: global_read=%s (requires a coordinator with -global-enabled; mTLS is still pending, so do not enable over an untrusted network)",
+	logger.Printf("Cross-cluster: global_read=%s (requires a coordinator running with -global-enabled; the coordinator's link to the control plane is what carries mTLS, not this flag)",
 		enabledState(cacheConfig.GlobalReadEnabled))
 
 	// Declarative warmup: a CSI session mounted with cachePolicy warmup=full

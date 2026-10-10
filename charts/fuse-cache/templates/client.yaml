@@ -210,6 +210,13 @@ spec:
             - "-peer-labels"
             - "{{ .Values.client.peerLabels }}"
             {{- end }}
+            {{- if .Values.globalCP.read }}
+            # A flag, not an env var: the client has no FUSE_GLOBAL_READ
+            # fallback, and inventing one here would put the switch in a
+            # place the binary does not read. Costs nothing when off -- only
+            # a local cloud MISS consults the cross-cluster path.
+            - "-global-read"
+            {{- end }}
             - "-s3-bucket"
             - "$(S3_BUCKET)"
             - "-s3-region"

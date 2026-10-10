@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globalcp
+  namespace: {{ include "fuse-globalcp.namespace" . }}
+  labels:
+    app: globalcp
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Recreate, not RollingUpdate: with the in-memory store a second pod would
+  # briefly hold an empty index and serve snapshots from it. A short gap is
+  # honest -- clusters reconnect and resend -- where a wrong answer is not.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: globalcp
+  template:
+    metadata:
+      labels:
+        app: globalcp
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: globalcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["globalcp"]
+          args:
+            - "-port"
+            - "{{ .Values.httpPort }}"
+            - "-grpc-port"
+            - "{{ .Values.grpcPort }}"
+            - "-max-prefixes"
+            - "{{ .Values.maxPrefixes }}"
+            {{- if .Values.tls.secretName }}
+            # Identity comes out of the verified client certificate. These
+            # three are all-or-nothing in the binary: a partial set is a
+            # startup error, never a quiet downgrade to plaintext.
+            - "-tls-cert"
+            - "/etc/fuse-globalcp/tls/{{ .Values.tls.certKey }}"
+            - "-tls-key"
+            - "/etc/fuse-globalcp/tls/{{ .Values.tls.keyKey }}"
+            - "-tls-ca"
+            - "/etc/fuse-globalcp/tls/{{ .Values.tls.caKey }}"
+            {{- else }}
+            - "-allow-insecure-identity"
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.httpPort }}
+              name: http
+            - containerPort: {{ .Values.grpcPort }}
+              name: grpc
+          {{- if .Values.tls.secretName }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/fuse-globalcp/tls
+              readOnly: true
+          {{- end }}
+          # Probes hit the HTTP surface, not gRPC: /api/health needs no
+          # client certificate, so a probe cannot be the reason the pod needs
+          # one issued to itself.
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.httpPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.httpPort }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      {{- if .Values.tls.secretName }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+            defaultMode: 0400
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

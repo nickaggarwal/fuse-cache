@@ -1,0 +1,38 @@
+{{- if .Values.ingress.enabled }}
+# Read-only HTTP observability only. The gRPC port is deliberately not
+# routed here: an ingress that terminates TLS verifies the client
+# certificate at the proxy and forwards an anonymous connection, which would
+# turn cert-derived cluster identity off without any error. Member clusters
+# reach gRPC through service.type (ClusterIP across peered networks, or
+# LoadBalancer), where the mTLS handshake is end-to-end.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: globalcp
+  namespace: {{ include "fuse-globalcp.namespace" . }}
+  labels:
+    app: globalcp
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{ if .Values.ingress.host }}host: {{ .Values.ingress.host | quote }}
+      {{ end }}http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: globalcp
+                port:
+                  number: {{ .Values.httpPort }}
+{{- end }}
