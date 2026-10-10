@@ -144,6 +144,12 @@ type CacheConfig struct {
 	// GCP config
 	GCPBucket string
 
+	// CloudKeyPrefix scopes every object-storage key this node writes, so
+	// several clusters can share one bucket without colliding. Empty (the
+	// default) is the historical flat layout; reads fall back to the
+	// unprefixed key, so adopting a prefix does not orphan existing objects.
+	CloudKeyPrefix string
+
 	// Cloud retry config
 	CloudRetryCount    int
 	CloudRetryBaseWait time.Duration
@@ -620,6 +626,9 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Applied after construction and before the store is reachable, so every
+	// provider picks up the cluster scope from one place instead of three.
+	ScopeCloudKeys(cm.cloudStorage, config.CloudKeyPrefix)
 
 	// Steady-state replica reconciler (thundering-herd Phase 3).
 	if config.ReplicaReconcileInterval > 0 {

@@ -72,6 +72,10 @@ func main() {
 		// GCP config
 		gcpBucket = flag.String("gcp-bucket", "fuse-client-cache", "GCS bucket name")
 
+		// Cluster scope for object-storage keys. Empty keeps the historical
+		// flat layout; set it when several clusters share one bucket.
+		cloudKeyPrefix = flag.String("cloud-key-prefix", "", "Prefix every cloud object key with this cluster scope (empty = flat, legacy layout)")
+
 		// NVMe capacity
 		nvmeMaxGB            = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
 		peerMaxGB            = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
@@ -147,6 +151,12 @@ func main() {
 	}
 	if v := os.Getenv("GCP_BUCKET"); v != "" && *gcpBucket == "fuse-client-cache" {
 		*gcpBucket = v
+	}
+	// Flag wins, env is the default. The older settings above vary on this
+	// (some env vars override an explicitly-passed flag); new settings use
+	// the one rule.
+	if v := strings.TrimSpace(os.Getenv("FUSE_CLOUD_KEY_PREFIX")); v != "" && *cloudKeyPrefix == "" {
+		*cloudKeyPrefix = v
 	}
 	if v := os.Getenv("S3_BUCKET"); v != "" && *s3Bucket == "fuse-client-cache" {
 		*s3Bucket = v
@@ -275,6 +285,7 @@ func main() {
 		AzureDownloadBlockSizeBytes:   int64(*azureDLBlockMB) * 1024 * 1024,
 		AzureParallelDownloadMinBytes: int64(*azureDLMinMB) * 1024 * 1024,
 		GCPBucket:                     *gcpBucket,
+		CloudKeyPrefix:                strings.TrimSpace(*cloudKeyPrefix),
 		LocalPeerID:                   *peerID,
 		PeerReadThroughputBytesPerSec: *peerReadMBps * 1024 * 1024,
 	}
@@ -704,6 +715,9 @@ func main() {
 	logger.Printf("- Coordinator gRPC: %s", *coordinatorGRPC)
 	logger.Printf("- FUSE backend: %s", *fuseBackendName)
 	logger.Printf("- Cloud provider: %s", *cloudProvider)
+	if p := strings.TrimSpace(*cloudKeyPrefix); p != "" {
+		logger.Printf("- Cloud key prefix: %s", p)
+	}
 	logger.Printf("- S3 bucket: %s", cacheConfig.S3Bucket)
 	logger.Printf("- S3 region: %s", cacheConfig.S3Region)
 	logger.Printf("- S3 download concurrency: %d", cacheConfig.S3DownloadConcurrency)

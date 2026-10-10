@@ -44,6 +44,9 @@ type CloudStorage struct {
 	downloader      *s3manager.Downloader
 	timeout         time.Duration
 	preferDirectPut bool
+	// keys scopes object keys to a cluster so several clusters can share one
+	// bucket. Zero value is unscoped, i.e. the historical key layout.
+	keys KeyMapper
 }
 
 // NewCloudStorage creates a new cloud storage instance
@@ -117,7 +120,7 @@ func (cs *CloudStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	defer cancel()
 
 	var firstErr error
-	for _, key := range keyCandidates(path) {
+	for _, key := range cs.readKeyCandidates(path) {
 		if shouldUseDirectS3Read(path) {
 			data, err := cs.readDirect(timeoutCtx, key)
 			if err == nil {
@@ -180,7 +183,7 @@ func readAllSized(r io.Reader, contentLength int64) ([]byte, error) {
 }
 
 func (cs *CloudStorage) Write(ctx context.Context, path string, data []byte) error {
-	key := normalizeS3Key(path)
+	key := cs.objectKey(path)
 
 	// Small chunk-sized writes are faster and more reliable via PutObject than
 	// multipart upload manager, especially on S3 Express directory buckets.
@@ -236,7 +239,7 @@ func (cs *CloudStorage) putObject(ctx context.Context, key string, data []byte) 
 // CopyObject duplicates an object inside the bucket server-side, so a rename
 // costs one request per object instead of a download plus an upload.
 func (cs *CloudStorage) CopyObject(ctx context.Context, srcPath, dstPath string) error {
-	return s3CopyObject(ctx, cs.s3Client, cs.bucket, srcPath, dstPath, cs.timeout)
+	return s3CopyObject(ctx, cs.s3Client, cs.bucket, srcPath, dstPath, cs.timeout, cs.keys)
 }
 
 // Delete removes the object under every spelling of path that Read, Exists,
@@ -250,7 +253,7 @@ func (cs *CloudStorage) Delete(ctx context.Context, path string) error {
 	defer cancel()
 
 	var firstErr error
-	for _, key := range keyCandidates(path) {
+	for _, key := range cs.readKeyCandidates(path) {
 		_, err := cs.s3Client.DeleteObjectWithContext(timeoutCtx, &s3.DeleteObjectInput{
 			Bucket: aws.String(cs.bucket),
 			Key:    aws.String(key),
@@ -269,7 +272,7 @@ func (cs *CloudStorage) Exists(ctx context.Context, path string) bool {
 	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
 	defer cancel()
 
-	for _, key := range keyCandidates(path) {
+	for _, key := range cs.readKeyCandidates(path) {
 		_, err := cs.s3Client.HeadObjectWithContext(timeoutCtx, &s3.HeadObjectInput{
 			Bucket: aws.String(cs.bucket),
 			Key:    aws.String(key),
@@ -289,7 +292,7 @@ func (cs *CloudStorage) Size(ctx context.Context, path string) (int64, error) {
 	defer cancel()
 
 	var firstErr error
-	for _, key := range keyCandidates(path) {
+	for _, key := range cs.readKeyCandidates(path) {
 		resp, err := cs.s3Client.HeadObjectWithContext(timeoutCtx, &s3.HeadObjectInput{
 			Bucket: aws.String(cs.bucket),
 			Key:    aws.String(key),
@@ -313,15 +316,24 @@ func (cs *CloudStorage) Size(ctx context.Context, path string) (int64, error) {
 	return 0, firstErr
 }
 
+// normalizeS3Key is S3's own spelling rule: no leading slash. It is separate
+// from cluster scoping, which KeyMapper applies on top.
 func normalizeS3Key(path string) string {
 	return strings.TrimPrefix(path, "/")
 }
 
+// objectKey is the key to WRITE path under: S3-normalized, then cluster-scoped.
+func (cs *CloudStorage) objectKey(path string) string {
+	return cs.keys.Key(normalizeS3Key(path))
+}
+
 // s3CopyObject issues a server-side copy, shared by the S3 and GCS-interop
-// backends. The source is tried under both key spellings for the same reason
-// reads are (keyCandidates): objects written before key normalization still
-// carry the leading slash.
-func s3CopyObject(ctx context.Context, client *s3.S3, bucket, srcPath, dstPath string, timeout time.Duration) error {
+// backends. The source is tried under every spelling a read would try, for
+// the same reason: objects written before key normalization still carry the
+// leading slash, and objects written before a cluster prefix was configured
+// are still unscoped. The destination always takes the current scoped key, so
+// a copy migrates the object forward.
+func s3CopyObject(ctx context.Context, client *s3.S3, bucket, srcPath, dstPath string, timeout time.Duration, keys KeyMapper) error {
 	if srcPath == dstPath {
 		return nil
 	}
@@ -329,10 +341,10 @@ func s3CopyObject(ctx context.Context, client *s3.S3, bucket, srcPath, dstPath s
 	defer cancel()
 
 	var firstErr error
-	for _, srcKey := range keyCandidates(srcPath) {
+	for _, srcKey := range scopedKeyCandidates(srcPath, keys) {
 		_, err := client.CopyObjectWithContext(timeoutCtx, &s3.CopyObjectInput{
 			Bucket: aws.String(bucket),
-			Key:    aws.String(normalizeS3Key(dstPath)),
+			Key:    aws.String(keys.Key(normalizeS3Key(dstPath))),
 			// CopySource is "bucket/key" and must be URL-escaped: object keys
 			// routinely contain characters (spaces, "+") that would otherwise
 			// be reinterpreted by the service.
@@ -354,12 +366,31 @@ func s3CopyObject(ctx context.Context, client *s3.S3, bucket, srcPath, dstPath s
 	return firstErr
 }
 
+// keyCandidates lists the unscoped read spellings: normalized first, then the
+// raw path, because objects written before key normalization kept their
+// leading slash.
 func keyCandidates(path string) []string {
 	norm := normalizeS3Key(path)
 	if norm == path {
 		return []string{norm}
 	}
 	return []string{norm, path}
+}
+
+// scopedKeyCandidates is keyCandidates with cluster scoping layered on: the
+// scoped key first (the hit once migrated), then every unscoped spelling, so
+// a cluster that adopts a prefix keeps reading what it wrote before. Shared
+// by the S3 and GCS-interop backends.
+func scopedKeyCandidates(path string, keys KeyMapper) []string {
+	legacy := keyCandidates(path)
+	if keys.Prefix() == "" {
+		return legacy
+	}
+	return append([]string{keys.Key(normalizeS3Key(path))}, legacy...)
+}
+
+func (cs *CloudStorage) readKeyCandidates(path string) []string {
+	return scopedKeyCandidates(path, cs.keys)
 }
 
 func shouldUseDirectS3Read(path string) bool {

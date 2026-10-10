@@ -240,6 +240,14 @@ func newSnapshotCloudStoreFromEnv(logger *log.Logger) snapshotCloudStore {
 		logger.Printf("Coordinator snapshot cloud store initialization failed: %v", err)
 		return nil
 	}
+	// Must match the clients' scope: the coordinator reads and writes the same
+	// objects they do, so a prefix set on one side only makes every snapshot
+	// read miss.
+	keyPrefix := strings.TrimSpace(os.Getenv("FUSE_CLOUD_KEY_PREFIX"))
+	cache.ScopeCloudKeys(store, keyPrefix)
+	if keyPrefix != "" {
+		logger.Printf("Coordinator snapshot cloud store key prefix=%s", keyPrefix)
+	}
 	logger.Printf("Coordinator snapshot cloud store enabled for provider=%s", provider)
 	return store
 }

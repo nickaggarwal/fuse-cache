@@ -35,6 +35,25 @@ type AzureStorage struct {
 	downloadConcurrency      uint16
 	downloadBlockSize        int64
 	parallelDownloadMinBytes int64
+	// keys scopes blob names to a cluster so several clusters can share one
+	// container. Zero value is unscoped, i.e. the historical layout.
+	keys KeyMapper
+}
+
+// objectKey is the blob name to WRITE path under.
+//
+// Like the GCS backend and unlike S3, this does not trim the leading slash:
+// Azure blob names have always been the raw path here, and changing that now
+// would orphan every blob already written.
+func (as *AzureStorage) objectKey(path string) string { return as.keys.Key(path) }
+
+// readKeyCandidates lists the blob names to try for a read, scoped first.
+// With no prefix it is the single raw name, exactly as before scoping existed.
+func (as *AzureStorage) readKeyCandidates(path string) []string {
+	if as.keys.Prefix() == "" {
+		return []string{path}
+	}
+	return []string{as.objectKey(path), path}
 }
 
 // NewAzureStorage creates a new Azure Blob Storage instance
@@ -89,13 +108,41 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
+	// The helpers below take a resolved blob name, not a mount path: the
+	// candidate loop is the only place that knows which spelling is in play,
+	// and threading a path through three layers that would each have to
+	// re-resolve it is how the two drift apart.
+	var firstErr error
+	for _, name := range as.readKeyCandidates(path) {
+		data, err := as.readName(timeoutCtx, name)
+		if err == nil {
+			return data, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		// A timeout says nothing about whether the next spelling exists, and
+		// retrying under an already-expired context just returns the same
+		// error more slowly.
+		if timeoutCtx.Err() != nil {
+			return nil, firstErr
+		}
+		if !bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound) {
+			return nil, err
+		}
+	}
+	return nil, firstErr
+}
+
+// readName reads one fully-resolved blob name.
+func (as *AzureStorage) readName(timeoutCtx context.Context, name string) ([]byte, error) {
 	// Chunk-object reads dominate cold range-read traffic. Avoiding a separate
 	// GetProperties HEAD request removes one round-trip per chunk, and the
 	// first-range read discovers the size from Content-Range so the rest of
 	// the blob downloads in parallel (a single sequential GET was the ~10MB/s
 	// tail on every cloud-fallback chunk).
-	if isChunkObjectPath(path) {
-		data, err := as.readFirstRangeThenParallel(timeoutCtx, path)
+	if isChunkObjectPath(name) {
+		data, err := as.readFirstRangeThenParallel(timeoutCtx, name)
 		if err == nil {
 			return data, nil
 		}
@@ -103,10 +150,10 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 			return nil, err
 		}
 		// Any non-timeout failure falls back to the plain stream read.
-		return as.readStream(timeoutCtx, path)
+		return as.readStream(timeoutCtx, name)
 	}
 
-	props, err := as.getProperties(timeoutCtx, path)
+	props, err := as.getPropertiesName(timeoutCtx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +165,7 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if as.downloadConcurrency > 1 && size >= as.parallelDownloadMinBytes {
 		if size <= int64(int(^uint(0)>>1)) {
 			buf := make([]byte, int(size))
-			_, err = as.client.DownloadBuffer(timeoutCtx, as.containerName, path, buf, &azblob.DownloadBufferOptions{
+			_, err = as.client.DownloadBuffer(timeoutCtx, as.containerName, name, buf, &azblob.DownloadBufferOptions{
 				Range:       azblob.HTTPRange{Offset: 0, Count: size},
 				BlockSize:   as.downloadBlockSize,
 				Concurrency: as.downloadConcurrency,
@@ -133,7 +180,7 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		}
 	}
 
-	return as.readStream(timeoutCtx, path)
+	return as.readStream(timeoutCtx, name)
 }
 
 // readFirstRangeThenParallel reads one blob without a prior HEAD: it GETs the
@@ -141,11 +188,12 @@ func (as *AzureStorage) Read(ctx context.Context, path string) ([]byte, error) {
 // response, and pulls the remainder with the SDK's parallel ranged
 // downloader. Small blobs (<= one block) complete in exactly one round-trip;
 // larger ones get concurrency without the GetProperties latency tax.
-func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path string) ([]byte, error) {
+// It takes a resolved blob name, not a mount path.
+func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, name string) ([]byte, error) {
 	// Constructor guarantees downloadBlockSize > 0.
 	blockSize := as.downloadBlockSize
 
-	resp, err := as.client.DownloadStream(ctx, as.containerName, path, &azblob.DownloadStreamOptions{
+	resp, err := as.client.DownloadStream(ctx, as.containerName, name, &azblob.DownloadStreamOptions{
 		Range: azblob.HTTPRange{Offset: 0, Count: blockSize},
 	})
 	if err != nil {
@@ -166,7 +214,7 @@ func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path str
 		// No Content-Range (zero-byte blob or server quirk): fall back to the
 		// plain stream read rather than re-implementing it here.
 		resp.Body.Close()
-		return as.readStream(ctx, path)
+		return as.readStream(ctx, name)
 	}
 
 	buf := make([]byte, total)
@@ -184,7 +232,7 @@ func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path str
 	}
 
 	// Remainder in parallel ranged blocks.
-	_, err = as.client.DownloadBuffer(ctx, as.containerName, path, buf[first:], &azblob.DownloadBufferOptions{
+	_, err = as.client.DownloadBuffer(ctx, as.containerName, name, buf[first:], &azblob.DownloadBufferOptions{
 		Range:       azblob.HTTPRange{Offset: first, Count: total - first},
 		BlockSize:   blockSize,
 		Concurrency: as.downloadConcurrency,
@@ -195,8 +243,9 @@ func (as *AzureStorage) readFirstRangeThenParallel(ctx context.Context, path str
 	return buf, nil
 }
 
-func (as *AzureStorage) readStream(ctx context.Context, path string) ([]byte, error) {
-	resp, err := as.client.DownloadStream(ctx, as.containerName, path, nil)
+// readStream takes a resolved blob name, not a mount path.
+func (as *AzureStorage) readStream(ctx context.Context, name string) ([]byte, error) {
+	resp, err := as.client.DownloadStream(ctx, as.containerName, name, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +265,7 @@ func (as *AzureStorage) Write(ctx context.Context, path string, data []byte) err
 	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
-	_, err := as.client.UploadBuffer(timeoutCtx, as.containerName, path, data, &azblob.UploadBufferOptions{
+	_, err := as.client.UploadBuffer(timeoutCtx, as.containerName, as.objectKey(path), data, &azblob.UploadBufferOptions{
 		BlockSize:   as.downloadBlockSize,
 		Concurrency: as.downloadConcurrency,
 	})
@@ -235,14 +284,18 @@ func (as *AzureStorage) CopyObject(ctx context.Context, srcPath, dstPath string)
 		return nil
 	}
 	container := as.client.ServiceClient().NewContainerClient(as.containerName)
-	src := container.NewBlobClient(srcPath)
-	dst := container.NewBlobClient(dstPath)
+	// The source may still sit at its unscoped name (written before a prefix
+	// was configured); the destination always gets the scoped one, so a
+	// rename quietly migrates the blob forward.
+	srcName := as.existingName(ctx, srcPath)
+	src := container.NewBlobClient(srcName)
+	dst := container.NewBlobClient(as.objectKey(dstPath))
 
 	// The service fetches the source itself, so it needs a URL it can read.
 	// GetSASURL signs with the shared key this client was built from.
 	sourceURL, err := src.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(azureCopySASTTL), nil)
 	if err != nil {
-		return fmt.Errorf("sign copy source %s: %w", srcPath, err)
+		return fmt.Errorf("sign copy source %s: %w", srcName, err)
 	}
 
 	startCtx, cancel := context.WithTimeout(ctx, as.timeout)
@@ -300,8 +353,20 @@ func (as *AzureStorage) Delete(ctx context.Context, path string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
-	_, err := as.client.DeleteBlob(timeoutCtx, as.containerName, path, nil)
-	return err
+	var firstErr error
+	for _, name := range as.readKeyCandidates(path) {
+		_, err := as.client.DeleteBlob(timeoutCtx, as.containerName, name, nil)
+		if err == nil {
+			return nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if timeoutCtx.Err() != nil || !bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound) {
+			return err
+		}
+	}
+	return firstErr
 }
 
 func (as *AzureStorage) Exists(ctx context.Context, path string) bool {
@@ -309,13 +374,7 @@ func (as *AzureStorage) Exists(ctx context.Context, path string) bool {
 	defer cancel()
 
 	_, err := as.getProperties(timeoutCtx, path)
-	if err == nil {
-		return true
-	}
-	if bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound) {
-		return false
-	}
-	return false
+	return err == nil
 }
 
 func (as *AzureStorage) Size(ctx context.Context, path string) (int64, error) {
@@ -332,8 +391,44 @@ func (as *AzureStorage) Size(ctx context.Context, path string) (int64, error) {
 	return *props.ContentLength, nil
 }
 
+// getProperties heads the first candidate spelling that exists.
 func (as *AzureStorage) getProperties(ctx context.Context, path string) (blob.GetPropertiesResponse, error) {
-	return as.client.ServiceClient().NewContainerClient(as.containerName).NewBlobClient(path).GetProperties(ctx, nil)
+	var firstErr error
+	for _, name := range as.readKeyCandidates(path) {
+		props, err := as.getPropertiesName(ctx, name)
+		if err == nil {
+			return props, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if ctx.Err() != nil || !bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound) {
+			return props, err
+		}
+	}
+	return blob.GetPropertiesResponse{}, firstErr
+}
+
+func (as *AzureStorage) getPropertiesName(ctx context.Context, name string) (blob.GetPropertiesResponse, error) {
+	return as.client.ServiceClient().NewContainerClient(as.containerName).NewBlobClient(name).GetProperties(ctx, nil)
+}
+
+// existingName picks the candidate spelling a blob is actually stored under,
+// falling back to the scoped name when neither answers.
+func (as *AzureStorage) existingName(ctx context.Context, path string) string {
+	cands := as.readKeyCandidates(path)
+	if len(cands) == 1 {
+		return cands[0]
+	}
+	for _, name := range cands {
+		headCtx, cancel := context.WithTimeout(ctx, as.timeout)
+		_, err := as.getPropertiesName(headCtx, name)
+		cancel()
+		if err == nil {
+			return name
+		}
+	}
+	return cands[0]
 }
 
 func isChunkObjectPath(path string) bool {
@@ -364,7 +459,16 @@ func (as *AzureStorage) ListUnder(ctx context.Context, prefix string) ([]string,
 	ctx, cancel := context.WithTimeout(ctx, as.timeout)
 	defer cancel()
 
-	p := strings.TrimPrefix(prefix, "/")
+	// Callers feed these names straight back into Read, which re-applies the
+	// cluster scope, so the listing must enumerate scoped but report
+	// unscoped. Returning the stored names would double-prefix every
+	// subsequent read.
+	trimmed := strings.TrimPrefix(prefix, "/")
+	scope := as.keys.Prefix()
+	p := trimmed
+	if scope != "" {
+		p = scope + "/" + trimmed
+	}
 	pager := as.client.NewListBlobsFlatPager(as.containerName, &azblob.ListBlobsFlatOptions{
 		Prefix: &p,
 	})
@@ -375,9 +479,14 @@ func (as *AzureStorage) ListUnder(ctx context.Context, prefix string) ([]string,
 			return nil, fmt.Errorf("azure: list blobs under %s: %w", p, err)
 		}
 		for _, item := range page.Segment.BlobItems {
-			if item != nil && item.Name != nil {
-				out = append(out, *item.Name)
+			if item == nil || item.Name == nil {
+				continue
 			}
+			name := *item.Name
+			if scope != "" {
+				name = strings.TrimPrefix(name, scope+"/")
+			}
+			out = append(out, name)
 		}
 	}
 	return out, nil
