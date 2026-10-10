@@ -19,6 +19,7 @@ import (
 	"fuse-client/internal/coordinator"
 	"fuse-client/internal/coordinator/globalsync"
 	"fuse-client/internal/globalcp"
+	"fuse-client/internal/mtls"
 	pb "fuse-client/internal/pb"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -45,6 +46,10 @@ func main() {
 		globalSubscribe    = flag.String("global-subscribe-prefixes", "", "Comma-separated path prefixes this cluster wants to discover from other clusters. Empty subscribes to nothing.")
 		globalEmbedded     = flag.Bool("global-embedded", false, "DEV ONLY: run the global control plane in-process on loopback with no TLS, and point the sync agent at it")
 		globalEmbeddedPort = flag.Int("global-embedded-port", 9091, "Loopback port for the embedded global control plane")
+		globalTLSCert      = flag.String("global-tls-cert", "", "PEM client certificate this cluster presents to the global control plane; its first DNS SAN is the cluster identity the CP will use")
+		globalTLSKey       = flag.String("global-tls-key", "", "PEM private key for -global-tls-cert")
+		globalTLSCA        = flag.String("global-tls-ca", "", "PEM CA bundle that signs the global control plane's server certificate")
+		globalTLSName      = flag.String("global-tls-server-name", "", "Expected server name in the control plane's certificate; defaults to the host part of -global-endpoint")
 
 		help = flag.Bool("help", false, "Show help")
 	)
@@ -100,6 +105,10 @@ func main() {
 		Subscribe:    *globalSubscribe,
 		Embedded:     *globalEmbedded,
 		EmbeddedPort: *globalEmbeddedPort,
+		TLSCert:      *globalTLSCert,
+		TLSKey:       *globalTLSKey,
+		TLSCA:        *globalTLSCA,
+		TLSName:      *globalTLSName,
 	})
 
 	var (
@@ -123,6 +132,39 @@ func main() {
 			// nothing, and silence here reads as a working setup.
 			logger.Printf("WARNING: global sync enabled with no publish or subscribe prefixes; nothing will cross the cluster boundary")
 		}
+		if err := gcfg.TLS.Validate(); err != nil {
+			logger.Fatalf("Global TLS configuration: %v", err)
+		}
+		// Embedded mode is loopback and certificate-free by construction, so
+		// TLS flags there are a contradiction rather than a refinement -- most
+		// likely a production config that also picked up -global-embedded.
+		if gcfg.Embedded && gcfg.TLS.Enabled() {
+			logger.Fatalf("-global-embedded cannot be combined with -global-tls-*: the embedded control plane is loopback-only and serves no certificate")
+		}
+		if !gcfg.Embedded && !gcfg.TLS.Enabled() {
+			// Loud, not fatal: stages 0-3 are exercisable against a plaintext
+			// CP on a trusted network, and failing here would break that. But
+			// without a certificate the CP cannot tell this cluster from any
+			// other, so the ID below is a claim, not an identity.
+			logger.Printf("WARNING: connecting to global control plane %s without mTLS; cluster identity %q is self-declared and unverifiable. Do not run this across an untrusted network.",
+				gcfg.Endpoint, gcfg.ClusterID)
+		}
+
+		var dialOpts []grpc.DialOption
+		if gcfg.TLS.Enabled() {
+			// Default the expected server name to the endpoint host, so an
+			// operator who set no -global-tls-server-name still gets name
+			// verification rather than silently skipping it.
+			if gcfg.TLS.ServerName == "" {
+				gcfg.TLS.ServerName = hostOnly(gcfg.Endpoint)
+			}
+			opt, derr := gcfg.TLS.DialOption()
+			if derr != nil {
+				logger.Fatalf("Failed to build global client TLS credentials: %v", derr)
+			}
+			dialOpts = append(dialOpts, opt)
+		}
+
 		if gcfg.Embedded {
 			embeddedSrv, err = startEmbeddedGlobalCP(gcfg.EmbeddedPort, logger)
 			if err != nil {
@@ -136,6 +178,7 @@ func main() {
 			Object:            globalObjectRefFromEnv(gcfg.ClusterID),
 			PublishPrefixes:   gcfg.Publish,
 			SubscribePrefixes: gcfg.Subscribe,
+			DialOptions:       dialOpts,
 			Logger:            log.New(os.Stdout, "[GLOBALSYNC] ", log.LstdFlags),
 		})
 		if err != nil {
@@ -149,8 +192,8 @@ func main() {
 		// cannot itself resolve against.
 		coordinatorService.SetGlobalMirror(syncAgent.Mirror())
 		syncAgent.Start(ctx)
-		logger.Printf("Global sync enabled: cluster=%q endpoint=%s publish=%v subscribe=%v",
-			gcfg.ClusterID, gcfg.Endpoint, gcfg.Publish, gcfg.Subscribe)
+		logger.Printf("Global sync enabled: cluster=%q endpoint=%s mtls=%v publish=%v subscribe=%v",
+			gcfg.ClusterID, gcfg.Endpoint, gcfg.TLS.Enabled(), gcfg.Publish, gcfg.Subscribe)
 	}
 
 	// Create HTTP server
@@ -216,6 +259,10 @@ type globalSettings struct {
 	Subscribe    string
 	Embedded     bool
 	EmbeddedPort int
+	TLSCert      string
+	TLSKey       string
+	TLSCA        string
+	TLSName      string
 }
 
 // globalConfig is the resolved configuration.
@@ -227,6 +274,7 @@ type globalConfig struct {
 	Subscribe    []string
 	Embedded     bool
 	EmbeddedPort int
+	TLS          mtls.Config
 }
 
 // globalConfigFromEnv applies env defaults to the flag values.
@@ -249,6 +297,12 @@ func globalConfigFromEnv(s globalSettings) globalConfig {
 		Subscribe:    splitPrefixes(str(s.Subscribe, "FUSE_GLOBAL_SUBSCRIBE_PREFIXES")),
 		Embedded:     s.Embedded || envBool("FUSE_GLOBAL_EMBEDDED", false),
 		EmbeddedPort: s.EmbeddedPort,
+		TLS: mtls.Config{
+			CertFile:   str(s.TLSCert, "FUSE_GLOBAL_TLS_CERT"),
+			KeyFile:    str(s.TLSKey, "FUSE_GLOBAL_TLS_KEY"),
+			CAFile:     str(s.TLSCA, "FUSE_GLOBAL_TLS_CA"),
+			ServerName: str(s.TLSName, "FUSE_GLOBAL_TLS_SERVER_NAME"),
+		},
 	}
 	if !cfg.Enabled {
 		return cfg
@@ -262,6 +316,18 @@ func globalConfigFromEnv(s globalSettings) globalConfig {
 		cfg.ClusterID = strings.TrimSpace(os.Getenv("CLUSTER_NAME"))
 	}
 	return cfg
+}
+
+// hostOnly strips the port from a dial target, for certificate name
+// verification. A bare host with no port is returned unchanged, so an
+// endpoint written without one still verifies against itself rather than
+// against the empty string, which gRPC treats as "skip the name check".
+func hostOnly(endpoint string) string {
+	h, _, err := net.SplitHostPort(strings.TrimSpace(endpoint))
+	if err != nil {
+		return strings.TrimSpace(endpoint)
+	}
+	return h
 }
 
 func splitPrefixes(v string) []string {

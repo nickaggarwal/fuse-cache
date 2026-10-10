@@ -7,6 +7,7 @@ CLIENT_BINARY := $(BINARY_DIR)/client
 CSI_BINARY := $(BINARY_DIR)/csi-driver
 NODE_INIT_BINARY := $(BINARY_DIR)/node-init
 GLOBALCP_BINARY := $(BINARY_DIR)/globalcp
+GLOBALCP_CERTS_BINARY := $(BINARY_DIR)/globalcp-certs
 PROTO_DIR := internal/proto
 GO_FILES := $(shell find . -name "*.go" -not -path "./vendor/*")
 
@@ -20,7 +21,7 @@ $(BINARY_DIR):
 
 # Build targets
 .PHONY: build
-build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY) $(NODE_INIT_BINARY) $(GLOBALCP_BINARY)
+build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY) $(NODE_INIT_BINARY) $(GLOBALCP_BINARY) $(GLOBALCP_CERTS_BINARY)
 
 $(COORDINATOR_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(COORDINATOR_BINARY) cmd/coordinator/main.go
@@ -36,6 +37,11 @@ $(NODE_INIT_BINARY): $(BINARY_DIR) $(GO_FILES)
 
 $(GLOBALCP_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(GLOBALCP_BINARY) cmd/globalcp/main.go
+
+# Dev-only certificate issuer. Shares internal/mtls.TestCA with the unit
+# tests so the trust model has exactly one definition.
+$(GLOBALCP_CERTS_BINARY): $(BINARY_DIR) $(GO_FILES)
+	go build -o $(GLOBALCP_CERTS_BINARY) cmd/globalcp-certs/main.go
 
 # Install dependencies
 .PHONY: deps

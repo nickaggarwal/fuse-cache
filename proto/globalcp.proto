@@ -164,6 +164,10 @@ message GlobalEvent {
 
 message ResolveRequest {
   string file_path = 1;
+  // Advisory, and only consulted in the insecure/embedded mode. Under mTLS
+  // the control plane takes identity from the verified client certificate
+  // and ignores this field entirely.
+  string cluster_id = 2;
 }
 
 message ResolveResponse {

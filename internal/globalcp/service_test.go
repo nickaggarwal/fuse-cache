@@ -327,6 +327,9 @@ func TestResolveReturnsEveryClustersCopy(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// Resolve is registration-gated and subscription-scoped, so a reader
+	// has to declare what it wants to see before it can ask for it.
+	registerCluster(t, client, "c", nil, []string{"/models/"})
 	resp, err := client.Resolve(asCluster(context.Background(), "c"), &pb.ResolveRequest{FilePath: "/models/a.bin"})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -336,6 +339,11 @@ func TestResolveReturnsEveryClustersCopy(t *testing.T) {
 	if len(resp.GetLocations()) != 2 {
 		t.Fatalf("got %d locations, want 2", len(resp.GetLocations()))
 	}
+	// A miss inside the subscription is an empty answer, not an error --
+	// the data path treats a resolve error and an empty result
+	// differently, and conflating them would make a cold index look like
+	// a broken one.
+	registerCluster(t, client, "c", nil, []string{"/models/", "/nope"})
 	resp, err = client.Resolve(asCluster(context.Background(), "c"), &pb.ResolveRequest{FilePath: "/nope"})
 	if err != nil {
 		t.Fatalf("resolve miss: %v", err)

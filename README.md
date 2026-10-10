@@ -296,6 +296,78 @@ Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
   (EKS + S3 Express directory bucket + VPC endpoints) and Azure (AKS +
   premium blob), Helm chart with per-cloud overlays.
 
+## Cross-Cluster (Global Control Plane)
+
+**Status: stages 0-4 of 5 complete. Usable across a real network as of stage 4
+(mTLS); the Helm chart for the control plane is stage 5 and not written yet.**
+
+Each cluster is a complete, self-sufficient coordinated cache. A separate
+global control plane (`cmd/globalcp`) makes an explicitly published *subset*
+of each cluster's cache discoverable to the others. Four properties define
+the design:
+
+- **The global data path is object storage only.** No cross-cluster
+  peer-to-peer byte transfer exists or is planned. The control plane answers
+  *where* (bucket + key prefix); the reading cluster fetches from object
+  storage itself with its own credentials.
+- **Published paths only.** A cluster publishes nothing until an operator
+  configures a prefix allowlist (`-global-publish-prefixes`). This is what
+  keeps the global index small enough to mirror locally.
+- **Full local autonomy.** With the control plane unreachable, every local
+  operation behaves exactly as in a single-cluster deployment. Only discovery
+  of *new* cross-cluster rows degrades; the mirror keeps serving what it
+  already knows. `scripts/ops/e2e-global-mtls.sh` section 5 asserts this.
+- **The coordinator always dials out.** Private clusters need no inbound
+  rule; only the control plane is addressable.
+
+Nothing above changes a single-cluster deployment: every flag defaults off
+and `-cloud-key-prefix` defaults empty, which is byte-identical to the
+pre-existing key layout.
+
+```bash
+# Dev: one embedded control plane, loopback, no certificates.
+./bin/coordinator -global-enabled -global-cluster-id dev -global-embedded \
+  -global-publish-prefixes /models/ -global-subscribe-prefixes /models/
+
+# Real: mTLS, and the client certificate IS the cluster identity.
+./bin/globalcp-certs -dir ./certs -names globalcp,cluster-a
+./bin/globalcp -tls-cert certs/globalcp.crt -tls-key certs/globalcp.key \
+  -tls-ca certs/ca.crt
+./bin/coordinator -global-enabled -global-cluster-id cluster-a \
+  -global-endpoint globalcp.example:9090 \
+  -global-tls-cert certs/cluster-a.crt -global-tls-key certs/cluster-a.key \
+  -global-tls-ca certs/ca.crt \
+  -global-publish-prefixes /models/ -global-subscribe-prefixes /models/
+
+# Reading cluster opts into the cross-cluster fallback (client side):
+./bin/client -global-read
+```
+
+**Security model, and the one thing to get right.** The control plane takes
+each cluster's identity from the first DNS SAN of its verified client
+certificate and ignores every identity the request body or headers claim. So
+**issuing a certificate IS granting a cluster identity** — anyone who can mint
+a certificate your `-tls-ca` trusts can publish as any cluster. That is also
+why the CA bundle is read from the file you name and never from the system
+roots: trusting public CAs here would be identity forgery, not merely a weaker
+channel.
+
+Both binaries refuse to start on a partial TLS configuration rather than
+falling back to plaintext, and `globalcp` refuses to start with no TLS at all
+unless `-allow-insecure-identity` is passed explicitly. That insecure mode is
+for the loopback embedded deployment only; with it on, any caller can claim
+any cluster ID.
+
+**Consistency.** Cross-cluster visibility is eventually consistent, bounded by
+the publish coalescing window plus stream delivery — not the sub-second
+cross-node figure. It inherits every weakness in `docs/SEMANTICS.md`:
+concurrent writers in different clusters are no better coordinated than
+concurrent writers on different nodes (last publish wins).
+
+```bash
+scripts/ops/e2e-global-mtls.sh   # stage 4 gate: startup refusals, real mTLS, autonomy
+```
+
 ## Operating Modes
 
 Three modes, chosen by what the deployment optimizes for. All three share the

@@ -25,9 +25,11 @@ const ClusterIDHeader = "x-fuse-cluster-id"
 // which binds to loopback and is documented as not deployable over a real
 // network.
 //
-// Stage 4 (mTLS) tightens exactly one thing here: AllowInsecureIdentity
-// flips to false and the fallback disappears. Keeping the seam in one
-// function is what makes that a one-line change rather than an audit.
+// AllowInsecureIdentity is what opens the fallback, and it is off by
+// default and refused at startup unless the operator also declines TLS
+// explicitly (cmd/globalcp/main.go). Keeping the whole decision in one
+// function is what makes "can a caller forge an identity?" answerable by
+// reading one page rather than by auditing every RPC.
 func (s *Service) identify(ctx context.Context, fallbackID string) (string, error) {
 	if id := certClusterID(ctx); id != "" {
 		return id, nil

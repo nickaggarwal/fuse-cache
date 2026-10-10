@@ -208,9 +208,10 @@ func min(a, b int) int {
 func (a *Agent) session(ctx context.Context) error {
 	opts := a.cfg.DialOptions
 	if len(opts) == 0 {
-		// Stage 4 supplies mTLS credentials. Until then this is plaintext,
-		// and saying so once per connection is better than a deployment
-		// discovering it from a packet capture.
+		// No credentials configured. The caller logs this once at startup
+		// with the full explanation; repeating it per connection is what
+		// keeps a long-running plaintext deployment from looking normal in
+		// a log tail.
 		a.logger.Printf("WARNING: connecting to %s without TLS", a.cfg.Endpoint)
 		opts = []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	}

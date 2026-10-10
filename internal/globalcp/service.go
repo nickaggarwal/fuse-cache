@@ -160,10 +160,35 @@ func (s *Service) RegisterCluster(ctx context.Context, req *pb.RegisterClusterRe
 
 // Resolve answers a point lookup. Deliberately off every hot path: a
 // reader only gets here when its mirror does not know the path.
+//
+// Authenticated and scoped, like Sync. It would be easy to leave a read-only
+// lookup open -- it mutates nothing -- but the index is not public data: a
+// row names a bucket, a key prefix, and the fact that some cluster holds a
+// given path. An unauthenticated Resolve is a path-oracle for the whole
+// federation, and it would also be the one way to read rows outside your
+// own subscription, which Sync is careful never to deliver.
 func (s *Service) Resolve(ctx context.Context, req *pb.ResolveRequest) (*pb.ResolveResponse, error) {
 	path := req.GetFilePath()
 	if path == "" {
 		return nil, status.Error(codes.InvalidArgument, "file_path is required")
+	}
+	clusterID, err := s.identify(ctx, req.GetClusterId())
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read cluster: %v", err)
+	}
+	if c == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cluster %s must call RegisterCluster before Resolve", clusterID)
+	}
+	// Same scope the stream enforces. A cluster that did not subscribe to a
+	// prefix does not get to read it one path at a time.
+	if !MatchesAny(path, c.SubscribePrefixes) {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"cluster %s is not subscribed to %s", clusterID, path)
 	}
 	locs, err := s.store.GetLocations(ctx, path)
 	if err != nil {
