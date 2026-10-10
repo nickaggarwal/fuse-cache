@@ -45,13 +45,88 @@ func (cm *DefaultCacheManager) LookupEntry(ctx context.Context, filePath string,
 	if !forceRefresh && !stale {
 		return nil, false
 	}
+	// A forced refresh asks about ONE path, so ask the coordinator about one
+	// path. Refreshing the whole view here downloads every file location in
+	// the cluster (measured: 18 MB / ~62k keys, ~0.8 s) for each lookup of a
+	// name that doesn't exist yet. Every Create does such a lookup, so a burst
+	// of new files turns into concurrent full-table lists, which OOM-killed
+	// all three coordinator replicas (2026-10-10). The periodic, TTL-driven
+	// view refresh below still serves Readdir and unforced lookups.
+	if forceRefresh {
+		entry, found, err := cm.lookupRemoteEntry(ctx, filePath)
+		if err != nil {
+			// Coordinator outages must not turn into ENOENT for a path the
+			// last good view still knows about.
+			return findInView(view, filePath)
+		}
+		if found {
+			cm.mergeIntoView([]*CacheEntry{entry})
+			return entry, true
+		}
+		// Not a file. It may be a directory whose children live only on
+		// peers: DirExists answers from the view, and the full refresh this
+		// replaced used to put them there as a side effect. Ask for this
+		// path's subtree only. For a name that doesn't exist yet (the
+		// Create case) that is an empty etcd range, not the whole table.
+		if children, err := cm.config.Coordinator.ListFileLocations(ctx, normalizeDirPath(filePath)+"/"); err == nil {
+			cm.mergeIntoView(cm.entriesFromLocations(children))
+		}
+		return nil, false
+	}
 	refreshed, err := cm.refreshMetadataView(ctx)
 	if err != nil {
-		// Coordinator outages must not turn into ENOENT for a path the last
-		// good view still knows about.
 		return findInView(view, filePath)
 	}
 	return findInView(refreshed, filePath)
+}
+
+// mergeIntoView adds entries learned by point or subtree lookups to the cached
+// remote view, replacing same-path rows. metadataAt is left alone so the
+// periodic full refresh still runs on schedule and drops anything stale.
+func (cm *DefaultCacheManager) mergeIntoView(entries []*CacheEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	fresh := make(map[string]*CacheEntry, len(entries))
+	for _, e := range entries {
+		if e != nil {
+			fresh[e.FilePath] = e
+		}
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	merged := make([]*CacheEntry, 0, len(cm.metadataView)+len(fresh))
+	for _, e := range cm.metadataView {
+		if e == nil {
+			continue
+		}
+		if _, replaced := fresh[e.FilePath]; !replaced {
+			merged = append(merged, e)
+		}
+	}
+	for _, e := range fresh {
+		merged = append(merged, e)
+	}
+	cm.metadataView = merged
+}
+
+// lookupRemoteEntry is a single-path coordinator lookup. found=false with a
+// nil error means the coordinator positively does not know the path.
+func (cm *DefaultCacheManager) lookupRemoteEntry(ctx context.Context, filePath string) (*CacheEntry, bool, error) {
+	coord := cm.config.Coordinator
+	if coord == nil {
+		return nil, false, errNoCoordinator
+	}
+	locations, err := coord.GetFileLocation(ctx, filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, entry := range cm.entriesFromLocations(locations) {
+		if entry.FilePath == filePath {
+			return entry, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // DirExists reports whether path names a directory, i.e. whether anything

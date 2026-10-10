@@ -14,16 +14,44 @@ import (
 // list endpoint was hit, so tests can assert the cached view is honored.
 type countingCoordinator struct {
 	warmupCoordinator
-	calls int
-	err   error
+	calls    int
+	prefixes []string
+	points   int
+	err      error
 }
 
 func (c *countingCoordinator) ListFileLocations(ctx context.Context, prefix string) ([]*coordinator.FileLocation, error) {
 	c.calls++
+	c.prefixes = append(c.prefixes, prefix)
 	if c.err != nil {
 		return nil, c.err
 	}
 	return c.warmupCoordinator.ListFileLocations(ctx, prefix)
+}
+
+func (c *countingCoordinator) GetFileLocation(_ context.Context, path string) ([]*coordinator.FileLocation, error) {
+	c.points++
+	if c.err != nil {
+		return nil, c.err
+	}
+	for _, loc := range c.locations {
+		if loc.FilePath == path {
+			return []*coordinator.FileLocation{loc}, nil
+		}
+	}
+	return []*coordinator.FileLocation{}, nil
+}
+
+// fullLists counts list calls with an empty prefix: downloads of the entire
+// cluster's file table.
+func (c *countingCoordinator) fullLists() int {
+	n := 0
+	for _, p := range c.prefixes {
+		if p == "" {
+			n++
+		}
+	}
+	return n
 }
 
 func lookupTestManager(t *testing.T, coord Coordinator) *DefaultCacheManager {
@@ -180,5 +208,43 @@ func TestDirExists(t *testing.T) {
 	}
 	if cm.DirExists(ctx, "/no-such-dir") {
 		t.Fatal("nonexistent directory reported present")
+	}
+}
+
+// A forced refresh of one path must never download the whole file table.
+// Every Create checks existence with forceRefresh=true, so a full list here
+// turns a burst of new files into concurrent downloads of the entire
+// cluster's file table; on 2026-10-10 that OOM-killed every coordinator
+// replica. A miss may still list that path's own subtree (it could be a
+// directory held only by peers), which for a not-yet-created name is empty.
+func TestLookupEntry_ForcedRefreshNeverListsWholeTable(t *testing.T) {
+	coord := &countingCoordinator{warmupCoordinator: warmupCoordinator{
+		locations: []*coordinator.FileLocation{
+			{FilePath: "/kv/abc", StorageTier: "peer", FileSize: 11},
+			{FilePath: "/kv/dir/child", StorageTier: "peer", FileSize: 3},
+		},
+	}}
+	cm := lookupTestManager(t, coord)
+	ctx := context.Background()
+
+	if _, ok := cm.LookupEntry(ctx, "/kv/new", true); ok {
+		t.Fatal("absent path resolved")
+	}
+	entry, ok := cm.LookupEntry(ctx, "/kv/abc", true)
+	if !ok || entry.Size != 11 || entry.Tier != TierPeer {
+		t.Fatalf("got %+v ok=%v, want the remote entry", entry, ok)
+	}
+	// A remote-only directory is still discoverable right after a forced miss.
+	if _, ok := cm.LookupEntry(ctx, "/kv/dir", true); ok {
+		t.Fatal("directory resolved as a file")
+	}
+	if !cm.DirExists(ctx, "/kv/dir") {
+		t.Fatal("remote-only directory not visible after forced lookup")
+	}
+	if n := coord.fullLists(); n != 0 {
+		t.Fatalf("forced lookups made %d full-table lists (prefixes %q), want 0", n, coord.prefixes)
+	}
+	if coord.points != 3 {
+		t.Fatalf("point lookups = %d, want 3", coord.points)
 	}
 }
