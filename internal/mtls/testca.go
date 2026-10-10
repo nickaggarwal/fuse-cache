@@ -15,7 +15,7 @@ import (
 
 // TestCA issues certificates for tests and for scripts/ops.
 //
-// Exported from the non-test file on purpose: scripts/ops/e2e-global.sh
+// Exported from the non-test file on purpose: scripts/ops/e2e-global-mtls.sh
 // needs the same material the unit tests use, and a shell script wiring
 // together openssl invocations would be a second, divergent implementation
 // of the trust model this package defines. cmd/globalcp-certs is the thin

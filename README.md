@@ -395,7 +395,17 @@ nothing, or `globalCP.read` without membership.
 ```bash
 scripts/ops/e2e-global-mtls.sh   # stage 4 gate: startup refusals, real mTLS, autonomy
 scripts/ops/e2e-global-chart.sh  # stage 5: the charts' own args/env, fed to the real binaries
+go test ./internal/globalcpe2e/  # the data path: A writes, B reads A's bytes
 ```
+
+The two scripts drive the real binaries but write no bytes -- they cover who
+may connect and what the charts emit. `internal/globalcpe2e` covers the claim
+underneath: a file written in cluster A, published only because it reached
+object storage, becomes readable in cluster B, with no network path between
+the two data planes. It runs two real coordinators, two real sync agents, a
+real control plane over gRPC, and two real cloud backends against one shared
+object store, so A's write key and B's read key have to be the same literal
+string or the read misses.
 
 ## Operating Modes
 

@@ -10,8 +10,11 @@
 # exact failure this stage exists to prevent, and only a real process
 # invocation can catch it.
 #
-# No MinIO, no cluster: this is the control path, not the data path.
-# scripts/ops/e2e-global.sh covers the cross-cluster object read.
+# No MinIO, no cluster: this is the control path, not the data path. The
+# cross-cluster object read -- A writes, B reads A's bytes out of the shared
+# bucket -- is internal/globalcpe2e, which runs the same real components
+# against a real S3 protocol server in-process (see its doc.go for why that
+# is a Go test rather than a third script here).
 #
 # Exit code = number of failed checks.
 
