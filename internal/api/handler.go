@@ -926,6 +926,18 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_warm_reconcile_files_warmed_total %d\n", hc.WarmReconcileFilesWarmedTotal)
 	fmt.Fprintf(w, "fuse_warm_reconcile_skipped_busy_total %d\n", hc.WarmReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_warm_intents_active %d\n", len(dcm.WarmIntents()))
+	// Cross-cluster reads. rows_found well above hits is the signal that
+	// matters: it means the global index is advertising objects this cluster
+	// cannot actually read -- stale rows, or a bucket it has no credentials
+	// for -- which hit rate alone cannot distinguish from "nothing published".
+	gr := dcm.GlobalReadSnapshot()
+	fmt.Fprintf(w, "fuse_global_read_lookups_total %d\n", gr.Lookups)
+	fmt.Fprintf(w, "fuse_global_read_rows_found_total %d\n", gr.RowsFound)
+	fmt.Fprintf(w, "fuse_global_read_hits_total %d\n", gr.Hits)
+	fmt.Fprintf(w, "fuse_global_read_misses_total %d\n", gr.Misses)
+	fmt.Fprintf(w, "fuse_global_read_unreachable_bucket_total %d\n", gr.Unreachable)
+	fmt.Fprintf(w, "fuse_global_read_resolve_errors_total %d\n", gr.ResolveErrors)
+
 	// Cluster-wide delete: every tier that can silently keep a copy after an
 	// rm. Non-zero means orphaned bytes somewhere, which is unenumerable
 	// otherwise.

@@ -132,6 +132,73 @@ config:
   # measured downside (default was 1MB).
   goFuseMaxWriteKB: "4096"
 
+# Cross-cluster membership. Default off: an install that leaves this alone
+# is a single-cluster deployment and behaves exactly as before.
+#
+# The global control plane holds an index, never bytes. It answers "which
+# cluster published this path, into which bucket, under which key prefix";
+# the reading cluster then fetches from object storage itself. There is no
+# cross-cluster peer traffic and no inbound path into this cluster -- the
+# coordinator dials OUT and holds the stream.
+#
+# If the control plane is unreachable this cluster keeps working exactly as
+# a single-cluster deployment: local reads, writes, peer fetch and cloud
+# fetch are untouched, and the mirror keeps serving its last-good contents.
+# Only discovery of NEW remote publications stops.
+globalCP:
+  enabled: false
+  # This cluster's identity in the global namespace. Required when enabled.
+  #
+  # Under mTLS this is advisory -- the control plane takes identity from the
+  # first DNS SAN of the client certificate and ignores what is sent. Set it
+  # to the same name the certificate carries so logs agree with reality.
+  clusterId: ""
+  # host:port of the control plane's gRPC port.
+  endpoint: ""
+  # Paths this cluster offers to the federation. Everything not matched here
+  # stays local-only, which is what keeps the global index small enough for
+  # each cluster to mirror it. Prefix match on the mount-relative path.
+  #   e.g. ["/models/", "/checkpoints/"]
+  publishPrefixes: []
+  # Paths this cluster wants to learn about from others. Empty subscribes to
+  # nothing: a cluster that asked for nothing gets nothing, never everything.
+  subscribePrefixes: []
+  tls:
+    # Secret holding this cluster's client certificate. ISSUING IT IS
+    # GRANTING THIS CLUSTER ITS IDENTITY: the control plane reads the first
+    # DNS SAN as the cluster ID, so the SAN must be clusterId above.
+    #
+    # Empty means plaintext, which the coordinator permits but warns about
+    # loudly, because identity is then self-declared and unverifiable. Only
+    # for an in-cluster or dev control plane.
+    secretName: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    caKey: ca.crt
+    # Expected name in the control plane's server certificate. Empty uses
+    # the host part of endpoint.
+    serverName: ""
+  # DEV ONLY: run the control plane in-process on loopback with no TLS, so
+  # the cross-cluster path is exercisable without a second cluster. Mutually
+  # exclusive with tls.secretName.
+  embedded: false
+  embeddedPort: 9091
+  # Serve cross-cluster reads on the client. Off is free: only a local cloud
+  # MISS consults the mirror, so no hit path changes. Requires the
+  # coordinator to be running with globalCP.enabled.
+  read: false
+
+cloud:
+  # Prefix every cloud object key with this cluster scope. Empty is the
+  # legacy flat layout and is byte-identical to pre-federation behavior.
+  #
+  # Two clusters sharing one bucket MUST set different values or they
+  # overwrite each other's objects silently. It is also what a remote
+  # cluster reads under, so changing it after data exists orphans that data
+  # from the global index (reads still find it locally -- the key mapper
+  # tries the bare key as a fallback -- but other clusters will not).
+  keyPrefix: ""
+
 secrets:
   aws:
     create: true

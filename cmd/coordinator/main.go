@@ -17,6 +17,9 @@ import (
 
 	"fuse-client/internal/cache"
 	"fuse-client/internal/coordinator"
+	"fuse-client/internal/coordinator/globalsync"
+	"fuse-client/internal/globalcp"
+	"fuse-client/internal/mtls"
 	pb "fuse-client/internal/pb"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -31,7 +34,24 @@ func main() {
 		etcdPrefix      = flag.String("etcd-prefix", "/fuse", "etcd key prefix for coordinator state")
 		etcdLeaseTTL    = flag.Int("etcd-peer-lease-ttl", 90, "Peer liveness lease TTL in seconds (etcd-backed only); keep this at ~3x the client heartbeat interval (30s) so one slow heartbeat doesn't expire the peer")
 		etcdDialTimeout = flag.Duration("etcd-dial-timeout", 5*time.Second, "etcd dial timeout")
-		help            = flag.Bool("help", false, "Show help")
+
+		// Global control plane. Every one of these defaults to off: an
+		// existing single-cluster deployment that upgrades this binary must
+		// behave exactly as before, with no new goroutine, no new socket,
+		// and no new dependency on anything being reachable.
+		globalEnabled      = flag.Bool("global-enabled", false, "Join a global control plane so a published subset of this cluster's cache is discoverable by other clusters")
+		globalClusterID    = flag.String("global-cluster-id", "", "This cluster's identity in the global namespace (required with -global-enabled)")
+		globalEndpoint     = flag.String("global-endpoint", "", "Global control plane gRPC address (required with -global-enabled unless -global-embedded)")
+		globalPublish      = flag.String("global-publish-prefixes", "", "Comma-separated path prefixes this cluster publishes globally, e.g. /models,/checkpoints. Empty publishes nothing.")
+		globalSubscribe    = flag.String("global-subscribe-prefixes", "", "Comma-separated path prefixes this cluster wants to discover from other clusters. Empty subscribes to nothing.")
+		globalEmbedded     = flag.Bool("global-embedded", false, "DEV ONLY: run the global control plane in-process on loopback with no TLS, and point the sync agent at it")
+		globalEmbeddedPort = flag.Int("global-embedded-port", 9091, "Loopback port for the embedded global control plane")
+		globalTLSCert      = flag.String("global-tls-cert", "", "PEM client certificate this cluster presents to the global control plane; its first DNS SAN is the cluster identity the CP will use")
+		globalTLSKey       = flag.String("global-tls-key", "", "PEM private key for -global-tls-cert")
+		globalTLSCA        = flag.String("global-tls-ca", "", "PEM CA bundle that signs the global control plane's server certificate")
+		globalTLSName      = flag.String("global-tls-server-name", "", "Expected server name in the control plane's certificate; defaults to the host part of -global-endpoint")
+
+		help = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
 
@@ -75,9 +95,114 @@ func main() {
 		}
 	}()
 
+	// Global control plane, if enabled. Everything below this point is
+	// nil-safe when it is not.
+	gcfg := globalConfigFromEnv(globalSettings{
+		Enabled:      *globalEnabled,
+		ClusterID:    *globalClusterID,
+		Endpoint:     *globalEndpoint,
+		Publish:      *globalPublish,
+		Subscribe:    *globalSubscribe,
+		Embedded:     *globalEmbedded,
+		EmbeddedPort: *globalEmbeddedPort,
+		TLSCert:      *globalTLSCert,
+		TLSKey:       *globalTLSKey,
+		TLSCA:        *globalTLSCA,
+		TLSName:      *globalTLSName,
+	})
+
+	var (
+		syncAgent   *globalsync.Agent
+		embeddedSrv *grpc.Server
+	)
+	if gcfg.Enabled {
+		// Fail at startup rather than at first publish. A coordinator that
+		// came up "enabled" but silently never joined is the worst of the
+		// three states: an operator sees a healthy pod and an empty global
+		// index, with nothing connecting the two.
+		if gcfg.ClusterID == "" {
+			logger.Fatalf("-global-enabled requires -global-cluster-id (or FUSE_GLOBAL_CLUSTER_ID / CLUSTER_NAME)")
+		}
+		if !gcfg.Embedded && gcfg.Endpoint == "" {
+			logger.Fatalf("-global-enabled requires -global-endpoint (or FUSE_GLOBAL_ENDPOINT), unless -global-embedded")
+		}
+		if len(gcfg.Publish) == 0 && len(gcfg.Subscribe) == 0 {
+			// Not fatal: a cluster may legitimately join to be visible in
+			// the registry before any prefix is configured. But it does
+			// nothing, and silence here reads as a working setup.
+			logger.Printf("WARNING: global sync enabled with no publish or subscribe prefixes; nothing will cross the cluster boundary")
+		}
+		if err := gcfg.TLS.Validate(); err != nil {
+			logger.Fatalf("Global TLS configuration: %v", err)
+		}
+		// Embedded mode is loopback and certificate-free by construction, so
+		// TLS flags there are a contradiction rather than a refinement -- most
+		// likely a production config that also picked up -global-embedded.
+		if gcfg.Embedded && gcfg.TLS.Enabled() {
+			logger.Fatalf("-global-embedded cannot be combined with -global-tls-*: the embedded control plane is loopback-only and serves no certificate")
+		}
+		if !gcfg.Embedded && !gcfg.TLS.Enabled() {
+			// Loud, not fatal: stages 0-3 are exercisable against a plaintext
+			// CP on a trusted network, and failing here would break that. But
+			// without a certificate the CP cannot tell this cluster from any
+			// other, so the ID below is a claim, not an identity.
+			logger.Printf("WARNING: connecting to global control plane %s without mTLS; cluster identity %q is self-declared and unverifiable. Do not run this across an untrusted network.",
+				gcfg.Endpoint, gcfg.ClusterID)
+		}
+
+		var dialOpts []grpc.DialOption
+		if gcfg.TLS.Enabled() {
+			// Default the expected server name to the endpoint host, so an
+			// operator who set no -global-tls-server-name still gets name
+			// verification rather than silently skipping it.
+			if gcfg.TLS.ServerName == "" {
+				gcfg.TLS.ServerName = hostOnly(gcfg.Endpoint)
+			}
+			opt, derr := gcfg.TLS.DialOption()
+			if derr != nil {
+				logger.Fatalf("Failed to build global client TLS credentials: %v", derr)
+			}
+			dialOpts = append(dialOpts, opt)
+		}
+
+		if gcfg.Embedded {
+			embeddedSrv, err = startEmbeddedGlobalCP(gcfg.EmbeddedPort, logger)
+			if err != nil {
+				logger.Fatalf("Failed to start embedded global control plane: %v", err)
+			}
+			gcfg.Endpoint = fmt.Sprintf("127.0.0.1:%d", gcfg.EmbeddedPort)
+		}
+		syncAgent, err = globalsync.New(globalsync.Config{
+			ClusterID:         gcfg.ClusterID,
+			Endpoint:          gcfg.Endpoint,
+			Object:            globalObjectRefFromEnv(gcfg.ClusterID),
+			PublishPrefixes:   gcfg.Publish,
+			SubscribePrefixes: gcfg.Subscribe,
+			DialOptions:       dialOpts,
+			Logger:            log.New(os.Stdout, "[GLOBALSYNC] ", log.LstdFlags),
+		})
+		if err != nil {
+			logger.Fatalf("Failed to build global sync agent: %v", err)
+		}
+		// Attached before the service starts serving, so no request can
+		// observe a half-wired coordinator.
+		coordinatorService.SetGlobalPublisher(syncAgent)
+		// The read side of the same link. Installed together with the
+		// publisher so a coordinator is never publishing into an index it
+		// cannot itself resolve against.
+		coordinatorService.SetGlobalMirror(syncAgent.Mirror())
+		syncAgent.Start(ctx)
+		logger.Printf("Global sync enabled: cluster=%q endpoint=%s mtls=%v publish=%v subscribe=%v",
+			gcfg.ClusterID, gcfg.Endpoint, gcfg.TLS.Enabled(), gcfg.Publish, gcfg.Subscribe)
+	}
+
 	// Create HTTP server
 	mux := http.NewServeMux()
 	setupRoutes(mux, coordinatorService, newSnapshotCloudStoreFromEnv(logger))
+	// Mounted unconditionally: with sync off these report disabled, which
+	// is a usable answer. A 404 would be indistinguishable from an older
+	// binary that has no global support at all.
+	globalsync.RegisterRoutes(mux, syncAgent)
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *port),
@@ -102,6 +227,12 @@ func main() {
 
 	// Graceful shutdown
 	cancel()
+	if syncAgent != nil {
+		syncAgent.Stop()
+	}
+	if embeddedSrv != nil {
+		embeddedSrv.GracefulStop()
+	}
 	grpcSrv.GracefulStop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -117,6 +248,157 @@ func main() {
 	}
 
 	logger.Println("Coordinator stopped")
+}
+
+// globalSettings is the raw flag surface, before env defaults.
+type globalSettings struct {
+	Enabled      bool
+	ClusterID    string
+	Endpoint     string
+	Publish      string
+	Subscribe    string
+	Embedded     bool
+	EmbeddedPort int
+	TLSCert      string
+	TLSKey       string
+	TLSCA        string
+	TLSName      string
+}
+
+// globalConfig is the resolved configuration.
+type globalConfig struct {
+	Enabled      bool
+	ClusterID    string
+	Endpoint     string
+	Publish      []string
+	Subscribe    []string
+	Embedded     bool
+	EmbeddedPort int
+	TLS          mtls.Config
+}
+
+// globalConfigFromEnv applies env defaults to the flag values.
+//
+// Precedence: flag wins, env is the default. The older settings in this
+// repo vary on this (COORDINATOR_GRPC_ADDR unconditionally overrides its
+// flag), but every setting added for the global path uses the one rule.
+func globalConfigFromEnv(s globalSettings) globalConfig {
+	str := func(flagVal, env string) string {
+		if v := strings.TrimSpace(flagVal); v != "" {
+			return v
+		}
+		return strings.TrimSpace(os.Getenv(env))
+	}
+	cfg := globalConfig{
+		Enabled:      s.Enabled || envBool("FUSE_GLOBAL_ENABLED", false),
+		ClusterID:    str(s.ClusterID, "FUSE_GLOBAL_CLUSTER_ID"),
+		Endpoint:     str(s.Endpoint, "FUSE_GLOBAL_ENDPOINT"),
+		Publish:      splitPrefixes(str(s.Publish, "FUSE_GLOBAL_PUBLISH_PREFIXES")),
+		Subscribe:    splitPrefixes(str(s.Subscribe, "FUSE_GLOBAL_SUBSCRIBE_PREFIXES")),
+		Embedded:     s.Embedded || envBool("FUSE_GLOBAL_EMBEDDED", false),
+		EmbeddedPort: s.EmbeddedPort,
+		TLS: mtls.Config{
+			CertFile:   str(s.TLSCert, "FUSE_GLOBAL_TLS_CERT"),
+			KeyFile:    str(s.TLSKey, "FUSE_GLOBAL_TLS_KEY"),
+			CAFile:     str(s.TLSCA, "FUSE_GLOBAL_TLS_CA"),
+			ServerName: str(s.TLSName, "FUSE_GLOBAL_TLS_SERVER_NAME"),
+		},
+	}
+	if !cfg.Enabled {
+		return cfg
+	}
+	// A cluster ID is not defaultable. Two clusters that both fall back to
+	// the same generated name would silently overwrite each other's rows in
+	// the global index, which is precisely the collision this whole design
+	// exists to prevent -- so fall back to the Kubernetes cluster-ish names
+	// only if an operator set one, and otherwise let startup fail loudly.
+	if cfg.ClusterID == "" {
+		cfg.ClusterID = strings.TrimSpace(os.Getenv("CLUSTER_NAME"))
+	}
+	return cfg
+}
+
+// hostOnly strips the port from a dial target, for certificate name
+// verification. A bare host with no port is returned unchanged, so an
+// endpoint written without one still verifies against itself rather than
+// against the empty string, which gRPC treats as "skip the name check".
+func hostOnly(endpoint string) string {
+	h, _, err := net.SplitHostPort(strings.TrimSpace(endpoint))
+	if err != nil {
+		return strings.TrimSpace(endpoint)
+	}
+	return h
+}
+
+func splitPrefixes(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// globalObjectRefFromEnv describes where this cluster's published objects
+// live, from the same env the cache backends already read.
+//
+// KeyPrefix comes from FUSE_CLOUD_KEY_PREFIX, which must be the same value
+// the clients use: a skew here does not fail, it makes every remote read of
+// a published path look under a key that was never written.
+func globalObjectRefFromEnv(clusterID string) *pb.ObjectRef {
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("CLOUD_PROVIDER")))
+	ref := &pb.ObjectRef{
+		Provider:  provider,
+		KeyPrefix: strings.TrimSpace(os.Getenv("FUSE_CLOUD_KEY_PREFIX")),
+	}
+	switch provider {
+	case "azure":
+		ref.Bucket = strings.TrimSpace(os.Getenv("AZURE_CONTAINER_NAME"))
+		ref.Endpoint = strings.TrimSpace(os.Getenv("AZURE_STORAGE_ACCOUNT"))
+	case "gcp":
+		ref.Bucket = strings.TrimSpace(os.Getenv("GCP_BUCKET"))
+		ref.Endpoint = strings.TrimSpace(os.Getenv("GCP_ENDPOINT"))
+	default:
+		ref.Bucket = strings.TrimSpace(os.Getenv("S3_BUCKET"))
+		ref.Region = strings.TrimSpace(os.Getenv("AWS_REGION"))
+		ref.Endpoint = strings.TrimSpace(os.Getenv("S3_ENDPOINT"))
+	}
+	return ref
+}
+
+// startEmbeddedGlobalCP runs the control plane in this process, on
+// loopback, with no TLS.
+//
+// DEV ONLY, and the loopback bind is what enforces that rather than a
+// comment: an embedded CP cannot be reached from another machine even if an
+// operator sets the flag in production by mistake. Stage 4 is the gate for
+// a real cross-network deployment; until then this is how the cross-cluster
+// path is exercised at all, by running two coordinators against one of
+// these.
+func startEmbeddedGlobalCP(port int, logger *log.Logger) (*grpc.Server, error) {
+	lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, fmt.Errorf("listen on loopback %d: %w", port, err)
+	}
+	svc := globalcp.NewService(globalcp.Config{
+		Logger: log.New(os.Stdout, "[GLOBALCP] ", log.LstdFlags),
+		// No certificates in embedded mode, so identity comes from the
+		// header. Safe only because the listener is loopback-bound.
+		AllowInsecureIdentity: true,
+	})
+	srv := grpc.NewServer()
+	pb.RegisterGlobalControlPlaneServer(srv, svc)
+	go func() {
+		if err := srv.Serve(lis); err != nil {
+			logger.Printf("Embedded global control plane stopped: %v", err)
+		}
+	}()
+	logger.Printf("DEV: embedded global control plane on 127.0.0.1:%d (no TLS, loopback only)", port)
+	return srv, nil
 }
 
 type snapshotCloudStore interface {
@@ -239,6 +521,14 @@ func newSnapshotCloudStoreFromEnv(logger *log.Logger) snapshotCloudStore {
 	if err != nil {
 		logger.Printf("Coordinator snapshot cloud store initialization failed: %v", err)
 		return nil
+	}
+	// Must match the clients' scope: the coordinator reads and writes the same
+	// objects they do, so a prefix set on one side only makes every snapshot
+	// read miss.
+	keyPrefix := strings.TrimSpace(os.Getenv("FUSE_CLOUD_KEY_PREFIX"))
+	cache.ScopeCloudKeys(store, keyPrefix)
+	if keyPrefix != "" {
+		logger.Printf("Coordinator snapshot cloud store key prefix=%s", keyPrefix)
 	}
 	logger.Printf("Coordinator snapshot cloud store enabled for provider=%s", provider)
 	return store

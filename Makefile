@@ -6,6 +6,8 @@ COORDINATOR_BINARY := $(BINARY_DIR)/coordinator
 CLIENT_BINARY := $(BINARY_DIR)/client
 CSI_BINARY := $(BINARY_DIR)/csi-driver
 NODE_INIT_BINARY := $(BINARY_DIR)/node-init
+GLOBALCP_BINARY := $(BINARY_DIR)/globalcp
+GLOBALCP_CERTS_BINARY := $(BINARY_DIR)/globalcp-certs
 PROTO_DIR := internal/proto
 GO_FILES := $(shell find . -name "*.go" -not -path "./vendor/*")
 
@@ -19,7 +21,7 @@ $(BINARY_DIR):
 
 # Build targets
 .PHONY: build
-build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY) $(NODE_INIT_BINARY)
+build: $(COORDINATOR_BINARY) $(CLIENT_BINARY) $(CSI_BINARY) $(NODE_INIT_BINARY) $(GLOBALCP_BINARY) $(GLOBALCP_CERTS_BINARY)
 
 $(COORDINATOR_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(COORDINATOR_BINARY) cmd/coordinator/main.go
@@ -32,6 +34,14 @@ $(CSI_BINARY): $(BINARY_DIR) $(GO_FILES)
 
 $(NODE_INIT_BINARY): $(BINARY_DIR) $(GO_FILES)
 	go build -o $(NODE_INIT_BINARY) cmd/node-init/main.go
+
+$(GLOBALCP_BINARY): $(BINARY_DIR) $(GO_FILES)
+	go build -o $(GLOBALCP_BINARY) cmd/globalcp/main.go
+
+# Dev-only certificate issuer. Shares internal/mtls.TestCA with the unit
+# tests so the trust model has exactly one definition.
+$(GLOBALCP_CERTS_BINARY): $(BINARY_DIR) $(GO_FILES)
+	go build -o $(GLOBALCP_CERTS_BINARY) cmd/globalcp-certs/main.go
 
 # Install dependencies
 .PHONY: deps
@@ -150,7 +160,7 @@ proto:
 	protoc --proto_path=proto \
 	  --go_out=internal/pb --go_opt=paths=source_relative \
 	  --go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
-	  proto/coordinator.proto proto/peer.proto proto/agent.proto
+	  proto/coordinator.proto proto/peer.proto proto/agent.proto proto/globalcp.proto
 
 # Check code quality
 .PHONY: lint

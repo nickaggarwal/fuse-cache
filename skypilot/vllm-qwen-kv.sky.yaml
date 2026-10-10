@@ -1,0 +1,121 @@
+# SkyServe service: vLLM serving Qwen2.5-1.5B off the FUSE cache mount, with
+# the REAL vLLM KV cache offloaded onto that same distributed filesystem.
+#
+# Scope, stated plainly: SharedStorageConnector is vLLM's own debug connector.
+# Its source comment says so ("Simple debug implementation"), its path helpers
+# are named `_generate_foldername_debug`, it is not TP-safe, and it has no
+# eviction and no size cap. It proves that genuine KV tensors -- not synthetic
+# test blocks -- are written to and read back from the FUSE mount. It is NOT a
+# production KV tier, and it does NOT route through the Model KV store's earned
+# durability. Those need a newer vLLM (see the note at the bottom of this file).
+#
+# The point of this file is that the model is NOT downloaded and NOT baked into
+# an image -- it is read from /mnt/fuse, the distributed cache, whose weights
+# are already resident on both A100 nodes. HF_HUB_OFFLINE=1 makes a missing
+# mount fail loudly instead of silently downloading from the Hub and erasing
+# the difference being measured.
+#
+# Two non-obvious details, both load-bearing:
+#
+#  1. mountPropagation: HostToContainer. /mnt/fuse on the host is a FUSE mount
+#     created by the fuse-client DaemonSet. Without propagation the pod
+#     captures the directory at container start and sees the EMPTY underlying
+#     dir, not the filesystem mounted over it. SkyPilot never emits this field
+#     itself (zero occurrences in its source), but it is a valid V1VolumeMount
+#     field so the client-side validator accepts it, and volumeMounts
+#     patch-merge by mountPath so it survives the merge intact.
+#
+#  2. The container entry has no `name:`. SkyPilot merges containers by name;
+#     an unnamed entry merges into container[0] (`ray-node`), which is the one
+#     that actually runs the task. Naming it would append a second container.
+
+service:
+  readiness_probe:
+    path: /v1/models
+    # Loading 3GB of safetensors off the cache takes a while on a cold node,
+    # and a probe that gives up early looks identical to a broken service.
+    initial_delay_seconds: 600
+  replicas: 1
+
+resources:
+  infra: k8s
+  accelerators: A100-80GB:1
+  image_id: docker:vllm/vllm-openai:v0.9.2
+  ports: 8000
+
+envs:
+  MODEL_PATH: /mnt/fuse/models/Qwen2.5-1.5B-Instruct
+  SERVED_NAME: Qwen/Qwen2.5-1.5B-Instruct
+  HF_HUB_OFFLINE: "1"
+  KV_PATH: /mnt/fuse-kv/vllmkv
+
+run: |
+  set -e
+  echo "[check] weights visible through the FUSE mount:"
+  ls -la "$MODEL_PATH"
+  # Fail loudly and early rather than letting vLLM report a confusing
+  # tokenizer error when the mount propagated as an empty directory.
+  test -f "$MODEL_PATH/model.safetensors" || {
+    echo "FATAL: model.safetensors not visible at $MODEL_PATH" >&2
+    echo "The FUSE mount likely did not propagate into this pod." >&2
+    exit 1
+  }
+
+  # The connector does not create its root; a missing dir surfaces later as a
+  # confusing per-layer save error rather than a clear startup failure.
+  mkdir -p "$KV_PATH"
+  echo "[check] KV path writable through the mount:"
+  touch "$KV_PATH/.probe" && rm -f "$KV_PATH/.probe" && echo "  ok: $KV_PATH"
+
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_PATH" \
+    --served-model-name "$SERVED_NAME" \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 4096 \
+    --kv-transfer-config \
+    '{"kv_connector":"SharedStorageConnector","kv_role":"kv_both","kv_connector_extra_config":{"shared_storage_path":"/mnt/fuse-kv/vllmkv"}}' 
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        containers:
+          - volumeMounts:
+              - mountPath: /mnt/fuse
+                name: fuse-mount
+                readOnly: true
+                mountPropagation: HostToContainer
+              # The same host FUSE filesystem, mounted a second time WRITABLE
+              # for the KV connector. Weights stay read-only so a bug in the KV
+              # write path cannot corrupt the checkpoint every replica reads.
+              - mountPath: /mnt/fuse-kv
+                name: fuse-mount-rw
+                mountPropagation: HostToContainer
+        volumes:
+          - name: fuse-mount
+            hostPath:
+              path: /mnt/fuse
+              type: Directory
+          - name: fuse-mount-rw
+            hostPath:
+              path: /mnt/fuse
+              type: Directory
+
+# ---------------------------------------------------------------------------
+# Why this connector and not a better one
+#
+# The image is pinned to vllm/vllm-openai:v0.9.2. Relevant version facts:
+#
+#   v0.8.5   KVConnectorBase_V1, LMCacheConnectorV1  -- available here
+#   v0.11.0  OffloadingConnector                     -- NOT in 0.9.2
+#   v0.26.0  TieringOffloadingSpec + `fs` secondary tier, and the per-tier
+#            metric vllm:kv_offload_tiering_chunk_hits_total{tier="1:fs"}
+#            which is the only counter that can PROVE a disk-tier hit
+#   v0.13.0  SharedStorageConnector renamed to ExampleConnector (no alias),
+#            so this exact config raises "Unsupported connector type" on any
+#            vLLM >= 0.13.0. It works here only because 0.9.2 predates it.
+#
+# Wiring the Model KV store itself as a first-class vLLM tier means
+# implementing an out-of-tree SecondaryTierManager, which requires >= v0.26.0.
+# ---------------------------------------------------------------------------

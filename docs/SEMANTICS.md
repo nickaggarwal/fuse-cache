@@ -80,6 +80,66 @@ trade is a durability window (see Writes).
   restart. There is no per-read etag check against cloud (perf trade;
   chunk content checksums are on the roadmap).
 
+## Cross-cluster (global control plane)
+
+Off by default. Everything above describes one cluster and is unchanged by
+this section when `globalCP.enabled` is false.
+
+A cluster may publish a configured subset of its paths to a global control
+plane, which other clusters mirror and read. The contract is deliberately
+much weaker than the single-cluster one, and the weakening is in the
+*discovery* path, not the data path.
+
+- **The global path is object storage only.** The control plane answers
+  "which cluster published this path, into which bucket, under which key
+  prefix". The reading cluster then fetches from object storage itself.
+  There is no cross-cluster peer transfer, no cross-cluster FUSE traffic,
+  and no inbound network path into a member cluster.
+- **Only explicitly published prefixes are visible.** A path outside
+  `publishPrefixes` does not exist to any other cluster. This is not a
+  permission check layered on a global namespace; there is no global
+  namespace apart from what was published.
+- **Cross-cluster visibility is eventually consistent**, bounded by the
+  publish coalescing window plus stream delivery. Do NOT read the
+  "typically sub-second" figure from *Consistency model* as applying here:
+  that number is a cross-node location publish inside one cluster. A
+  cross-cluster publish is a different, longer path, and there is no upper
+  bound on it when the control plane is unreachable.
+- **A path is published only once its bytes are in object storage.** A file
+  that exists only on a local NVMe tier is never advertised, because no
+  other cluster could fetch it. So cross-cluster visibility lags the
+  durability window described in *Writes*, and inherits it: a cluster that
+  dies inside that window never publishes, and the file is simply absent
+  globally rather than advertised-and-missing.
+- **A global read is a cloud read.** It is attempted only after this
+  cluster's own cloud read has already missed, so it adds latency to misses
+  and nothing to hits. A global miss is still a miss, with exactly the
+  failure taxonomy described for any other tier.
+- **Every single-cluster weakness is inherited, not repaired.** Concurrent
+  writers in *different* clusters are no better coordinated than concurrent
+  writers on different nodes: last publish wins, no merge. The chunked
+  in-place overwrite tearing described in *Writes* is unchanged, and it is
+  if anything easier to hit across clusters, because the window is longer.
+  Write-once-then-read workloads (checkpoints, models) are the supported
+  shape.
+- **A stale index row is normal and is not an error.** A row says a cluster
+  published the path at some time; it is not a liveness claim about the
+  object. A row whose object has since been deleted reads as a miss. The
+  `rows_found` vs `hits` counters exist to make that gap visible.
+- **The control plane is advisory.** If it is unreachable this cluster
+  behaves exactly as a single-cluster deployment: local read, write, peer
+  fetch and cloud fetch are untouched, and the mirror keeps serving its
+  last-good contents. Only discovery of *new* remote publications stops.
+  There is no mode in which a global control plane outage can fail a local
+  operation.
+- **Two clusters sharing a bucket must set different `cloud.keyPrefix`
+  values.** They otherwise overwrite each other's objects silently, with no
+  error at any layer. This is enforced by nothing — it is configuration.
+
+Cross-cluster deletes and withdrawals are best-effort and idempotent. A
+withdraw that never reaches the control plane leaves a stale row, which
+degrades to the miss case above.
+
 ## Explicitly out of scope
 
 - POSIX byte-range locks (accepted locally, not distributed).

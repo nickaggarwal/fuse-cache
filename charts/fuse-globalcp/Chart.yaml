@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fuse-globalcp
+description: Helm chart for the fuse-cache global control plane (cross-cluster index)
+type: application
+version: 0.1.0
+appVersion: "latest"

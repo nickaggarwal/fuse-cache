@@ -6,6 +6,34 @@ produced by `scripts/ops/benchmark-fuse-scenario.sh`, which appends to
 for what each field means and how to keep rows comparable.
 
 
+## Per-commit microbenchmark regression gate
+
+`scripts/ops/bench-regression.sh` is a different instrument from the rows below
+and does not add to them. It A/Bs the Go microbenchmarks in `internal/cache`
+between HEAD and a baseline commit on one machine, and runs on every push and
+PR via `.github/workflows/bench-regression.yml`.
+
+The split is deliberate. The tables in this file are end-to-end cluster
+throughput -- peer, cloud, object -- and cost real nodes to produce, so they
+are run when a change warrants it and recorded by hand. The gate is cheap,
+automatic, and only sees in-process cache operations: it catches an extra
+allocation per lookup or a lock held across IO, and is blind to everything the
+tables measure. A green gate is not evidence of end-to-end performance.
+
+Why it is built the way it is: six consecutive runs of one unchanged benchmark
+on an idle M4 Pro spanned 777us..864us, 11% apart with no code change. So a
+single absolute number cannot support a claim about a commit. The harness runs
+both sides interleaved (base, new, base, new, ...) so thermal drift lands on
+both rather than on the new code, takes benchmark functions from the new tree
+for both sides so a newly added benchmark still gets a baseline column, and
+gates on benchstat's p-value rather than the percentage alone. Threshold is 10%
+locally and 25% in CI, because shared runners have noisy neighbours and a check
+that cries wolf gets muted.
+
+Verified against a planted regression (a 50us sleep in `LookupEntry`): reported
++84636% at p=0.002 and exited 1, while the untouched `GetNVMeHit` in the same
+run correctly reported no significant change.
+
 Benchmark fields captured:
 - Cloud test type
 - Machine types

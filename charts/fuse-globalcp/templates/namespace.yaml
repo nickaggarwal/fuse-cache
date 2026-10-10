@@ -1,0 +1,9 @@
+{{- include "fuse-globalcp.validate" . -}}
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "fuse-globalcp.namespace" . }}
+  labels:
+    app.kubernetes.io/part-of: fuse-client
+{{- end }}

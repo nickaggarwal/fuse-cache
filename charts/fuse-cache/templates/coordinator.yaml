@@ -37,7 +37,17 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["coordinator"]
-          args: ["-port", "{{ .Values.coordinator.httpPort }}"]
+          args:
+            - "-port"
+            - "{{ .Values.coordinator.httpPort }}"
+            {{- if and .Values.globalCP.enabled .Values.globalCP.embedded }}
+            # DEV ONLY: the control plane runs in-process on loopback with
+            # no TLS. Every -global-* setting arrives through the ConfigMap;
+            # only the loopback port is a literal, because nothing outside
+            # this pod can reach it and so nothing else needs to know it.
+            - "-global-embedded-port"
+            - "{{ .Values.globalCP.embeddedPort }}"
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: fuse-config
@@ -54,10 +64,23 @@ spec:
               name: http
             - containerPort: {{ .Values.coordinator.grpcPort }}
               name: grpc
-          {{- if .Values.coordinator.persistence.enabled }}
+          {{- if or .Values.coordinator.persistence.enabled (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
           volumeMounts:
+            {{- if .Values.coordinator.persistence.enabled }}
             - name: state
               mountPath: /data
+            {{- end }}
+            {{- if and .Values.globalCP.enabled .Values.globalCP.tls.secretName }}
+            # This cluster's identity to the federation. The control plane
+            # reads the certificate's first DNS SAN as the cluster ID, so
+            # the file mounted here decides what this cluster IS globally,
+            # not merely how it encrypts.
+            - name: global-tls
+              mountPath: /etc/fuse-global/tls
+              readOnly: true
+            {{- end }}
+          {{- end }}
+          {{- if .Values.coordinator.persistence.enabled }}
           workingDir: /data
           {{- end }}
           livenessProbe:
@@ -74,11 +97,19 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
-      {{- if .Values.coordinator.persistence.enabled }}
+      {{- if or .Values.coordinator.persistence.enabled (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
       volumes:
+        {{- if .Values.coordinator.persistence.enabled }}
         - name: state
           persistentVolumeClaim:
             claimName: coordinator-state
+        {{- end }}
+        {{- if and .Values.globalCP.enabled .Values.globalCP.tls.secretName }}
+        - name: global-tls
+          secret:
+            secretName: {{ .Values.globalCP.tls.secretName }}
+            defaultMode: 0400
+        {{- end }}
       {{- end }}
 ---
 apiVersion: v1

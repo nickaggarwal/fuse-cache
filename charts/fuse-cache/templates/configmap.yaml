@@ -1,3 +1,4 @@
+{{- include "fuse-cache.validateGlobal" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,3 +48,27 @@ data:
   FUSE_GOFUSE_WRITE_APPEND_BUFFER_MB: {{ .Values.config.goFuseWriteAppendBufferMB | quote }}
   FUSE_GOFUSE_WRITEBACK_CACHE: {{ .Values.config.goFuseWritebackCache | quote }}
   FUSE_GOFUSE_MAX_WRITE_KB: {{ .Values.config.goFuseMaxWriteKB | quote }}
+  # The cluster scope on every cloud object key. Empty = legacy flat layout.
+  # The coordinator publishes this prefix to the global index as the one
+  # other clusters read under, and the client writes with it, so the two
+  # MUST agree -- which is why it is one ConfigMap key and not two flags.
+  FUSE_CLOUD_KEY_PREFIX: {{ .Values.cloud.keyPrefix | quote }}
+{{- if .Values.globalCP.enabled }}
+  # Cross-cluster membership (coordinator only; the client ignores these).
+  FUSE_GLOBAL_ENABLED: "true"
+  FUSE_GLOBAL_CLUSTER_ID: {{ .Values.globalCP.clusterId | quote }}
+  FUSE_GLOBAL_ENDPOINT: {{ .Values.globalCP.endpoint | quote }}
+  FUSE_GLOBAL_PUBLISH_PREFIXES: {{ join "," .Values.globalCP.publishPrefixes | quote }}
+  FUSE_GLOBAL_SUBSCRIBE_PREFIXES: {{ join "," .Values.globalCP.subscribePrefixes | quote }}
+{{- if .Values.globalCP.embedded }}
+  FUSE_GLOBAL_EMBEDDED: "true"
+{{- end }}
+{{- if .Values.globalCP.tls.secretName }}
+  FUSE_GLOBAL_TLS_CERT: "/etc/fuse-global/tls/{{ .Values.globalCP.tls.certKey }}"
+  FUSE_GLOBAL_TLS_KEY: "/etc/fuse-global/tls/{{ .Values.globalCP.tls.keyKey }}"
+  FUSE_GLOBAL_TLS_CA: "/etc/fuse-global/tls/{{ .Values.globalCP.tls.caKey }}"
+{{- if .Values.globalCP.tls.serverName }}
+  FUSE_GLOBAL_TLS_SERVER_NAME: {{ .Values.globalCP.tls.serverName | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,103 @@
+# The global control plane: one deployment for a whole federation.
+#
+# It is a SEPARATE chart from fuse-cache on purpose. fuse-cache is installed
+# once per cluster; this is installed once per federation, usually in a
+# cluster of its own. Folding it into fuse-cache as a toggle would make it a
+# per-cluster object by construction, which is the opposite of what it is.
+#
+# It holds no data — only an index naming which cluster published which path
+# into which bucket. Clusters dial OUT to it and hold the stream, so it needs
+# no route back into any member cluster.
+
+namespace:
+  create: true
+  name: fuse-globalcp
+
+image:
+  # Same image as fuse-cache: the globalcp binary ships in it.
+  repository: stargzrepo.azurecr.io/fuse-client
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# replicaCount is 1 and should stay 1 with the default in-memory store.
+#
+# The store is per-process and so is the subscriber fan-out, so two replicas
+# behind one Service would give each cluster a different view of the index
+# depending on which pod its stream landed on — a partition that looks like
+# eventual consistency and never converges. Scaling out needs the
+# etcd-backed store (internal/globalcp/store.go), which is not wired here.
+replicaCount: 1
+# Escape hatch for the replicaCount guard above. Set it only if you have
+# read why the guard exists and it does not apply to your install.
+allowMultiReplica: false
+
+httpPort: 8090   # read-only operator surface: /api/global/{clusters,index}, /api/health
+grpcPort: 9090   # the mTLS GlobalControlPlane service clusters dial
+
+# Maximum publish/subscribe prefixes one cluster may register. The index is
+# only small because membership is explicit; this is the backstop.
+maxPrefixes: 64
+
+tls:
+  # Required for any deployment reachable over a real network.
+  #
+  # The control plane reads the cluster ID out of the first DNS SAN of the
+  # verified client certificate, so ISSUING A CERTIFICATE IS GRANTING A
+  # CLUSTER ITS IDENTITY. The CA named here must therefore sign nothing but
+  # cluster certificates — a public CA in this bundle means anyone with a
+  # cert for any name can publish as that cluster.
+  #
+  # Leave secretName empty ONLY for a loopback/dev install, and then
+  # allowInsecureIdentity must be set true or the pod refuses to start.
+  secretName: ""
+  # Keys inside the secret. cert-manager's default Certificate secret uses
+  # tls.crt / tls.key / ca.crt, which is why these are the defaults.
+  certKey: tls.crt
+  keyKey: tls.key
+  caKey: ca.crt
+
+# DEV ONLY. With no mTLS there is no way to tell who is calling, so the
+# binary refuses to start unless this names the risk explicitly: any caller
+# that can reach the port may claim any cluster ID and publish as it.
+allowInsecureIdentity: false
+
+service:
+  # ClusterIP is the default and is correct when every member cluster can
+  # already route here (same VNet/VPC, peering, or a service mesh).
+  # LoadBalancer is the first non-ClusterIP Service in this repo; use it when
+  # member clusters reach the CP over the internet, and keep in mind the gRPC
+  # port then becomes publicly dialable. That is survivable precisely because
+  # identity is the client certificate: an unauthenticated dialer gets past
+  # nothing. It is still worth a loadBalancerSourceRanges allowlist.
+  type: ClusterIP
+  annotations: {}
+  loadBalancerSourceRanges: []
+
+ingress:
+  # Off by default, and narrower than it looks: only the read-only HTTP
+  # surface is routable this way. The gRPC stream is long-lived and mTLS
+  # client-authenticated, which a terminating HTTP ingress would break by
+  # definition — it would verify the certificate at the proxy and hand the CP
+  # an anonymous connection, silently turning identity off. Expose gRPC with
+  # service.type, not here.
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}

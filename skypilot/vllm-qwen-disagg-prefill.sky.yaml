@@ -1,0 +1,99 @@
+# SkyServe service: the prefill half of a DISAGGREGATED prefill/decode pair,
+# pinned to node aks-gpuckpt-13588264-vmss00000h.
+#
+# Read skypilot/README-disagg.md first -- it explains why both halves carry
+# kv_role: kv_both, which looks wrong and is not.
+#
+# The disaggregation is REAL in the sense that matters: the prefill engine and
+# the decode engine are separate vLLM processes on separate GPUs on separate
+# physical nodes. The KV cache computed on aks-gpuckpt-13588264-vmss00000h is consumed on
+# aks-gpuckpt-13588264-vmss00000g, and it travels between them through the fuse-client
+# distributed cache -- which is the entire point of running this on this
+# cluster rather than on one box with two GPUs.
+#
+# Node pinning is done with nodeAffinity rather than by letting the scheduler
+# choose, because with exactly one allocatable GPU per node the scheduler would
+# otherwise be free to place both halves on the same node once a replica
+# restarts, and the test would silently degrade into the single-engine case it
+# is meant to be distinguished from.
+
+service:
+  readiness_probe:
+    path: /v1/models
+    initial_delay_seconds: 600
+  replicas: 1
+
+resources:
+  infra: k8s
+  accelerators: A100-80GB:1
+  image_id: docker:vllm/vllm-openai:v0.9.2
+  ports: 8000
+
+envs:
+  MODEL_PATH: /mnt/fuse/models/Qwen2.5-1.5B-Instruct
+  SERVED_NAME: Qwen/Qwen2.5-1.5B-Instruct
+  HF_HUB_OFFLINE: "1"
+  # BOTH halves must point at the SAME directory. This is the transport: the
+  # prefill engine writes KV here, the decode engine reads it back. It is a
+  # path on the FUSE mount, so the two nodes see the same bytes.
+  KV_PATH: /mnt/fuse-kv/vllmkv-disagg
+  ROLE: prefill
+
+run: |
+  set -e
+  echo "[$ROLE] node: $(cat /etc/hostname)"
+  ls -la "$MODEL_PATH" >/dev/null || { echo "FATAL: weights not visible" >&2; exit 1; }
+  test -f "$MODEL_PATH/model.safetensors" || {
+    echo "FATAL: model.safetensors not visible at $MODEL_PATH" >&2
+    echo "The FUSE mount likely did not propagate into this pod." >&2
+    exit 1
+  }
+
+  mkdir -p "$KV_PATH"
+  touch "$KV_PATH/.probe-$ROLE" && rm -f "$KV_PATH/.probe-$ROLE"
+  echo "[$ROLE] shared KV transport ready at $KV_PATH"
+
+  # enforce_eager matches vLLM's own disagg example. CUDA graphs capture a
+  # fixed batch shape, and the connector's save/load hooks run outside the
+  # captured region; eager keeps the KV hooks on the real execution path.
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_PATH" \
+    --served-model-name "$SERVED_NAME" \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 4096 \
+    --enforce-eager \
+    --kv-transfer-config \
+    '{"kv_connector":"SharedStorageConnector","kv_role":"kv_both","kv_connector_extra_config":{"shared_storage_path":"/mnt/fuse-kv/vllmkv-disagg"}}'
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        # Pin this half to its own node. See the header.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values: ["aks-gpuckpt-13588264-vmss00000h"]
+        containers:
+          - volumeMounts:
+              - mountPath: /mnt/fuse
+                name: fuse-mount
+                readOnly: true
+                mountPropagation: HostToContainer
+              - mountPath: /mnt/fuse-kv
+                name: fuse-mount-rw
+                mountPropagation: HostToContainer
+        volumes:
+          - name: fuse-mount
+            hostPath:
+              path: /mnt/fuse
+              type: Directory
+          - name: fuse-mount-rw
+            hostPath:
+              path: /mnt/fuse
+              type: Directory

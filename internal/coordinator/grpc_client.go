@@ -12,7 +12,9 @@ import (
 	pb "fuse-client/internal/pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // GRPCCoordinatorClient implements the Coordinator interface via gRPC.
@@ -208,4 +210,24 @@ func deriveCoordinatorHTTPAddr(grpcAddr string) string {
 		return grpcAddr
 	}
 	return net.JoinHostPort(host, "8080")
+}
+
+// ResolveGlobal implements GlobalResolver over gRPC.
+//
+// A coordinator too old to know the RPC answers Unimplemented. That is
+// "this cluster has no global index", not a failure, so it degrades to the
+// same empty-and-not-ready answer a configured-but-unsynced coordinator
+// gives -- a rolling upgrade must not make the read path log errors.
+func (c *GRPCCoordinatorClient) ResolveGlobal(ctx context.Context, filePath string) (*GlobalResolution, error) {
+	resp, err := c.client.ResolveGlobal(ctx, &pb.ResolveGlobalRequest{FilePath: filePath})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return &GlobalResolution{}, nil
+		}
+		return nil, err
+	}
+	return &GlobalResolution{
+		Locations: globalLocationsFromProto(resp.GetLocations()),
+		Ready:     resp.GetReady(),
+	}, nil
 }
