@@ -137,10 +137,23 @@ git worktree add --detach --quiet "$WT_NEW"  "$NEW_SHA"  || { echo "worktree add
 # This is only valid while the benchmarks compile against both trees; when a
 # benchmark uses an API that does not exist in the baseline, the baseline
 # build fails loudly below rather than quietly skipping.
+#
+# A file is copied only if it declares a benchmark, or already exists in the
+# baseline tree. A file that is new AND benchmark-free contributes no
+# baseline row -- there is nothing in it to measure -- so copying it cannot
+# help, and it breaks the baseline build whenever it exercises an API the
+# change itself introduced. That is a unit test for the new code, which the
+# normal test suite already runs against the tree it belongs to.
 copy_bench_files() {
   local pkgdir="$1"
   [[ -d "$WT_NEW/$pkgdir" ]] || return 0
-  find "$WT_NEW/$pkgdir" -maxdepth 1 -name "*_test.go" -exec cp {} "$WT_BASE/$pkgdir/" \; 2>/dev/null || true
+  local f base
+  while IFS= read -r f; do
+    base="$(basename "$f")"
+    if grep -qE '^func Benchmark[A-Z_]' "$f" || [[ -f "$WT_BASE/$pkgdir/$base" ]]; then
+      cp "$f" "$WT_BASE/$pkgdir/" 2>/dev/null || true
+    fi
+  done < <(find "$WT_NEW/$pkgdir" -maxdepth 1 -name "*_test.go")
 }
 
 # Resolve ./internal/cache -> internal/cache for the copy step.
