@@ -491,3 +491,14 @@ func (as *AzureStorage) ListUnder(ctx context.Context, prefix string) ([]string,
 	}
 	return out, nil
 }
+
+// ReadKey implements rawKeyReader: fetch exactly name, unscoped. Azure's
+// container is the bucket analogue, so BucketName returns it.
+func (as *AzureStorage) ReadKey(ctx context.Context, name string) ([]byte, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, as.timeout)
+	defer cancel()
+	return as.readName(timeoutCtx, name)
+}
+
+// BucketName implements rawKeyReader.
+func (as *AzureStorage) BucketName() string { return as.containerName }

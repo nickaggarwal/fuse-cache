@@ -272,6 +272,16 @@ type CacheConfig struct {
 	// Advisory — coordinator errors degrade to plain cloud reads.
 	FetchLeaseEnabled bool
 
+	// GlobalReadEnabled lets a cloud miss fall through to another cluster's
+	// object storage, resolved via the coordinator's mirror of the global
+	// index. Default off, and off is a complete configuration: nothing on
+	// the read path consults it until an operator opts in.
+	//
+	// It is scoped to the MISS branch on purpose. An NVMe hit, a peer hit,
+	// and a local cloud hit never reach it, so enabling it cannot change
+	// the latency of a read that was going to succeed anyway.
+	GlobalReadEnabled bool
+
 	// FastChunkAdvertise publishes this node as a holder of each chunk the
 	// moment the chunk lands on local NVMe after a remote fetch, instead of
 	// only after whole-object operations. Later requesters then pull from the
@@ -364,6 +374,7 @@ type DefaultCacheManager struct {
 	hedgeLimiter    chan struct{}
 	peerServeGate   *peerServeGate
 	herdStats       herdControlStats
+	globalStats     globalReadStats
 	deleteStats     deleteStats
 	// tombstones suppress this node's own metadata publishes for recently
 	// deleted paths, so a background persist or chunk completion that was
@@ -2231,6 +2242,49 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 	}
 	close(jobs)
 	wg.Wait()
+
+	cm.publishChunkedParentToCloud(ctx, filePath, numChunks)
+}
+
+// publishChunkedParentToCloud records a cloud-tier location row for the
+// PARENT path of a chunked file, once every chunk has landed.
+//
+// Without this a chunked file has no cloud row at all: persistToCloud
+// publishes one row per "<file>_chunk_<n>" object and nothing ever names
+// the file itself as being in cloud storage. Locally that goes unnoticed,
+// because every reader of a chunked file resolves chunks individually. It
+// matters the moment the location table is read by something that thinks in
+// whole files -- the global index being the first such reader, where the
+// absence would mean no chunked file is ever discoverable across clusters,
+// silently and for every large file, which is exactly the population the
+// feature exists for.
+//
+// Published only when markPersistedToCloud has flipped the parent, so the
+// row never advertises a partially-uploaded file.
+func (cm *DefaultCacheManager) publishChunkedParentToCloud(ctx context.Context, filePath string, numChunks int64) {
+	cm.mu.RLock()
+	parent, ok := cm.entries.get(filePath)
+	var size, chunkSize int64
+	persisted := false
+	if ok && parent != nil {
+		size = parent.Size
+		chunkSize = cm.effectiveChunkSize(parent)
+		persisted = parent.PersistedToCloud
+	}
+	cm.mu.RUnlock()
+	if !persisted {
+		return
+	}
+	cm.publishFileLocation(ctx, &CacheEntry{
+		FilePath:     filePath,
+		StoragePath:  filePath,
+		Size:         size,
+		LastAccessed: time.Now(),
+		Tier:         TierCloud,
+		IsChunked:    true,
+		NumChunks:    numChunks,
+		ChunkSize:    chunkSize,
+	}, TierCloud)
 }
 
 // putToNVMeWithEviction lands entry's bytes on NVMe, credits them to the

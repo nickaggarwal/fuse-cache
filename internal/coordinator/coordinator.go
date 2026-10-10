@@ -114,6 +114,11 @@ type CoordinatorService struct {
 	// Declared as an atomic-free plain field because it is set once during
 	// startup, before the service serves anything.
 	global GlobalPublisher
+
+	// globalMirror is the read side of the same link: a local, read-only
+	// index of what other clusters have published. Nil whenever global
+	// sync is off, which is the default.
+	globalMirror GlobalMirror
 	// saveMu serializes SaveStateToPath: the periodic save goroutine and the
 	// shutdown path can otherwise write the same temp file concurrently and
 	// rename a torn snapshot into place.

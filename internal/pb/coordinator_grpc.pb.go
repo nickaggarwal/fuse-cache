@@ -26,6 +26,7 @@ const (
 	CoordinatorService_UpdateFileLocation_FullMethodName = "/pb.CoordinatorService/UpdateFileLocation"
 	CoordinatorService_DeleteFileLocation_FullMethodName = "/pb.CoordinatorService/DeleteFileLocation"
 	CoordinatorService_GetPeerStats_FullMethodName       = "/pb.CoordinatorService/GetPeerStats"
+	CoordinatorService_ResolveGlobal_FullMethodName      = "/pb.CoordinatorService/ResolveGlobal"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -39,6 +40,12 @@ type CoordinatorServiceClient interface {
 	UpdateFileLocation(ctx context.Context, in *UpdateFileLocationRequest, opts ...grpc.CallOption) (*UpdateFileLocationResponse, error)
 	DeleteFileLocation(ctx context.Context, in *DeleteFileLocationRequest, opts ...grpc.CallOption) (*DeleteFileLocationResponse, error)
 	GetPeerStats(ctx context.Context, in *GetPeerStatsRequest, opts ...grpc.CallOption) (*GetPeerStatsResponse, error)
+	// ResolveGlobal answers "does another cluster hold this path, and where in
+	// object storage". Advisory like everything else on this interface: a
+	// coordinator with no global sync agent returns an empty, not-ready answer
+	// rather than an error, so a caller never has to distinguish "feature off"
+	// from "call failed".
+	ResolveGlobal(ctx context.Context, in *ResolveGlobalRequest, opts ...grpc.CallOption) (*ResolveGlobalResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -112,6 +119,15 @@ func (c *coordinatorServiceClient) GetPeerStats(ctx context.Context, in *GetPeer
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) ResolveGlobal(ctx context.Context, in *ResolveGlobalRequest, opts ...grpc.CallOption) (*ResolveGlobalResponse, error) {
+	out := new(ResolveGlobalResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_ResolveGlobal_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility
@@ -123,6 +139,12 @@ type CoordinatorServiceServer interface {
 	UpdateFileLocation(context.Context, *UpdateFileLocationRequest) (*UpdateFileLocationResponse, error)
 	DeleteFileLocation(context.Context, *DeleteFileLocationRequest) (*DeleteFileLocationResponse, error)
 	GetPeerStats(context.Context, *GetPeerStatsRequest) (*GetPeerStatsResponse, error)
+	// ResolveGlobal answers "does another cluster hold this path, and where in
+	// object storage". Advisory like everything else on this interface: a
+	// coordinator with no global sync agent returns an empty, not-ready answer
+	// rather than an error, so a caller never has to distinguish "feature off"
+	// from "call failed".
+	ResolveGlobal(context.Context, *ResolveGlobalRequest) (*ResolveGlobalResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -150,6 +172,9 @@ func (UnimplementedCoordinatorServiceServer) DeleteFileLocation(context.Context,
 }
 func (UnimplementedCoordinatorServiceServer) GetPeerStats(context.Context, *GetPeerStatsRequest) (*GetPeerStatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPeerStats not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) ResolveGlobal(context.Context, *ResolveGlobalRequest) (*ResolveGlobalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResolveGlobal not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 
@@ -290,6 +315,24 @@ func _CoordinatorService_GetPeerStats_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_ResolveGlobal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveGlobalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).ResolveGlobal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_ResolveGlobal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).ResolveGlobal(ctx, req.(*ResolveGlobalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -324,6 +367,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetPeerStats",
 			Handler:    _CoordinatorService_GetPeerStats_Handler,
+		},
+		{
+			MethodName: "ResolveGlobal",
+			Handler:    _CoordinatorService_ResolveGlobal_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

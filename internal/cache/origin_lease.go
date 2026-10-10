@@ -169,7 +169,32 @@ func (cm *DefaultCacheManager) getFromCloudLeased(ctx context.Context, path stri
 // data actually came from.
 func (cm *DefaultCacheManager) getFromRemoteTier(ctx context.Context, path string, tier CacheTier) (*CacheEntry, CacheTier, error) {
 	if tier == TierCloud {
-		return cm.getFromCloudLeased(ctx, path)
+		entry, served, err := cm.getFromCloudLeased(ctx, path)
+		if err != nil && isCloudMiss(err) {
+			// The object is not in THIS cluster's bucket scope. Before
+			// calling it a miss, ask whether another cluster published it.
+			//
+			// Only on isCloudMiss, never on a general error: a timeout or a
+			// 503 says nothing about whether the object exists locally, and
+			// chasing a remote copy on every transient cloud fault would add
+			// a second round trip to the failures that are already slowest.
+			//
+			// The returned tier stays TierCloud. A global read IS a cloud
+			// read -- same backend, same credentials, different key -- so
+			// the caller's tier accounting, miss recording, and promotion
+			// all stay correct without knowing this happened.
+			if data, ok := cm.getFromGlobal(ctx, path); ok {
+				return &CacheEntry{
+					FilePath:     path,
+					StoragePath:  path,
+					Size:         int64(len(data)),
+					LastAccessed: time.Now(),
+					Tier:         TierCloud,
+					Data:         data,
+				}, TierCloud, nil
+			}
+		}
+		return entry, served, err
 	}
 	entry, err := cm.getFromTier(ctx, path, tier)
 	return entry, tier, err

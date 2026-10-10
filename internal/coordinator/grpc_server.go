@@ -183,3 +183,79 @@ func toInt64(v interface{}) int64 {
 		return 0
 	}
 }
+
+// ResolveGlobal serves the coordinator's local mirror of the global index.
+//
+// Never returns an error for "not configured": a coordinator without global
+// sync answers empty-and-not-ready, so a client cannot tell a disabled
+// feature from a reachable-but-empty one, and does not have to.
+func (s *GRPCServer) ResolveGlobal(ctx context.Context, req *pb.ResolveGlobalRequest) (*pb.ResolveGlobalResponse, error) {
+	res, err := s.service.ResolveGlobal(ctx, req.GetFilePath())
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ResolveGlobalResponse{
+		Locations: globalLocationsToProto(res.Locations),
+		Ready:     res.Ready,
+	}, nil
+}
+
+func globalLocationsToProto(in []*GlobalLocation) []*pb.GlobalLocation {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*pb.GlobalLocation, 0, len(in))
+	for _, l := range in {
+		if l == nil {
+			continue
+		}
+		out = append(out, &pb.GlobalLocation{
+			ClusterId: l.ClusterID,
+			FilePath:  l.FilePath,
+			FileSize:  l.FileSize,
+			IsChunked: l.IsChunked,
+			ChunkSize: l.ChunkSize,
+			Object: &pb.ObjectRef{
+				Provider:  l.Provider,
+				Bucket:    l.Bucket,
+				KeyPrefix: l.KeyPrefix,
+				Region:    l.Region,
+				Endpoint:  l.Endpoint,
+			},
+			PublishedUnix: l.PublishedAt,
+		})
+	}
+	return out
+}
+
+func globalLocationsFromProto(in []*pb.GlobalLocation) []*GlobalLocation {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*GlobalLocation, 0, len(in))
+	for _, l := range in {
+		if l == nil {
+			continue
+		}
+		obj := l.GetObject()
+		if obj == nil || obj.GetBucket() == "" {
+			// Same filter as Mirror.Resolve: a row naming no bucket names
+			// no readable bytes.
+			continue
+		}
+		out = append(out, &GlobalLocation{
+			ClusterID:   l.GetClusterId(),
+			FilePath:    l.GetFilePath(),
+			FileSize:    l.GetFileSize(),
+			IsChunked:   l.GetIsChunked(),
+			ChunkSize:   l.GetChunkSize(),
+			Provider:    obj.GetProvider(),
+			Bucket:      obj.GetBucket(),
+			KeyPrefix:   obj.GetKeyPrefix(),
+			Region:      obj.GetRegion(),
+			Endpoint:    obj.GetEndpoint(),
+			PublishedAt: l.GetPublishedUnix(),
+		})
+	}
+	return out
+}

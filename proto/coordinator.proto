@@ -5,6 +5,10 @@ package pb;
 option go_package = "fuse-client/internal/pb";
 
 import "google/protobuf/timestamp.proto";
+// GlobalLocation lives in globalcp.proto: the cross-cluster row is defined
+// once, by the service that owns it, rather than mirrored here where the two
+// copies would drift.
+import "globalcp.proto";
 
 // CoordinatorService handles peer registration and file location metadata.
 service CoordinatorService {
@@ -15,6 +19,12 @@ service CoordinatorService {
   rpc UpdateFileLocation(UpdateFileLocationRequest) returns (UpdateFileLocationResponse);
   rpc DeleteFileLocation(DeleteFileLocationRequest) returns (DeleteFileLocationResponse);
   rpc GetPeerStats(GetPeerStatsRequest) returns (GetPeerStatsResponse);
+  // ResolveGlobal answers "does another cluster hold this path, and where in
+  // object storage". Advisory like everything else on this interface: a
+  // coordinator with no global sync agent returns an empty, not-ready answer
+  // rather than an error, so a caller never has to distinguish "feature off"
+  // from "call failed".
+  rpc ResolveGlobal(ResolveGlobalRequest) returns (ResolveGlobalResponse);
 }
 
 message PeerInfo {
@@ -123,4 +133,20 @@ message GetPeerStatsResponse {
   int64 used_space = 4;
   int64 available_space = 5;
   int64 file_count = 6;
+}
+
+// ResolveGlobalRequest asks the coordinator where else in the world a path
+// lives. Served from the coordinator's local mirror of the global index, so
+// it is a cheap same-cluster call with no outbound network in its path.
+message ResolveGlobalRequest {
+  string file_path = 1;
+}
+
+message ResolveGlobalResponse {
+  repeated GlobalLocation locations = 1;
+  // ready distinguishes "the mirror knows of no remote copy" from "the
+  // mirror has never synced". Empty-and-not-ready must not be cached as a
+  // negative answer, or a cluster that restarts while the global CP is down
+  // stops looking forever.
+  bool ready = 2;
 }

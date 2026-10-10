@@ -424,3 +424,16 @@ func shouldPreferDirectPut(bucket, endpoint string) bool {
 	e := strings.ToLower(strings.TrimSpace(endpoint))
 	return strings.HasSuffix(b, "--x-s3") || strings.Contains(e, "s3express")
 }
+
+// ReadKey implements rawKeyReader: fetch exactly key, with no candidate
+// spellings and no cluster scoping. Used by the cross-cluster read path,
+// which has already been told the full key by the global index and must not
+// re-derive it through this cluster's own KeyMapper.
+func (cs *CloudStorage) ReadKey(ctx context.Context, key string) ([]byte, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, cs.timeout)
+	defer cancel()
+	return cs.readDirect(timeoutCtx, key)
+}
+
+// BucketName implements rawKeyReader.
+func (cs *CloudStorage) BucketName() string { return cs.bucket }

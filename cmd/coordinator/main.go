@@ -144,6 +144,10 @@ func main() {
 		// Attached before the service starts serving, so no request can
 		// observe a half-wired coordinator.
 		coordinatorService.SetGlobalPublisher(syncAgent)
+		// The read side of the same link. Installed together with the
+		// publisher so a coordinator is never publishing into an index it
+		// cannot itself resolve against.
+		coordinatorService.SetGlobalMirror(syncAgent.Mirror())
 		syncAgent.Start(ctx)
 		logger.Printf("Global sync enabled: cluster=%q endpoint=%s publish=%v subscribe=%v",
 			gcfg.ClusterID, gcfg.Endpoint, gcfg.Publish, gcfg.Subscribe)

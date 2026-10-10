@@ -132,3 +132,92 @@ func TestMirrorStatusTracksSyncTime(t *testing.T) {
 		t.Fatal("empty snapshot left the mirror not-ready")
 	}
 }
+
+// TestResolveCarriesReadyEvenWithNoRows is the claim the data plane acts on.
+// An unsynced mirror and a synced one both return no rows for an unknown
+// path; only the second is a negative a reader may trust.
+func TestResolveCarriesReadyEvenWithNoRows(t *testing.T) {
+	m := NewMirror()
+	if _, ready := m.Resolve("/models/a.bin"); ready {
+		t.Fatal("unsynced mirror resolved as ready")
+	}
+	m.ApplySnapshot(nil)
+	if _, ready := m.Resolve("/models/a.bin"); !ready {
+		t.Fatal("an empty snapshot is still a sync; ready must be true")
+	}
+}
+
+// TestResolveTranslatesTheObjectRef: the mirror is where the wire type
+// becomes the type the cache reads keys out of. A field dropped here
+// produces a read under the wrong key.
+func TestResolveTranslatesTheObjectRef(t *testing.T) {
+	m := NewMirror()
+	m.ApplySnapshot([]*pb.GlobalLocation{{
+		ClusterId: "cluster-a", FilePath: "/models/a.bin",
+		FileSize: 99, IsChunked: true, ChunkSize: 1 << 20, PublishedUnix: 7,
+		Object: &pb.ObjectRef{
+			Provider: "azure", Bucket: "blobs", KeyPrefix: "cluster-a",
+			Region: "eastus", Endpoint: "https://x.blob.core.windows.net",
+		},
+	}})
+
+	got, ready := m.Resolve("/models/a.bin")
+	if !ready || len(got) != 1 {
+		t.Fatalf("ready=%v rows=%d", ready, len(got))
+	}
+	g := got[0]
+	if g.ClusterID != "cluster-a" || g.FilePath != "/models/a.bin" || g.FileSize != 99 ||
+		!g.IsChunked || g.ChunkSize != 1<<20 || g.PublishedAt != 7 ||
+		g.Provider != "azure" || g.Bucket != "blobs" || g.KeyPrefix != "cluster-a" ||
+		g.Region != "eastus" || g.Endpoint != "https://x.blob.core.windows.net" {
+		t.Fatalf("translation lost a field: %+v", *g)
+	}
+}
+
+// TestResolveDropsRowsWithNoReadableObject. The global data path is object
+// storage only, so a row with no bucket names nothing a reader can fetch.
+// Returning it would cost a wasted round trip on every miss for that path.
+func TestResolveDropsRowsWithNoReadableObject(t *testing.T) {
+	m := NewMirror()
+	m.ApplySnapshot([]*pb.GlobalLocation{
+		{ClusterId: "a", FilePath: "/models/a.bin"},                                        // no ObjectRef at all
+		{ClusterId: "b", FilePath: "/models/a.bin", Object: &pb.ObjectRef{Provider: "s3"}}, // no bucket
+		loc("c", "/models/a.bin", 10, 3),
+	})
+
+	got, ready := m.Resolve("/models/a.bin")
+	if !ready {
+		t.Fatal("not ready after a snapshot")
+	}
+	if len(got) != 1 || got[0].ClusterID != "c" {
+		t.Fatalf("got %d rows (%+v), want only the one with a bucket", len(got), got)
+	}
+}
+
+// TestResolveAfterWithdrawStopsAdvertising: the data plane must stop
+// resolving a path the publishing cluster withdrew, or every reader keeps
+// paying a wasted remote read for a deleted object.
+func TestResolveAfterWithdrawStopsAdvertising(t *testing.T) {
+	m := NewMirror()
+	m.ApplySnapshot([]*pb.GlobalLocation{loc("a", "/models/a.bin", 10, 1)})
+	if got, _ := m.Resolve("/models/a.bin"); len(got) != 1 {
+		t.Fatalf("setup: got %d rows", len(got))
+	}
+
+	m.ApplyEvent(&pb.GlobalEvent{
+		Kind:      pb.GlobalEvent_WITHDRAW,
+		ClusterId: "a",
+		FilePath:  "/models/a.bin",
+	})
+
+	got, ready := m.Resolve("/models/a.bin")
+	if len(got) != 0 {
+		t.Fatalf("withdrawn path still resolves: %+v", got)
+	}
+	// Ready must stay true: the mirror is still in sync, it just knows the
+	// object is gone. Collapsing to not-ready here would be a worse answer
+	// than the one it has.
+	if !ready {
+		t.Fatal("a withdraw must not make a synced mirror report unsynced")
+	}
+}

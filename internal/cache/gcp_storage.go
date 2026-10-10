@@ -196,3 +196,22 @@ func (gs *GCPStorage) Size(ctx context.Context, path string) (int64, error) {
 
 	return *resp.ContentLength, nil
 }
+
+// ReadKey implements rawKeyReader: fetch exactly key, unscoped. See the
+// S3 implementation for why the cross-cluster path needs this.
+func (gs *GCPStorage) ReadKey(ctx context.Context, key string) ([]byte, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, gs.timeout)
+	defer cancel()
+	buf := aws.NewWriteAtBuffer([]byte{})
+	buf.GrowthCoeff = 2
+	if _, err := gs.downloader.DownloadWithContext(timeoutCtx, buf, &s3.GetObjectInput{
+		Bucket: aws.String(gs.bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// BucketName implements rawKeyReader.
+func (gs *GCPStorage) BucketName() string { return gs.bucket }

@@ -18,6 +18,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"fuse-client/internal/coordinator"
 	"fuse-client/internal/pb"
 )
 
@@ -188,4 +189,51 @@ func (m *Mirror) Snapshot() []*pb.GlobalLocation {
 		return out[i].GetClusterId() < out[j].GetClusterId()
 	})
 	return out
+}
+
+// Resolve implements coordinator.GlobalMirror: the cross-cluster lookup as
+// the data path sees it.
+//
+// This is the whole cost of a global resolve -- one read lock and a map
+// hit. No dial, no RPC, no timeout to tune. It is called on a cloud miss,
+// which a reader is already waiting on, so anything slower would make the
+// miss path worse for every deployment in exchange for a feature most of
+// them do not use.
+//
+// The second return is "have I ever synced", and callers must not collapse
+// it into len(locations) == 0. A cluster that restarts while the global
+// control plane is down would otherwise learn a permanent negative.
+func (m *Mirror) Resolve(filePath string) ([]*coordinator.GlobalLocation, bool) {
+	m.mu.RLock()
+	ready := m.ready
+	m.mu.RUnlock()
+
+	rows := m.Lookup(filePath)
+	if len(rows) == 0 {
+		return nil, ready
+	}
+	out := make([]*coordinator.GlobalLocation, 0, len(rows))
+	for _, r := range rows {
+		obj := r.GetObject()
+		if obj == nil || obj.GetBucket() == "" {
+			// A row with no object reference names no readable bytes. The
+			// global data path is object storage only, so there is nothing
+			// a reader could do with it except waste a round trip.
+			continue
+		}
+		out = append(out, &coordinator.GlobalLocation{
+			ClusterID:   r.GetClusterId(),
+			FilePath:    r.GetFilePath(),
+			FileSize:    r.GetFileSize(),
+			IsChunked:   r.GetIsChunked(),
+			ChunkSize:   r.GetChunkSize(),
+			Provider:    obj.GetProvider(),
+			Bucket:      obj.GetBucket(),
+			KeyPrefix:   obj.GetKeyPrefix(),
+			Region:      obj.GetRegion(),
+			Endpoint:    obj.GetEndpoint(),
+			PublishedAt: r.GetPublishedUnix(),
+		})
+	}
+	return out, ready
 }

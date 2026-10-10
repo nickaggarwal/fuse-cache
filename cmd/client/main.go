@@ -96,6 +96,7 @@ func main() {
 		peerRawTransport     = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
 		peerServeMaxIn       = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
 		peerReplStaggerMS    = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
+		globalRead           = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
 		fetchLeaseEnabled    = flag.Bool("fetch-lease", false, "Take a short-TTL coordinator lease before cloud pulls so simultaneous misses of one object collapse to a single origin fetch (thundering-herd Phase 2; opt-in — adds cold-read latency on isolated reads)")
 		fastChunkAdvertise   = flag.Bool("fast-chunk-advertise", false, "Publish this node as a holder the moment the first remotely-fetched chunk lands on NVMe, so later readers pull from the growing swarm (thundering-herd Phase 3; opt-in — promotion competes with isolated reads)")
 		reconcileIntervalSec = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
@@ -258,6 +259,7 @@ func main() {
 		PeerServeMaxInflight:       *peerServeMaxIn,
 		PeerReplicationStagger:     time.Duration(*peerReplStaggerMS) * time.Millisecond,
 		FetchLeaseEnabled:          *fetchLeaseEnabled,
+		GlobalReadEnabled:          *globalRead,
 		FastChunkAdvertise:         *fastChunkAdvertise,
 		ReplicaReconcileInterval:   time.Duration(*reconcileIntervalSec) * time.Second,
 		ReplicaReconcileTarget:     *reconcileTarget,
@@ -558,6 +560,8 @@ func main() {
 		enabledState(cacheConfig.FastChunkAdvertise),
 		intervalState(cacheConfig.ReplicaReconcileInterval),
 		cacheConfig.PeerServeMaxInflight)
+	logger.Printf("Cross-cluster: global_read=%s (requires a coordinator with -global-enabled; mTLS is still pending, so do not enable over an untrusted network)",
+		enabledState(cacheConfig.GlobalReadEnabled))
 
 	// Declarative warmup: a CSI session mounted with cachePolicy warmup=full
 	// prefetches its subtree into local NVMe (warmup=metadata enumerates only).
