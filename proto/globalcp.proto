@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "fuse-client/internal/pb";
+
+// GlobalControlPlane makes a published subset of each cluster's cache
+// discoverable to other clusters.
+//
+// Two properties shape every message here.
+//
+// First, the global data path is object storage only. This service answers
+// "where" -- a bucket and a key -- and never carries file bytes, never
+// brokers a connection, and never names a peer. A reading cluster fetches
+// from object storage itself. So a global row is an ObjectRef, not a
+// FileLocation: PeerID and StoragePath are pod-scoped and mean nothing
+// across a cluster boundary.
+//
+// Second, the local coordinator always dials OUT and holds the stream. A
+// private cluster then needs no inbound rule and no public endpoint, and the
+// client certificate on that connection IS the cluster's identity -- there
+// is no registration secret to distribute. The cost is that this service can
+// never initiate a request to a cluster; everything server->client rides the
+// Sync stream as a push. That is sufficient because the global path is async
+// by requirement.
+service GlobalControlPlane {
+  // RegisterCluster announces a cluster and negotiates what it may publish.
+  // The response carries the ACCEPTED allowlist, which may be narrower than
+  // what was asked for; a cluster must treat the response, not its own
+  // config, as the authority.
+  rpc RegisterCluster(RegisterClusterRequest) returns (RegisterClusterResponse);
+
+  // Sync is the single long-lived connection. The client pushes publish and
+  // withdraw batches; the server pushes an initial snapshot followed by
+  // events from OTHER clusters under the subscribed prefixes.
+  //
+  // The client keeps a local read-only mirror fed by this stream rather than
+  // resolving per request. That is what makes local autonomy fall out for
+  // free: when this stream drops, the mirror simply stops receiving updates
+  // and keeps serving its last-good contents, exactly as the local
+  // coordinator's metadata view already does during a coordinator outage.
+  rpc Sync(stream SyncRequest) returns (stream SyncResponse);
+
+  // Resolve is a point lookup for a path the mirror does not know -- a cold
+  // mirror's fallback. It is deliberately not on any hot path: a local NVMe
+  // hit, a peer hit, or a local cloud hit never reaches this service at all.
+  rpc Resolve(ResolveRequest) returns (ResolveResponse);
+}
+
+// ObjectRef locates bytes in object storage. It is the only way the global
+// namespace ever points at data.
+message ObjectRef {
+  // "s3", "azure", or "gcp" -- the same vocabulary as -cloud-provider.
+  string provider = 1;
+  // Bucket (S3/GCS) or container (Azure).
+  string bucket = 2;
+  // The publishing cluster's object-key scope (-cloud-key-prefix). A reader
+  // joins this with file_path the same way KeyMapper does, so one shared
+  // bucket with one prefix per cluster needs no extra credentials.
+  string key_prefix = 3;
+  // Region (S3) or account (Azure). Advisory; a reader that already has a
+  // client for this bucket ignores it.
+  string region = 4;
+  // Non-AWS S3-compatible endpoint, empty for the provider default.
+  string endpoint = 5;
+}
+
+// GlobalLocation is one published path.
+//
+// Deliberately NOT a reuse of the coordinator's FileLocation: that type is
+// peer-scoped and carries PeerID and StoragePath, which have no cross-cluster
+// meaning. Sharing the type would invite a reader to dial a pod IP in another
+// cluster, which is precisely the thing this design never does.
+message GlobalLocation {
+  // Always cluster-qualified. Peer IDs are unqualified pod names, so two
+  // clusters running the same DaemonSet produce colliding peer IDs; nothing
+  // crossing a cluster boundary may be identified by one.
+  string cluster_id = 1;
+  // Mount-relative path -- the same namespace clients already use.
+  string file_path = 2;
+  int64 file_size = 3;
+  bool is_chunked = 4;
+  // Mirrors FileLocation.ChunkSize. 0 means unknown, which a reader must
+  // treat as "ask the object store", not as "unchunked".
+  int64 chunk_size = 5;
+  ObjectRef object = 6;
+  int64 published_unix = 7;
+}
+
+message RegisterClusterRequest {
+  // Advisory only. The server takes identity from the verified client
+  // certificate, never from this field, so a cluster cannot claim to be
+  // another by editing a request body. Sent so an unauthenticated dev/
+  // embedded deployment still has a name to use.
+  string cluster_id = 1;
+  // Where this cluster's published objects live.
+  ObjectRef object = 2;
+  // Path prefixes this cluster intends to publish and to subscribe to.
+  repeated string publish_prefixes = 3;
+  repeated string subscribe_prefixes = 4;
+}
+
+message RegisterClusterResponse {
+  // The identity the server assigned, which is authoritative.
+  string cluster_id = 1;
+  // The allowlists actually granted. May be narrower than requested.
+  repeated string publish_prefixes = 2;
+  repeated string subscribe_prefixes = 3;
+}
+
+message SyncRequest {
+  oneof body {
+    PublishBatch publish = 1;
+    WithdrawBatch withdraw = 2;
+    Heartbeat heartbeat = 3;
+  }
+}
+
+message PublishBatch {
+  // Coalesced upserts. A path is published only once its bytes are actually
+  // in object storage -- advertising a path whose only copy is on local NVMe
+  // would promise something no other cluster can fetch.
+  repeated GlobalLocation locations = 1;
+}
+
+message WithdrawBatch {
+  repeated string file_paths = 1;
+}
+
+message Heartbeat {
+  int64 sent_unix = 1;
+}
+
+message SyncResponse {
+  oneof body {
+    // Sent once at stream start, before any event, so a reconnecting agent
+    // converges without replaying history.
+    SnapshotBatch snapshot = 1;
+    GlobalEvent event = 2;
+    Heartbeat heartbeat = 3;
+  }
+}
+
+message SnapshotBatch {
+  repeated GlobalLocation locations = 1;
+  // False on every message but the last, so an agent knows when its mirror
+  // is complete rather than guessing from a quiet stream.
+  bool final = 2;
+}
+
+message GlobalEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    UPSERT = 1;
+    WITHDRAW = 2;
+  }
+  Kind kind = 1;
+  // Set for UPSERT.
+  GlobalLocation location = 2;
+  // Set for WITHDRAW, where there is no row left to carry them.
+  string cluster_id = 3;
+  string file_path = 4;
+}
+
+message ResolveRequest {
+  string file_path = 1;
+}
+
+message ResolveResponse {
+  // Empty when no cluster publishes this path. Several clusters may publish
+  // the same path; the caller picks, and the server does not pretend to
+  // know which copy is better.
+  repeated GlobalLocation locations = 1;
+}
