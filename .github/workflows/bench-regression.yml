@@ -1,0 +1,138 @@
+name: bench-regression
+
+# Microbenchmark A/B on every push and PR.
+#
+# What this can and cannot tell you, stated up front because a perf gate that
+# overclaims is worse than none:
+#
+#   CAN  -- catch an algorithmic regression in internal/cache (an extra
+#           allocation per lookup, an O(n) scan where there was a map, a lock
+#           held across IO). These show up as large, repeatable deltas.
+#   CANNOT -- measure the things this repo actually sells: peer transfer
+#           throughput, NVMe behaviour under real load, cloud fallback, or
+#           anything about the FUSE mount. Those need the cluster, and they
+#           live in scripts/ops/benchmark-fuse-scenario.sh with results in
+#           docs/benchmark-history.md. Nothing here replaces that.
+#
+# GitHub's shared runners are noisy neighbours by construction, so this is
+# deliberately NOT a required check -- see the threshold note in the harness.
+# It comments the comparison on the PR and fails only on a large, statistically
+# significant regression.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Regression threshold (%)"
+        default: "25"
+      count:
+        description: "Runs per benchmark per side"
+        default: "8"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # A superseded push has nothing useful to say; cancel it rather than queue
+  # benchmark runs behind each other on a shared runner.
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The harness compares against a baseline commit, so a shallow
+          # clone has nothing to compare to.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Run benchmark regression harness
+        id: bench
+        # Threshold is 25% on CI rather than the harness default of 10%.
+        # Shared runners share a host with other tenants; a 10% gate there
+        # fires on neighbours, and a check that cries wolf gets muted, which
+        # costs more than it saves. Run locally for the tighter 10%.
+        env:
+          THRESHOLD: ${{ github.event.inputs.threshold || '25' }}
+          COUNT: ${{ github.event.inputs.count || '8' }}
+          BENCHTIME: 50x
+          PKG: ./internal/cache
+          OUT_DIR: ${{ runner.temp }}/bench-out
+        run: |
+          set +e
+          ./scripts/ops/bench-regression.sh | tee "${RUNNER_TEMP}/bench-console.txt"
+          echo "verdict=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw benchmark data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: ${{ runner.temp }}/bench-out
+          retention-days: 30
+
+      - name: Comment comparison on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const p = `${process.env.RUNNER_TEMP}/bench-out/benchstat.txt`;
+            if (!fs.existsSync(p)) return;
+            const table = fs.readFileSync(p, 'utf8');
+            const failed = '${{ steps.bench.outputs.verdict }}' !== '0';
+            const head = failed
+              ? ':warning: **Benchmark regression detected**'
+              : ':white_check_mark: **No significant benchmark regression**';
+            const body = [
+              head,
+              '',
+              '<details><summary>benchstat (base vs HEAD, interleaved, same runner)</summary>',
+              '',
+              '```',
+              table.trim(),
+              '```',
+              '</details>',
+              '',
+              '_Microbenchmarks in `internal/cache` only. Peer/NVMe/cloud throughput is not measured here — see `docs/benchmark-history.md`._',
+            ].join('\n');
+
+            // Update the existing comment instead of stacking one per push.
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mine = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('benchstat (base vs HEAD'));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Fail on regression
+        if: steps.bench.outputs.verdict != '0'
+        run: |
+          echo "::error::benchmark regression detected; see the PR comment and the uploaded artifact"
+          exit 1
