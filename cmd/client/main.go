@@ -47,6 +47,7 @@ func main() {
 		peerID          = flag.String("peer-id", "", "Peer ID (auto-generated if not provided)")
 		chunkSizeMB     = flag.Int("chunk-size", 8, "Chunk size in MB")
 		apiKey          = flag.String("api-key", "", "API key for authentication (optional)")
+		maxUploadGB     = flag.Int("max-upload-gb", 0, "Cap on one PUT /api/files body in GB (0 = default 2GB). Raise for multi-GB model shards; bodies stream to NVMe staging, so this bounds disk, not memory")
 
 		// Cloud provider selection
 		cloudProvider = flag.String("cloud-provider", "s3", "Cloud storage provider: s3, azure, or gcp")
@@ -618,6 +619,7 @@ func main() {
 
 	// Create API handler
 	apiHandler := api.NewHandler(cacheManager, coordClient, *peerID, *apiKey)
+	apiHandler.SetMaxUploadSize(int64(*maxUploadGB) << 30)
 
 	// Model KV store, built over the tiers the cache manager already
 	// configured so credentials and the node-init cache directory are

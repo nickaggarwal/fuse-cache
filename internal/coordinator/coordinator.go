@@ -287,6 +287,14 @@ func (cs *CoordinatorService) ListFileLocations(ctx context.Context, prefix stri
 	return cs.store.ListFileLocations(ctx, prefix)
 }
 
+// RangeFileLocations returns every replica row grouped by path, filtered by a
+// raw string prefix. Exposed for the global sync agent's republish, which
+// needs to know whether ANY row for a path is cloud-tier -- ListFileLocations
+// returns only the first row per path, which may be an NVMe replica.
+func (cs *CoordinatorService) RangeFileLocations(ctx context.Context, prefix string) (map[string][]*FileLocation, error) {
+	return cs.store.RangeFileLocations(ctx, prefix)
+}
+
 // UpdateFileLocation updates the location of a file
 func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *FileLocation) error {
 	if err := cs.store.PutFileLocation(ctx, location); err != nil {

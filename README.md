@@ -319,6 +319,14 @@ the design:
   already knows. `scripts/ops/e2e-global-mtls.sh` section 5 asserts this.
 - **The coordinator always dials out.** Private clusters need no inbound
   rule; only the control plane is addressable.
+- **Chunked files cross as one row.** A large file (FUSE/HTTP staged write
+  or chunked put) publishes a single parent row with its size and stride
+  once every chunk is uploaded; chunk rows are never published. A
+  `-global-read` cluster reads it from the publisher's chunk keys via `Get`,
+  `ReadRange`, and the FUSE mount (forced lookup falls back to the mirror;
+  `readdir` does not enumerate global-only paths). Covered by
+  `internal/globalcpe2e/chunked_federation_test.go` (in-process; no live
+  multi-cluster run recorded for the chunked path yet).
 
 Nothing above changes a single-cluster deployment: every flag defaults off
 and `-cloud-key-prefix` defaults empty, which is byte-identical to the
@@ -601,7 +609,8 @@ leaving a node advertising a mount nothing can use.
 - `GET /api/peers` - Get peer list
 - `POST /api/peers/{peerID}/heartbeat` - Send heartbeat
 - `GET /api/cache` - List cached files
-- `GET /api/cache/stats` - Get cache statistics
+- `GET /api/cache/stats` - Get cache statistics (includes a `durability` map of path counts per persist state)
+- `POST /api/cache/durable` - Durability receipt: `{"paths":[...]}` or `{"prefix":"/dir"}`, optional `timeout_seconds` (wait, capped at 600) and `retry_failed`. `200` + `"durable": true` only when every path (every chunk and the parent, for chunked files) is in cloud storage; `202` with per-path `state` (`local`/`uploading`/`persisted`/`failed`/`unknown`) otherwise; `400` for no paths, a root prefix, a chunk path, or more than 10,000 paths. `GET ?path=...&path=...` or `?prefix=` answers without waiting. See `docs/SEMANTICS.md` (Writes)
 - `POST /api/fs/snapshot` - Snapshot local filesystem/cache entries (metadata + optional data payload), optionally persist snapshot JSON to cloud (`persist_cloud` + `cloud_path`)
 - `POST /api/fs/restore` - Restore local filesystem/cache entries from direct snapshot payload or from cloud snapshot object (`cloud_path`)
 - `GET /api/netprobe?bytes=N` - Stream probe payload for peer network throughput sampling

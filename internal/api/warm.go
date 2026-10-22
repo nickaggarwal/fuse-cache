@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"sync"
@@ -61,7 +62,10 @@ type warmJob struct {
 	EndedAt   *time.Time           `json:"ended_at,omitempty"`
 	Progress  cache.WarmupProgress `json:"progress"`
 	Result    *cache.WarmupResult  `json:"result,omitempty"`
-	Error     string               `json:"error,omitempty"`
+	// FilesResult is set instead of Result for a manifest warm
+	// (POST /api/cache/warm-files): per-file outcomes plus Complete.
+	FilesResult *cache.WarmFilesResult `json:"files_result,omitempty"`
+	Error       string                 `json:"error,omitempty"`
 }
 
 // warmJobs is the per-node registry of async warm passes.
@@ -128,6 +132,35 @@ func (r *warmJobs) finish(id string, res *cache.WarmupResult, err error) {
 			Files: res.Files, Done: res.Warmed + res.AlreadyLocal + res.Skipped + res.Failed,
 			Warmed: res.Warmed, AlreadyLocal: res.AlreadyLocal,
 			Skipped: res.Skipped, Failed: res.Failed, Bytes: res.Bytes,
+		}
+	}
+}
+
+// finishFiles records a manifest warm's outcome. A run that could not
+// complete every file is still "done" — the per-file results say why — but a
+// planning error is "failed".
+func (r *warmJobs) finishFiles(id string, res *cache.WarmFilesResult, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	job := r.jobs[id]
+	if job == nil {
+		return
+	}
+	now := time.Now()
+	job.UpdatedAt = now
+	job.EndedAt = &now
+	if err != nil {
+		job.Status = warmJobFailed
+		job.Error = err.Error()
+		return
+	}
+	job.Status = warmJobDone
+	job.FilesResult = res
+	if res != nil {
+		job.Progress = cache.WarmupProgress{
+			Files: res.Files, Done: res.Files,
+			Warmed: res.Warmed, AlreadyLocal: res.AlreadyLocal,
+			Skipped: res.Skipped, Failed: res.Failed + res.NotFound, Bytes: res.Bytes,
 		}
 	}
 }
@@ -233,6 +266,98 @@ func (h *Handler) handleCacheWarm(w http.ResponseWriter, r *http.Request) {
 	res, err := warmer.WarmPrefixOpts(ctx, req.Prefix, opts)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+// warmFilesRequest is the JSON body for POST /api/cache/warm-files: warm an
+// explicit file list rather than a prefix. Each path is resolved by forced
+// lookup, so a path visible only through the global index (another cluster's
+// published release) is warmed, and a path nobody can resolve is reported
+// not_found instead of being silently absent from a files=0 result.
+type warmFilesRequest struct {
+	Files          []cache.WarmFile `json:"files"`
+	Mode           string           `json:"mode,omitempty"` // full (default) | metadata
+	Source         string           `json:"source,omitempty"`
+	Bandwidth      string           `json:"bandwidth,omitempty"`
+	Async          bool             `json:"async,omitempty"`
+	TimeoutSeconds int              `json:"timeout_seconds,omitempty"`
+}
+
+// maxWarmFilesBody bounds the request: MaxWarmFiles paths of a few hundred
+// bytes each.
+const maxWarmFilesBody = 4 << 20
+
+func (h *Handler) handleCacheWarmFiles(w http.ResponseWriter, r *http.Request) {
+	warmer, ok := h.cacheManager.(cache.FilesWarmer)
+	if !ok {
+		http.Error(w, "manifest warmup not supported by this cache manager", http.StatusNotImplemented)
+		return
+	}
+	var req warmFilesRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxWarmFilesBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Files) == 0 {
+		http.Error(w, "files is required", http.StatusBadRequest)
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = "full"
+	}
+	opts := cache.WarmupOptions{Mode: req.Mode, Source: req.Source, Bandwidth: req.Bandwidth}
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+	// Validate synchronously (cheap, no I/O) so a bad list is a 400, not a
+	// failed job the caller has to poll to discover.
+	if err := cache.ValidateWarmFiles(req.Files); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Mode != "full" && req.Mode != "metadata" {
+		http.Error(w, "mode must be full or metadata", http.StatusBadRequest)
+		return
+	}
+
+	if req.Async {
+		job := h.warmJobs.start(warmRequest{Prefix: fmt.Sprintf("files:%d", len(req.Files)),
+			Mode: req.Mode, Source: req.Source, Bandwidth: req.Bandwidth})
+		jobOpts := opts
+		jobOpts.OnProgress = func(p cache.WarmupProgress) { h.warmJobs.progress(job.ID, p) }
+		files := append([]cache.WarmFile(nil), req.Files...)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			res, err := warmer.WarmFiles(ctx, files, jobOpts)
+			h.warmJobs.finishFiles(job.ID, res, err)
+			if err != nil {
+				h.logger.Printf("Async manifest warm %s failed: %v", job.ID, err)
+				return
+			}
+			h.logger.Printf("Async manifest warm %s done: files=%d warmed=%d already_local=%d skipped=%d failed=%d not_found=%d complete=%v",
+				job.ID, res.Files, res.Warmed, res.AlreadyLocal, res.Skipped, res.Failed, res.NotFound, res.Complete)
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"started": true, "job_id": job.ID, "files": len(req.Files), "mode": req.Mode,
+			"status_url": "/api/cache/warm/" + job.ID,
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	res, err := warmer.WarmFiles(ctx, req.Files, opts)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

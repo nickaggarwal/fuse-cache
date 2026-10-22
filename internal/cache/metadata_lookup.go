@@ -71,6 +71,18 @@ func (cm *DefaultCacheManager) LookupEntry(ctx context.Context, filePath string,
 		if children, err := cm.config.Coordinator.ListFileLocations(ctx, normalizeDirPath(filePath)+"/"); err == nil {
 			cm.mergeIntoView(cm.entriesFromLocations(children))
 		}
+		// Opt-in (-global-read) and forced lookups only: a path published
+		// by another cluster resolves through the mount, so FUSE can stat
+		// and open it (reads go through the global data path). Off, or not
+		// in the mirror, it stays ENOENT. Merged into the view so open and
+		// ReadRange find the shape; the next periodic refresh drops it and
+		// the next forced lookup re-learns it.
+		if loc, ok := cm.resolveGlobalFile(ctx, filePath); ok {
+			entry := cm.entryFromGlobal(loc)
+			cm.mergeIntoView([]*CacheEntry{entry})
+			entryCopy := *entry
+			return &entryCopy, true
+		}
 		return nil, false
 	}
 	refreshed, err := cm.refreshMetadataView(ctx)

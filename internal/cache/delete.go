@@ -210,6 +210,9 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	// Before anything is removed, so that a publisher racing the removal is
 	// already suppressed rather than merely losing the race.
 	cm.tombstones.mark(filePath, time.Now())
+	// A deleted path has nothing left to persist; an in-flight upload sees
+	// its generation retired and stops certifying it.
+	cm.durability.forget(filePath)
 
 	// Captured while the metadata is still intact: the local footprint delete
 	// drops the chunk entries the key list is derived from.
@@ -250,6 +253,7 @@ func (cm *DefaultCacheManager) DeleteLocal(ctx context.Context, filePath string)
 		return fmt.Errorf("delete: empty file path")
 	}
 	cm.tombstones.mark(filePath, time.Now())
+	cm.durability.forget(filePath)
 
 	err := cm.deleteLocalFootprint(ctx, filePath)
 

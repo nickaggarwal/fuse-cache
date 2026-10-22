@@ -72,6 +72,22 @@ type Config struct {
 	// dials insecure, which is why it logs a warning when it does.
 	DialOptions []grpc.DialOption
 
+	// Locations is this cluster's location table. When set, every successful
+	// registration is followed by a bounded republish of the rows the live
+	// path would publish under the ACCEPTED allowlist (see republish.go), so
+	// the global index recovers from a control-plane restart, queue
+	// overflow, or writes made before the first registration. Nil disables
+	// republish, which is the pre-I3 behavior.
+	Locations LocationSource
+
+	// RepublishMinInterval spaces republish passes (0 = 30s default,
+	// negative = no spacing). A due pass is delayed, never skipped.
+	RepublishMinInterval time.Duration
+	// RepublishMaxRows caps the rows in one pass (0 = default 50000).
+	RepublishMaxRows int
+	// RepublishRowsPerSec paces one pass (0 = default 2000).
+	RepublishRowsPerSec int
+
 	Logger *log.Logger
 }
 
@@ -105,6 +121,8 @@ type Agent struct {
 	published  atomic.Uint64
 	withdrawn  atomic.Uint64
 	reconnects atomic.Uint64
+
+	republish republisher
 
 	stop   context.CancelFunc
 	doneCh chan struct{}
@@ -238,9 +256,13 @@ func (a *Agent) session(ctx context.Context) error {
 		return fmt.Errorf("register: %w", err)
 	}
 
-	// The CP's answer is the authority, not the local config.
+	// The CP's answer is the authority, not the local config. Normalized
+	// here as well so the republish range below can never see an empty or
+	// unnormalized entry; NormalizePrefixes only drops and canonicalizes,
+	// so it cannot widen what was granted.
+	accepted := globalcp.NormalizePrefixes(reg.GetPublishPrefixes())
 	a.mu.Lock()
-	a.publishAllow = append([]string(nil), reg.GetPublishPrefixes()...)
+	a.publishAllow = accepted
 	a.mu.Unlock()
 
 	if len(reg.GetPublishPrefixes()) != len(a.cfg.PublishPrefixes) {
@@ -259,6 +281,16 @@ func (a *Agent) session(ctx context.Context) error {
 	a.setConnected()
 	a.logger.Printf("connected to global control plane %s as cluster %q (publish=%v subscribe=%v)",
 		a.cfg.Endpoint, a.cfg.ClusterID, reg.GetPublishPrefixes(), a.cfg.SubscribePrefixes)
+
+	// Re-assert this cluster's published set. Bound to the stream: a pass
+	// that outlives its connection would feed a queue the next session's
+	// pass also fills. The session waits for it to exit so two passes never
+	// overlap.
+	repDone := a.startRepublish(streamCtx, accepted)
+	defer func() {
+		streamCancel()
+		<-repDone
+	}()
 
 	// Two directions, two goroutines. The receive loop owns the mirror; the
 	// send loop owns the queue. gRPC streams allow one concurrent Send and
@@ -395,6 +427,7 @@ func (a *Agent) flush(stream pb.GlobalControlPlane_SyncClient) error {
 			a.queue.Requeue(upserts, withdrawals)
 			return fmt.Errorf("publish: %w", err)
 		}
+		a.queue.AckSent()
 		a.published.Add(uint64(len(upserts)))
 	}
 
@@ -484,20 +517,28 @@ func (a *Agent) setDisconnected(err error) {
 
 // Status reports the agent's state, for /api/global/status.
 type Status struct {
-	ClusterID         string       `json:"cluster_id"`
-	Endpoint          string       `json:"endpoint"`
-	Connected         bool         `json:"connected"`
-	LastConnectAt     time.Time    `json:"last_connect_at,omitempty"`
-	LastError         string       `json:"last_error,omitempty"`
-	Reconnects        uint64       `json:"reconnects"`
-	PublishPrefixes   []string     `json:"publish_prefixes"`
-	SubscribePrefixes []string     `json:"subscribe_prefixes"`
-	AcceptedPrefixes  []string     `json:"accepted_publish_prefixes"`
-	QueueDepth        int          `json:"queue_depth"`
-	QueueDropped      uint64       `json:"queue_dropped"`
-	Published         uint64       `json:"published_total"`
-	Withdrawn         uint64       `json:"withdrawn_total"`
-	Mirror            MirrorStatus `json:"mirror"`
+	ClusterID         string    `json:"cluster_id"`
+	Endpoint          string    `json:"endpoint"`
+	Connected         bool      `json:"connected"`
+	LastConnectAt     time.Time `json:"last_connect_at,omitempty"`
+	LastError         string    `json:"last_error,omitempty"`
+	Reconnects        uint64    `json:"reconnects"`
+	PublishPrefixes   []string  `json:"publish_prefixes"`
+	SubscribePrefixes []string  `json:"subscribe_prefixes"`
+	AcceptedPrefixes  []string  `json:"accepted_publish_prefixes"`
+	QueueDepth        int       `json:"queue_depth"`
+	QueueDropped      uint64    `json:"queue_dropped"`
+	// QueueDroppedWithdrawals is the part of QueueDropped that republish
+	// cannot heal: a dropped withdraw leaves a stale row in the CP until it
+	// restarts or the path is written and deleted again.
+	QueueDroppedWithdrawals uint64       `json:"queue_dropped_withdrawals"`
+	Published               uint64       `json:"published_total"`
+	Withdrawn               uint64       `json:"withdrawn_total"`
+	Mirror                  MirrorStatus `json:"mirror"`
+	// LastFullRepublishAt is when a republish pass last sent every in-scope
+	// row onto the stream. Zero means never (or republish is disabled).
+	LastFullRepublishAt time.Time       `json:"last_full_republish_at,omitempty"`
+	Republish           RepublishStatus `json:"republish"`
 }
 
 func (a *Agent) Status() Status {
@@ -506,20 +547,26 @@ func (a *Agent) Status() Status {
 	accepted := append([]string(nil), a.publishAllow...)
 	a.mu.RUnlock()
 
+	rep, lastFull := a.republish.snapshot()
+	rep.Enabled = a.cfg.Locations != nil
+
 	return Status{
-		ClusterID:         a.cfg.ClusterID,
-		Endpoint:          a.cfg.Endpoint,
-		Connected:         connected,
-		LastConnectAt:     lastConn,
-		LastError:         lastErr,
-		Reconnects:        a.reconnects.Load(),
-		PublishPrefixes:   a.cfg.PublishPrefixes,
-		SubscribePrefixes: a.cfg.SubscribePrefixes,
-		AcceptedPrefixes:  accepted,
-		QueueDepth:        a.queue.Len(),
-		QueueDropped:      a.queue.Dropped(),
-		Published:         a.published.Load(),
-		Withdrawn:         a.withdrawn.Load(),
-		Mirror:            a.mirror.Status(),
+		ClusterID:               a.cfg.ClusterID,
+		Endpoint:                a.cfg.Endpoint,
+		Connected:               connected,
+		LastConnectAt:           lastConn,
+		LastError:               lastErr,
+		Reconnects:              a.reconnects.Load(),
+		PublishPrefixes:         a.cfg.PublishPrefixes,
+		SubscribePrefixes:       a.cfg.SubscribePrefixes,
+		AcceptedPrefixes:        accepted,
+		QueueDepth:              a.queue.Len(),
+		QueueDropped:            a.queue.Dropped(),
+		QueueDroppedWithdrawals: a.queue.DroppedWithdrawals(),
+		Published:               a.published.Load(),
+		Withdrawn:               a.withdrawn.Load(),
+		Mirror:                  a.mirror.Status(),
+		LastFullRepublishAt:     lastFull,
+		Republish:               rep,
 	}
 }

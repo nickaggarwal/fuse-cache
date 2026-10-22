@@ -179,7 +179,11 @@ func main() {
 			PublishPrefixes:   gcfg.Publish,
 			SubscribePrefixes: gcfg.Subscribe,
 			DialOptions:       dialOpts,
-			Logger:            log.New(os.Stdout, "[GLOBALSYNC] ", log.LstdFlags),
+			// Republish source: after every registration the agent re-sends
+			// the cloud-tier rows under the CP-accepted allowlist, so the
+			// global index heals after a CP restart or queue overflow.
+			Locations: coordinatorService,
+			Logger:    log.New(os.Stdout, "[GLOBALSYNC] ", log.LstdFlags),
 		})
 		if err != nil {
 			logger.Fatalf("Failed to build global sync agent: %v", err)

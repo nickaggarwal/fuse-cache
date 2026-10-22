@@ -123,6 +123,19 @@ func (cm *DefaultCacheManager) Rename(ctx context.Context, oldPath, newPath stri
 	}
 	cm.mu.Unlock()
 
+	// Durability follows the bytes. A pending upload of the old name is
+	// retired (its in-flight attempt sees a stale generation and stops) and
+	// the new name takes over as a tracked write, uploaded from the moved
+	// local copy by the durability loop. A persisted source needs no record:
+	// moveCloudObjects re-points the cloud copy and the receipt API verifies
+	// the new name by probing.
+	oldRec, hadRec := cm.durability.get(oldPath)
+	cm.durability.forget(oldPath)
+	cm.durability.forget(newPath)
+	if hadRec && oldRec.State != DurabilityPersisted {
+		cm.durability.enqueue(newPath, oldRec.shape())
+	}
+
 	renamedParent := parent
 	renamedParent.FilePath = newPath
 	renamedParent.StoragePath = newPath

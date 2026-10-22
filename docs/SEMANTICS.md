@@ -24,9 +24,25 @@ trade is a durability window (see Writes).
 - Writes land on local NVMe and ack at NVMe speed. Files larger than the
   chunk size (default 8MiB) are split into `_chunk_N` objects.
 - **Durability is asynchronous**: cloud persist happens in the background
-  (backlog-scaled workers). Until `PersistedToCloud` is set, the only copy
-  is local — a node lost in that window loses the file. `fsync`/`Flush`
+  (backlog-scaled workers). Until a path is `persisted`, the only copy is
+  local — a node lost in that window loses the file. `fsync`/`Flush`
   persists buffered writes locally but does NOT wait for cloud persist.
+  This is deliberate: the hot path stays at NVMe speed, and consumers that
+  need node-loss safety ask for it explicitly (below).
+- **Durability receipt** (`POST /api/cache/durable`): every write is tracked
+  as `local` → `uploading` → `persisted`, or `failed` when an attempt
+  exhausts its retries. Failed uploads are retried with backoff (30 s up to
+  10 min) instead of being dropped, and pending uploads are journalled
+  under `<nvme>/.fuse-durability/` so a client restart resumes them. The
+  receipt (`200`, `"durable": true`) is issued only when every requested
+  path, and for a chunked file every chunk plus the parent, is in object
+  storage; otherwise the answer is `202` with per-path state. A node that
+  did not write a path verifies it by probing every object's size in the
+  cloud. Limits: the journal is rename-atomic but not fsynced, so a kernel
+  crash or power loss (not a process crash) can drop a just-written record;
+  that file stays unevictable but its upload does not auto-resume, and the
+  receipt reports it as `local`, never as persisted. The receipt verifies
+  sizes, not content digests (see Consistency model).
 - Eviction will never delete bytes whose only copy is local.
 - In-place partial rewrite of an existing chunked file is supported but
   slow (read-modify-write of affected chunks) — avoid for hot paths.
@@ -107,13 +123,22 @@ much weaker than the single-cluster one, and the weakening is in the
   bound on it when the control plane is unreachable.
 - **A path is published only once its bytes are in object storage.** A file
   that exists only on a local NVMe tier is never advertised, because no
-  other cluster could fetch it. So cross-cluster visibility lags the
+  other cluster could fetch it. A chunked file is published as exactly one
+  row (its parent, with size and chunk stride) after every chunk has been
+  uploaded; `_chunk_N` objects never appear in the global index. Readers
+  derive the chunk keys from the parent row and its stride, so a reader with
+  a different `-chunk-size` still reads the right bytes. So cross-cluster visibility lags the
   durability window described in *Writes*, and inherits it: a cluster that
   dies inside that window never publishes, and the file is simply absent
   globally rather than advertised-and-missing.
 - **A global read is a cloud read.** It is attempted only after this
   cluster's own cloud read has already missed, so it adds latency to misses
-  and nothing to hits. A global miss is still a miss, with exactly the
+  and nothing to hits. With `-global-read` on, a forced FUSE lookup (open,
+  create, getattr refresh) of a path this cluster does not know falls back
+  to the global mirror, so a published file can be opened and read through
+  the mount. `readdir` does not list global-only paths (the mirror is not
+  enumerated), and `create` of a name another cluster published returns
+  `EEXIST`. With `-global-read` off, global paths are `ENOENT`. A global miss is still a miss, with exactly the
   failure taxonomy described for any other tier.
 - **Every single-cluster weakness is inherited, not repaired.** Concurrent
   writers in *different* clusters are no better coordinated than concurrent

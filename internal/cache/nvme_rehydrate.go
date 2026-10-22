@@ -61,6 +61,10 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 			return nil
 		}
 		if d.IsDir() {
+			// The durability journal is cache-internal state, not objects.
+			if d.Name() == durabilityDirName && filepath.Dir(path) == filepath.Clean(base) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		name := d.Name()

@@ -253,3 +253,103 @@ func TestWarmJobs_FailureAndRetention(t *testing.T) {
 		}
 	}
 }
+
+// filesWarmMockCache adds FilesWarmer to the standard mock.
+type filesWarmMockCache struct {
+	*mockCacheManager
+	mu    sync.Mutex
+	got   []cache.WarmFile
+	gotOp cache.WarmupOptions
+}
+
+func (m *filesWarmMockCache) WarmFiles(_ context.Context, files []cache.WarmFile, opts cache.WarmupOptions) (*cache.WarmFilesResult, error) {
+	m.mu.Lock()
+	m.got, m.gotOp = files, opts
+	m.mu.Unlock()
+	res := &cache.WarmFilesResult{Mode: opts.Mode, Files: len(files)}
+	for _, f := range files {
+		res.Results = append(res.Results, cache.WarmFileResult{Path: f.Path, Status: cache.WarmFileWarmed, Size: f.Size})
+		res.Warmed++
+		res.Bytes += f.Size
+	}
+	res.Complete = true
+	return res, nil
+}
+
+func TestHandleCacheWarmFiles(t *testing.T) {
+	cm := &filesWarmMockCache{mockCacheManager: newMockCacheManager()}
+	router := NewHandler(cm, nil, "p", "").SetupRoutes()
+	do := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/cache/warm-files", bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := do(`{"files":[{"path":"models/a/config.json","size":7},{"path":"/models/a/w.bin","size":9}],"source":"cloud-first"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sync = %d %s", rec.Code, rec.Body.String())
+	}
+	var res cache.WarmFilesResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+	if !res.Complete || res.Warmed != 2 || res.Bytes != 16 {
+		t.Fatalf("result = %+v", res)
+	}
+	if cm.got[0].Path != "/models/a/config.json" || cm.gotOp.Source != "cloud-first" || cm.gotOp.Mode != "full" {
+		t.Errorf("manager saw %+v %+v", cm.got, cm.gotOp)
+	}
+
+	for body, want := range map[string]int{
+		`{"files":[]}`: 400,
+		`{"files":[{"path":"/a"},{"path":"/a"}]}`:  400,
+		`{"files":[{"path":"/a/../b"}]}`:           400,
+		`{"files":[{"path":"/a_chunk_3"}]}`:        400,
+		`{"files":[{"path":"/a"}],"mode":"bogus"}`: 400,
+		`{"files":[{"path":"/a"}],"prefix":"/x"}`:  400, // unknown field
+		`not json`: 400,
+	} {
+		if rec := do(body); rec.Code != want {
+			t.Errorf("%s = %d, want %d", body, rec.Code, want)
+		}
+	}
+
+	// Async: 202 + job that carries per-file results when done.
+	rec = do(`{"files":[{"path":"/m/x","size":3}],"async":true}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("async = %d", rec.Code)
+	}
+	var started struct {
+		JobID string `json:"job_id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &started)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req := httptest.NewRequest(http.MethodGet, "/api/cache/warm/"+started.JobID, nil)
+		r := httptest.NewRecorder()
+		router.ServeHTTP(r, req)
+		var job struct {
+			Status      string                 `json:"status"`
+			FilesResult *cache.WarmFilesResult `json:"files_result"`
+		}
+		_ = json.Unmarshal(r.Body.Bytes(), &job)
+		if job.Status == "done" {
+			if job.FilesResult == nil || !job.FilesResult.Complete || len(job.FilesResult.Results) != 1 {
+				t.Fatalf("job result = %+v", job.FilesResult)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job never finished: %s", r.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A manager without FilesWarmer: 501.
+	plain := NewHandler(newMockCacheManager(), nil, "p", "").SetupRoutes()
+	req := httptest.NewRequest(http.MethodPost, "/api/cache/warm-files", bytes.NewBufferString(`{"files":[{"path":"/a"}]}`))
+	r := httptest.NewRecorder()
+	plain.ServeHTTP(r, req)
+	if r.Code != http.StatusNotImplemented {
+		t.Errorf("no FilesWarmer = %d", r.Code)
+	}
+}

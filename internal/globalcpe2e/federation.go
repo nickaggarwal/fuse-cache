@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,9 @@ import (
 // control plane and must observe the consequence, which a TIME_WAIT race
 // would make intermittent.
 type controlPlane struct {
+	// mu guards the three fields below, which restart replaces while agents
+	// are dialing.
+	mu   sync.Mutex
 	svc  *globalcp.Service
 	lis  *bufconn.Listener
 	grpc *grpc.Server
@@ -55,15 +59,46 @@ func startControlPlane(t *testing.T) *controlPlane {
 func (cp *controlPlane) dialOptions() []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return cp.lis.DialContext(ctx)
+			cp.mu.Lock()
+			lis := cp.lis
+			cp.mu.Unlock()
+			return lis.DialContext(ctx)
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
 }
 
 func (cp *controlPlane) stop() {
-	cp.grpc.Stop()
-	_ = cp.lis.Close()
+	cp.mu.Lock()
+	srv, lis := cp.grpc, cp.lis
+	cp.mu.Unlock()
+	srv.Stop()
+	_ = lis.Close()
+}
+
+// restart replaces the control plane with a FRESH service -- empty store, no
+// registrations -- on a new listener that existing agents' dialers pick up.
+// That is what restarting the in-memory production CP looks like.
+func (cp *controlPlane) restart() {
+	cp.stop()
+	svc := globalcp.NewService(globalcp.Config{
+		Logger:                log.New(io.Discard, "", 0),
+		AllowInsecureIdentity: true,
+	})
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	pb.RegisterGlobalControlPlaneServer(srv, svc)
+	go func() { _ = srv.Serve(lis) }()
+	cp.mu.Lock()
+	cp.svc, cp.lis, cp.grpc = svc, lis, srv
+	cp.mu.Unlock()
+}
+
+// service returns the current control-plane service.
+func (cp *controlPlane) service() *globalcp.Service {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.svc
 }
 
 // cluster is one complete, self-sufficient coordinated cache: its own
@@ -92,6 +127,9 @@ type clusterConfig struct {
 	// globalRead is the data-plane switch. Off by default, exactly as the
 	// flag is, so the suite can assert the feature is inert when unset.
 	globalRead bool
+	// chunkSize overrides the cache stride. The chunked-file tests use a
+	// small stride so a three-chunk file stays a few hundred KiB.
+	chunkSize int64
 }
 
 const sharedBucket = "shared-federation-bucket"
@@ -114,7 +152,12 @@ func newCluster(t *testing.T, cp *controlPlane, store *s3Server, cfg clusterConf
 		PublishPrefixes:   cfg.publish,
 		SubscribePrefixes: cfg.subscribe,
 		DialOptions:       cp.dialOptions(),
-		Logger:            log.New(io.Discard, "", 0),
+		// Same wiring as cmd/coordinator: republish reads this cluster's own
+		// location table. No spacing between passes, so a restart test does
+		// not wait out the 30s production default.
+		Locations:            coord,
+		RepublishMinInterval: -1,
+		Logger:               log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("%s: sync agent: %v", cfg.id, err)
@@ -134,10 +177,14 @@ func newCluster(t *testing.T, cp *controlPlane, store *s3Server, cfg clusterConf
 	// coordinator in -- the exact sequence cmd/client performs. Assembling
 	// the manager by hand here would skip that wiring and test the
 	// assembly instead of the product.
+	chunkSize := cfg.chunkSize
+	if chunkSize <= 0 {
+		chunkSize = 8 << 20
+	}
 	cm, err := cache.NewCacheManager(&cache.CacheConfig{
 		NVMePath:    t.TempDir(),
 		MaxNVMeSize: 64 << 20,
-		ChunkSize:   8 << 20,
+		ChunkSize:   chunkSize,
 		// No Coordinator on the cache config would give it a no-op peer
 		// tier; passing the real one means a global read is reached only
 		// after the peer tier has genuinely missed, as in production.
@@ -237,6 +284,45 @@ func (c *cluster) read(path string) ([]byte, bool) {
 		return nil, false
 	}
 	return entry.Data, true
+}
+
+// writeThroughCache writes path the way the FUSE mount and the HTTP
+// streaming PUT do: stage a file on NVMe, then commit it with PutFromFile.
+// Unlike writeAndPublish, nothing here touches the coordinator or the bucket
+// directly -- the cache's own background persist has to upload the chunks
+// and publish the parent row, which is the path I2 fixes.
+func (c *cluster) writeThroughCache(t *testing.T, path string, data []byte) {
+	t.Helper()
+	ctx := context.Background()
+	f, staged, err := c.cm.CreateWriteFile(ctx, path)
+	if err != nil {
+		t.Fatalf("%s: stage %s: %v", c.id, path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatalf("%s: stage write %s: %v", c.id, path, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("%s: stage close %s: %v", c.id, path, err)
+	}
+	if err := c.cm.PutFromFile(ctx, path, staged, int64(len(data)), time.Now()); err != nil {
+		t.Fatalf("%s: PutFromFile %s: %v", c.id, path, err)
+	}
+}
+
+// waitDurable blocks on the durability receipt API until path is persisted.
+func (c *cluster) waitDurable(t *testing.T, path string) *cache.DurabilityReceipt {
+	t.Helper()
+	r, err := c.cm.DurabilityReceipt(context.Background(), cache.DurabilityRequest{
+		Paths: []string{path},
+		Wait:  20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("%s: durability receipt for %s: %v", c.id, path, err)
+	}
+	if !r.Durable {
+		t.Fatalf("%s: %s never became durable: %+v", c.id, path, r.Paths)
+	}
+	return r
 }
 
 // waitFor polls a condition rather than sleeping past a deadline. The

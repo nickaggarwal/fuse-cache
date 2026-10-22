@@ -26,7 +26,10 @@ import (
 	"github.com/gorilla/mux"
 )
 
-const maxUploadSize = 2 * 1024 * 1024 * 1024 // 2GB
+// defaultMaxUploadSize caps PUT /api/files bodies unless SetMaxUploadSize
+// raises it. Model shards (3-10 GB safetensors) need more; the body streams
+// to an NVMe staging file either way, so the cap bounds disk, not heap.
+const defaultMaxUploadSize = 2 * 1024 * 1024 * 1024 // 2GB
 
 const (
 	defaultNetProbeBytes = 1 * 1024 * 1024
@@ -51,6 +54,8 @@ type Handler struct {
 	// warmJobs tracks async /api/cache/warm passes so callers can poll them.
 	// Zero value is usable; the map is created on first start.
 	warmJobs warmJobs
+	// maxUploadBytes overrides defaultMaxUploadSize when > 0.
+	maxUploadBytes atomic.Int64
 	// mountHealthy reports whether the FUSE mount is currently being served.
 	// Unset means "not supervised" and health reports healthy, which keeps
 	// callers that mount nothing on the same handler. Atomic because the
@@ -166,9 +171,14 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache", h.handleCache).Methods("GET")
 	router.HandleFunc("/api/cache/stats", h.handleCacheStats).Methods("GET")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarm).Methods("POST")
+	router.HandleFunc("/api/cache/warm-files", h.handleCacheWarmFiles).Methods("POST")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
+	// Durability barrier/receipt for artifact consumers (pod-snapshotter
+	// restore eligibility). POST because a receipt may block and may kick
+	// retries; GET is the same query without side effects.
+	router.HandleFunc("/api/cache/durable", h.handleCacheDurable).Methods("POST", "GET")
 	// Declarative warm intents: the non-CSI entrance to the same registry the
 	// session hook writes to, so the reconciler is reachable on a cluster
 	// without the CSI node plugin. /reconcile is registered before the
@@ -242,9 +252,20 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, ctx context.Context, file
 	h.logger.Printf("Served file: %s (%d bytes)", filePath, n)
 }
 
+// SetMaxUploadSize sets the PUT body cap; n <= 0 restores the default.
+func (h *Handler) SetMaxUploadSize(n int64) { h.maxUploadBytes.Store(n) }
+
+func (h *Handler) maxUpload() int64 {
+	if n := h.maxUploadBytes.Load(); n > 0 {
+		return n
+	}
+	return defaultMaxUploadSize
+}
+
 // handleFilePut handles PUT requests for files
 func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx context.Context, filePath string) {
 	// Early rejection based on Content-Length header
+	maxUploadSize := h.maxUpload()
 	if r.ContentLength > maxUploadSize {
 		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 		return
@@ -556,6 +577,7 @@ func (h *Handler) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		for k, v := range dcm.GetMetrics() {
 			stats[k] = v
 		}
+		stats["durability"] = dcm.DurabilitySnapshot()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -941,6 +963,13 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	// Cluster-wide delete: every tier that can silently keep a copy after an
 	// rm. Non-zero means orphaned bytes somewhere, which is unenumerable
 	// otherwise.
+	// Durability backlog: "failed" non-zero means artifacts acked locally
+	// are not yet node-loss safe and their uploads are being retried.
+	durab := dcm.DurabilitySnapshot()
+	for _, st := range []string{"local", "uploading", "persisted", "failed"} {
+		fmt.Fprintf(w, "fuse_durability_paths{state=%q} %d\n", st, durab[st])
+	}
+
 	ds := dcm.DeleteSnapshot()
 	fmt.Fprintf(w, "fuse_delete_peer_failures_total %d\n", ds.PeerFailuresTotal)
 	fmt.Fprintf(w, "fuse_delete_cloud_failures_total %d\n", ds.CloudFailuresTotal)

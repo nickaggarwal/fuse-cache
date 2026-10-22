@@ -380,6 +380,10 @@ type DefaultCacheManager struct {
 	// deleted paths, so a background persist or chunk completion that was
 	// already in flight cannot re-advertise a file that is gone.
 	tombstones *deleteTombstones
+	// durability tracks per-path cloud persist state and journals pending
+	// uploads so they survive a restart (durability.go). nil in tests that
+	// build the manager literally: a nil tracker tracks nothing.
+	durability *durabilityTracker
 	readerHeat readerHeat
 	// warmIntents holds declarative CSI warmup intents this node must keep
 	// re-asserting (warm_reconciler.go).
@@ -664,6 +668,12 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// dir holds everything the previous process landed, so budgets and LRU
 	// silently exclude pre-restart files.
 	cm.rehydrateNVMeAccounting()
+
+	// Resume uploads the previous process acked locally but never finished
+	// (I1). Loaded after rehydration so resumed chunked files get their shape
+	// back on the entry rehydration adopted as a plain file, and before the
+	// evictor so nothing pending is ever judged by a stale bit.
+	cm.initDurability()
 
 	// Background watermark evictor: keeps NVMe inside the pressure band so
 	// foreground writes (almost) never pay the eviction scan, and reacts to
@@ -1352,7 +1362,12 @@ func (cm *DefaultCacheManager) Put(ctx context.Context, entry *CacheEntry) error
 		dataCopy := make([]byte, len(entry.Data))
 		copy(dataCopy, entry.Data)
 		filePath := entry.FilePath
-		cm.goBackground(func() { cm.persistToCloud(cm.shutdownCtx, filePath, dataCopy) })
+		gen := cm.durability.begin(filePath, persistShape{Size: int64(len(dataCopy))})
+		cm.goBackground(func() {
+			cm.runTrackedPersist(filePath, gen, func() error {
+				return cm.persistToCloudGen(cm.shutdownCtx, filePath, dataCopy, filePath, gen)
+			})
+		})
 		cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 
 		return nil
@@ -1505,9 +1520,16 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	cm.mu.Lock()
 	cm.entries.put(meta)
 	cm.mu.Unlock()
-	cm.goBackground(func() { cm.publishFileLocation(context.Background(), meta, TierNVMe) })
 	fp, nc := filePath, numChunks
-	cm.goBackground(func() { cm.persistChunkedFileToCloud(cm.shutdownCtx, fp, nc) })
+	gen := cm.durability.begin(fp, persistShape{
+		Size: size, IsChunked: true, ChunkSize: cm.config.ChunkSize, NumChunks: nc,
+	})
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), meta, TierNVMe) })
+	cm.goBackground(func() {
+		cm.runTrackedPersist(fp, gen, func() error {
+			return cm.persistChunkedFileToCloudGen(cm.shutdownCtx, fp, nc, gen)
+		})
+	})
 	return nil
 }
 
@@ -1600,10 +1622,26 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	cm.mu.Unlock()
 	cm.metrics.RecordWrite(size)
 
+	// Journalled before PutFromFile returns (and so before FUSE Flush acks),
+	// so a crash after the ack resumes the upload instead of forgetting it.
+	gen := cm.durability.begin(filePath, persistShape{
+		Size: size, IsChunked: isChunked, ChunkSize: chunkSize, NumChunks: numChunks,
+	})
+
 	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
+	fp, fp2, nc := filePath, finalPath, numChunks
 	if isChunked {
-		fp, fp2, nc := filePath, finalPath, numChunks
-		cm.goBackground(func() { cm.persistWholeFileAsChunksToCloud(cm.shutdownCtx, fp, fp2, nc) })
+		cm.goBackground(func() {
+			cm.runTrackedPersist(fp, gen, func() error {
+				return cm.persistWholeFileAsChunksToCloudGen(cm.shutdownCtx, fp, fp2, nc, gen)
+			})
+		})
+	} else {
+		cm.goBackground(func() {
+			cm.runTrackedPersist(fp, gen, func() error {
+				return cm.persistWholeLocalFileToCloud(cm.shutdownCtx, fp, fp2, gen)
+			})
+		})
 	}
 	return nil
 }
@@ -2142,16 +2180,35 @@ func isPathPinned(path string, prefixes []string) bool {
 	return false
 }
 
-// persistToCloud writes data to cloud storage with retry. It is always called
-// inside a goBackground goroutine. ctx should be the shutdownCtx so that retry
-// sleeps are interruptible during shutdown.
-func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath string, data []byte) {
+// persistToCloud writes data to cloud storage with retry and publishes the
+// cloud-tier location row. It is always called inside a goBackground
+// goroutine. ctx should be the shutdownCtx so that retry sleeps are
+// interruptible during shutdown. The error is the durability outcome:
+// nil only when the object is confirmed written.
+func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath string, data []byte) error {
+	return cm.persistToCloudGen(ctx, filePath, data, filePath, 0)
+}
+
+// errPersistCancelled reports an upload interrupted by shutdown. The durable
+// state is unchanged ("local"), so a restart resumes it.
+var errPersistCancelled = errors.New("persist cancelled: shutdown")
+
+// persistToCloudGen is persistToCloud on behalf of a tracked write: owner is
+// the logical path whose durability this object contributes to (the parent
+// for a chunk) and gen that write's generation. If a newer write of owner
+// supersedes gen mid-upload, the object is still written (harmless; the new
+// write uploads over it) but nothing is marked or published for it, so a
+// stale upload can never certify the newer bytes. gen == 0 means untracked.
+func (cm *DefaultCacheManager) persistToCloudGen(ctx context.Context, filePath string, data []byte, owner string, gen uint64) error {
+	if cm.cloudStorage == nil {
+		return errors.New("no cloud tier configured")
+	}
 	var lastErr error
 	for attempt := 0; attempt < cm.config.CloudRetryCount; attempt++ {
 		select {
 		case <-ctx.Done():
 			cm.logger.Printf("Cloud persist cancelled for %s (shutdown)", filePath)
-			return
+			return errPersistCancelled
 		default:
 		}
 		// Re-checked every attempt, not just on entry: a delete can land
@@ -2161,13 +2218,19 @@ func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath stri
 		// local bytes are already gone.
 		if cm.tombstoned(filePath) {
 			cm.logger.Printf("Cloud persist of %s abandoned: deleted", filePath)
-			return
+			return errPersistAbandoned
+		}
+		if cm.persistSuperseded(owner, gen) {
+			return errPersistAbandoned
 		}
 		callCtx, cancel := context.WithTimeout(ctx, cm.config.CloudTimeout)
 		err := cm.cloudStorage.Write(callCtx, filePath, data)
 		cancel()
 
 		if err == nil {
+			if cm.persistSuperseded(owner, gen) {
+				return errPersistAbandoned
+			}
 			cm.logger.Printf("Persisted %s (%d bytes) to cloud storage", filePath, len(data))
 			cm.markPersistedToCloud(filePath)
 			// Already in a background goroutine; call synchronously to stay tracked.
@@ -2178,7 +2241,7 @@ func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath stri
 				LastAccessed: time.Now(),
 				Tier:         TierCloud,
 			}, TierCloud)
-			return
+			return nil
 		}
 
 		lastErr = err
@@ -2187,26 +2250,53 @@ func (cm *DefaultCacheManager) persistToCloud(ctx context.Context, filePath stri
 			attempt+1, cm.config.CloudRetryCount, filePath, err, wait)
 		select {
 		case <-ctx.Done():
-			return
+			return errPersistCancelled
 		case <-time.After(wait):
 		}
 	}
 
-	cm.logger.Printf("CRITICAL: All %d cloud persist attempts failed for %s: %v",
+	cm.logger.Printf("CRITICAL: All %d cloud persist attempts failed for %s: %v (durability tracker will retry)",
 		cm.config.CloudRetryCount, filePath, lastErr)
+	return fmt.Errorf("cloud persist of %s failed after %d attempts: %w", filePath, cm.config.CloudRetryCount, lastErr)
 }
 
 // persistChunkedFileToCloud persists chunk objects so hybrid peer+cloud range
 // reads can use both tiers for large files. ctx should be shutdownCtx.
-func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, filePath string, numChunks int64) {
-	if numChunks <= 0 || cm.cloudStorage == nil || cm.nvmeStorage == nil {
-		return
+func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, filePath string, numChunks int64) error {
+	return cm.persistChunkedFileToCloudGen(ctx, filePath, numChunks, 0)
+}
+
+// persistChunkedFileToCloudGen uploads per-chunk NVMe objects and, only when
+// every chunk landed, flips and publishes the parent. Returns the first chunk
+// failure; a partially uploaded file is never reported or published as
+// persisted.
+func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context, filePath string, numChunks int64, gen uint64) error {
+	if numChunks <= 0 {
+		return fmt.Errorf("persist %s: invalid chunk count %d", filePath, numChunks)
+	}
+	if cm.cloudStorage == nil || cm.nvmeStorage == nil {
+		return errors.New("no cloud or NVMe tier configured")
 	}
 
 	// Persist concurrency scales with backlog: a 640-chunk checkpoint gets
 	// the max pool, a 3-chunk file the floor (the old fixed cap of 8
 	// throttled multi-GB uploads).
 	workers := cm.persistWorkersFor(numChunks)
+
+	var errMu sync.Mutex
+	var firstErr error
+	setErr := func(err error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+	}
+	failed := func() bool {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr != nil
+	}
 
 	jobs := make(chan int64, workers*2)
 	var wg sync.WaitGroup
@@ -2217,16 +2307,26 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 			for idx := range jobs {
 				select {
 				case <-ctx.Done():
+					setErr(errPersistCancelled)
 					return
 				default:
+				}
+				if failed() {
+					// One chunk already failed: the file cannot become
+					// persisted on this pass, so stop spending uploads on it.
+					// The tracker retries the whole file.
+					continue
 				}
 				chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, idx)
 				data, err := cm.nvmeStorage.Read(ctx, chunkPath)
 				if err != nil {
 					cm.logger.Printf("Chunk cloud persist skipped for %s: %v", chunkPath, err)
+					setErr(fmt.Errorf("chunk %s unreadable on NVMe: %w", chunkPath, err))
 					continue
 				}
-				cm.persistToCloud(ctx, chunkPath, data)
+				if err := cm.persistToCloudGen(ctx, chunkPath, data, filePath, gen); err != nil {
+					setErr(err)
+				}
 			}
 		}()
 	}
@@ -2236,14 +2336,83 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloud(ctx context.Context, fi
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
-			return
+			return errPersistCancelled
 		case jobs <- idx:
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	if cm.persistSuperseded(filePath, gen) {
+		return errPersistAbandoned
+	}
 
-	cm.publishChunkedParentToCloud(ctx, filePath, numChunks)
+	cm.completeChunkedPersist(ctx, filePath, numChunks, gen)
+	return nil
+}
+
+// persistSuperseded reports whether a newer write of path replaced generation
+// gen. Untracked uploads (gen 0) are never superseded.
+func (cm *DefaultCacheManager) persistSuperseded(path string, gen uint64) bool {
+	return gen != 0 && !cm.durability.current(path, gen)
+}
+
+// completeChunkedPersist runs once every chunk of path is in the cloud: it
+// flips the parent's PersistedToCloud bit and publishes the ONE cloud-tier
+// parent row the global index and cross-node readers resolve.
+//
+// The parent is flipped explicitly rather than left to markPersistedToCloud's
+// sibling scan, because whole-file writes (PutFromFile) have no chunk rows to
+// scan and that loop never fired for them.
+func (cm *DefaultCacheManager) completeChunkedPersist(ctx context.Context, filePath string, numChunks int64, gen uint64) {
+	var shape persistShape
+	haveShape := false
+	if rec, ok := cm.durability.get(filePath); ok && (gen == 0 || rec.gen == gen) && rec.IsChunked {
+		shape = rec.shape()
+		haveShape = true
+	}
+	cm.mu.Lock()
+	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.IsChunked {
+		if !haveShape || parent.Size == shape.Size {
+			parent.PersistedToCloud = true
+			if !haveShape {
+				shape = persistShape{
+					Size:      parent.Size,
+					IsChunked: true,
+					ChunkSize: cm.effectiveChunkSize(parent),
+					NumChunks: numChunks,
+				}
+				haveShape = true
+			}
+		}
+	}
+	cm.mu.Unlock()
+	if !haveShape {
+		// Nothing describes the file (no entry, no record): the chunks are
+		// durable but there is no honest size to publish.
+		return
+	}
+	if shape.NumChunks <= 0 {
+		shape.NumChunks = numChunks
+	}
+	cm.publishCloudParentRow(ctx, filePath, shape)
+}
+
+// publishCloudParentRow records that the whole of filePath is in object
+// storage.
+func (cm *DefaultCacheManager) publishCloudParentRow(ctx context.Context, filePath string, shape persistShape) {
+	cm.publishFileLocation(ctx, &CacheEntry{
+		FilePath:     filePath,
+		StoragePath:  filePath,
+		Size:         shape.Size,
+		LastAccessed: time.Now(),
+		Tier:         TierCloud,
+		IsChunked:    shape.IsChunked,
+		NumChunks:    shape.NumChunks,
+		ChunkSize:    shape.ChunkSize,
+	}, TierCloud)
 }
 
 // publishChunkedParentToCloud records a cloud-tier location row for the
@@ -2546,37 +2715,98 @@ func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, 
 	}, nil
 }
 
-func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(ctx context.Context, filePath string, localPath string, numChunks int64) {
+func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloud(ctx context.Context, filePath string, localPath string, numChunks int64) error {
+	return cm.persistWholeFileAsChunksToCloudGen(ctx, filePath, localPath, numChunks, 0)
+}
+
+// persistWholeFileAsChunksToCloudGen uploads a whole local file (the
+// PutFromFile shape) as chunk objects. It stops at the first failed chunk and
+// returns its error; only after every chunk is confirmed does it flip the
+// parent and publish the single parent cloud row. Before I1/I2 this path
+// skipped failed chunks silently and never published a parent row, so large
+// FUSE/HTTP writes were neither tracked as durable nor globally discoverable.
+func (cm *DefaultCacheManager) persistWholeFileAsChunksToCloudGen(ctx context.Context, filePath string, localPath string, numChunks int64, gen uint64) error {
+	return cm.persistWholeFileAsChunksStride(ctx, filePath, localPath, numChunks, cm.config.ChunkSize, gen)
+}
+
+// persistWholeFileAsChunksStride is the uploader with an explicit stride. A
+// resumed upload must slice at the stride the file was committed with, which
+// differs from this process's flag after a -chunk-size change.
+func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Context, filePath string, localPath string, numChunks, chunkSize int64, gen uint64) error {
+	if numChunks <= 0 {
+		return fmt.Errorf("persist %s: invalid chunk count %d", filePath, numChunks)
+	}
+	if chunkSize <= 0 {
+		chunkSize = cm.config.ChunkSize
+	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		cm.logger.Printf("Chunk cloud persist open failed for %s: %v", filePath, err)
-		return
+		return fmt.Errorf("open local copy of %s: %w", filePath, err)
 	}
 	defer f.Close()
 
-	buf := make([]byte, cm.config.ChunkSize)
+	buf := make([]byte, chunkSize)
+	var total int64
+	var uploaded int64
 	for i := int64(0); i < numChunks; i++ {
 		select {
 		case <-ctx.Done():
-			return
+			return errPersistCancelled
 		default:
+		}
+		if cm.persistSuperseded(filePath, gen) {
+			return errPersistAbandoned
 		}
 		n, readErr := io.ReadFull(f, buf)
 		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
 			cm.logger.Printf("Chunk cloud persist read failed for %s chunk=%d: %v", filePath, i, readErr)
-			return
+			return fmt.Errorf("read chunk %d of %s: %w", i, filePath, readErr)
 		}
 		if n <= 0 {
-			return
+			break
 		}
 		chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, i)
 		chunkData := make([]byte, n)
 		copy(chunkData, buf[:n])
-		cm.persistToCloud(ctx, chunkPath, chunkData)
+		if err := cm.persistToCloudGen(ctx, chunkPath, chunkData, filePath, gen); err != nil {
+			return err
+		}
+		total += int64(n)
+		uploaded++
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-			return
+			break
 		}
 	}
+	if uploaded != numChunks {
+		// The local file is shorter than the metadata says: the chunk set in
+		// the cloud cannot reassemble the file the parent row would describe.
+		return fmt.Errorf("persist %s: local copy yielded %d of %d chunks", filePath, uploaded, numChunks)
+	}
+	if cm.persistSuperseded(filePath, gen) {
+		return errPersistAbandoned
+	}
+
+	shape := persistShape{Size: total, IsChunked: true, ChunkSize: chunkSize, NumChunks: numChunks}
+	cm.mu.Lock()
+	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.Size == total {
+		parent.PersistedToCloud = true
+	}
+	cm.mu.Unlock()
+	cm.publishCloudParentRow(ctx, filePath, shape)
+	return nil
+}
+
+// persistWholeLocalFileToCloud uploads an unchunked staged file (PutFromFile
+// at or under the chunk size). This path previously did not exist: small
+// files written through FUSE or HTTP streaming were never uploaded at all, so
+// they stayed NVMe-only and unevictable forever.
+func (cm *DefaultCacheManager) persistWholeLocalFileToCloud(ctx context.Context, filePath, localPath string, gen uint64) error {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("read local copy of %s: %w", filePath, err)
+	}
+	return cm.persistToCloudGen(ctx, filePath, data, filePath, gen)
 }
 
 func (cm *DefaultCacheManager) getStorageForTier(tier CacheTier) TierStorage {
@@ -2709,9 +2939,16 @@ func (cm *DefaultCacheManager) putChunked(ctx context.Context, entry *CacheEntry
 	cm.mu.Lock()
 	cm.entries.put(entry)
 	cm.mu.Unlock()
-	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 	fp, nc := entry.FilePath, numChunks
-	cm.goBackground(func() { cm.persistChunkedFileToCloud(cm.shutdownCtx, fp, nc) })
+	gen := cm.durability.begin(fp, persistShape{
+		Size: dataLen, IsChunked: true, ChunkSize: cm.config.ChunkSize, NumChunks: nc,
+	})
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
+	cm.goBackground(func() {
+		cm.runTrackedPersist(fp, gen, func() error {
+			return cm.persistChunkedFileToCloudGen(cm.shutdownCtx, fp, nc, gen)
+		})
+	})
 
 	return nil
 }
@@ -3053,6 +3290,29 @@ func (cm *DefaultCacheManager) resolveChunkedEntry(ctx context.Context, filePath
 	defer cancel()
 	locations, err := cm.config.Coordinator.GetFileLocation(callCtx, filePath)
 	if err != nil {
+		return nil, false
+	}
+
+	if len(locations) == 0 {
+		// This cluster positively knows nothing about the path. With global
+		// read on, another cluster may have published it as a chunked file,
+		// whose bytes exist only as "<file>_chunk_N" objects under that
+		// cluster's prefix. Without learning the shape here, Get reads the
+		// parent as one object, which does not exist, and the read misses.
+		//
+		// Gated on "no local rows, no local bytes" so a path this cluster
+		// holds is never shadowed by a remote version (local wins, per the
+		// shared-bucket layout test), and an unchunked remote row falls
+		// through to the ordinary cloud-miss -> getFromGlobal path.
+		if cm.globalResolver() != nil && (cm.nvmeStorage == nil || !cm.nvmeStorage.Exists(ctx, filePath)) {
+			if loc, ok := cm.resolveGlobalFile(ctx, filePath); ok && loc.IsChunked {
+				resolved := cm.entryFromGlobal(loc)
+				cm.mu.Lock()
+				cm.entries.put(resolved)
+				cm.mu.Unlock()
+				return resolved, true
+			}
+		}
 		return nil, false
 	}
 

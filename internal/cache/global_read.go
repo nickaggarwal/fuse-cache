@@ -100,9 +100,20 @@ func (cm *DefaultCacheManager) getFromGlobal(ctx context.Context, path string) (
 		return nil, false
 	}
 
+	// A chunk object has no row of its own: the global index holds one row
+	// per FILE (globalsync.publishable drops chunk rows), so a chunk read
+	// resolves its parent and derives the chunk key from the parent's
+	// prefix (remoteObjectKey). Resolving the chunk path itself would miss
+	// on every chunk of every cross-cluster chunked file.
+	resolvePath := path
+	parent, isChunk := parentFilePathFromChunkPath(path)
+	if isChunk {
+		resolvePath = parent
+	}
+
 	cm.globalStats.lookups.Add(1)
 	callCtx, cancel := context.WithTimeout(ctx, globalReadTimeout)
-	res, err := resolver.ResolveGlobal(callCtx, path)
+	res, err := resolver.ResolveGlobal(callCtx, resolvePath)
 	cancel()
 	if err != nil {
 		// Advisory: a coordinator that cannot answer leaves the read exactly
@@ -118,6 +129,11 @@ func (cm *DefaultCacheManager) getFromGlobal(ctx context.Context, path string) (
 
 	localBucket := reader.BucketName()
 	for _, loc := range res.Locations {
+		if isChunk && loc != nil && !loc.IsChunked {
+			// The remote file is a single object; "<file>_chunk_N" does not
+			// exist under its prefix.
+			continue
+		}
 		key, ok := remoteObjectKey(loc, path)
 		if !ok {
 			continue
@@ -153,6 +169,77 @@ func (cm *DefaultCacheManager) getFromGlobal(ctx context.Context, path string) (
 		return data, true
 	}
 	return nil, false
+}
+
+// resolveGlobalFile returns the first row another cluster published for the
+// FILE path that this cluster can actually read (same bucket, raw-key
+// capable backend). It is the metadata half of the global path: it lets a
+// reader learn a remote file's shape (size, chunked, stride) so chunked files
+// are assembled from chunk keys and the FUSE mount can stat the path.
+//
+// Chunk paths are never resolved here, and an unready or erroring resolver is
+// a miss: like getFromGlobal, every non-answer means "not found".
+func (cm *DefaultCacheManager) resolveGlobalFile(ctx context.Context, path string) (*coordinator.GlobalLocation, bool) {
+	if _, isChunk := parentFilePathFromChunkPath(path); isChunk {
+		return nil, false
+	}
+	resolver := cm.globalResolver()
+	if resolver == nil {
+		return nil, false
+	}
+	reader, ok := cm.cloudStorage.(rawKeyReader)
+	if !ok {
+		return nil, false
+	}
+	callCtx, cancel := context.WithTimeout(ctx, globalReadTimeout)
+	res, err := resolver.ResolveGlobal(callCtx, path)
+	cancel()
+	if err != nil {
+		cm.globalStats.resolveErrors.Add(1)
+		return nil, false
+	}
+	if res == nil {
+		return nil, false
+	}
+	localBucket := reader.BucketName()
+	for _, loc := range res.Locations {
+		if loc == nil || loc.FilePath != path || loc.FileSize < 0 {
+			continue
+		}
+		if !sameBucket(loc.Bucket, localBucket) {
+			continue
+		}
+		if loc.IsChunked && loc.FileSize == 0 {
+			continue
+		}
+		return loc, true
+	}
+	return nil, false
+}
+
+// entryFromGlobal converts a remote row into the metadata a local reader
+// needs. Tier is cloud: the bytes are object-storage-only from here.
+func (cm *DefaultCacheManager) entryFromGlobal(loc *coordinator.GlobalLocation) *CacheEntry {
+	e := &CacheEntry{
+		FilePath:     loc.FilePath,
+		StoragePath:  loc.FilePath,
+		Size:         loc.FileSize,
+		LastAccessed: time.Now(),
+		Tier:         TierCloud,
+	}
+	if loc.PublishedAt > 0 {
+		e.LastAccessed = time.Unix(loc.PublishedAt, 0)
+	}
+	if loc.IsChunked {
+		chunkSize := loc.ChunkSize
+		if chunkSize <= 0 {
+			chunkSize = cm.config.ChunkSize
+		}
+		e.IsChunked = true
+		e.ChunkSize = chunkSize
+		e.NumChunks = chunkCountFor(loc.FileSize, chunkSize)
+	}
+	return e
 }
 
 // remoteObjectKey builds the key to read for path, given a row published by

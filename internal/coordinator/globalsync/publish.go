@@ -1,6 +1,8 @@
 package globalsync
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,19 +51,50 @@ type publishQueue struct {
 	// pending: a path can be past its window and still have nothing queued.
 	lastPub map[string]time.Time
 
+	// touched records when a LIVE intent (publish or withdraw) was last
+	// queued for a path. Republish consults it so a row read from the
+	// location table before a delete cannot be re-sent after the withdraw
+	// already went out -- see Republish.
+	touched map[string]time.Time
+	// holdSince, when non-zero, is the table-read time of a running
+	// republish pass; touched entries at or after it are not GC'd.
+	holdSince time.Time
+
+	// repPending counts republish-sourced intents still queued; repDropped
+	// counts those discarded for depth. A pass is complete only when its
+	// rows have left the queue by being sent.
+	repPending int
+	repDropped uint64
+	// repInflight counts republish rows drained but not yet acknowledged as
+	// sent (AckSent) or returned (Requeue). sendFailures counts Requeues of
+	// upserts, so a pass can tell "left the queue by being sent" from "left
+	// the queue and bounced".
+	repInflight  int
+	sendFailures uint64
+
 	dropped uint64
+	// droppedWithdrawals is the subset of dropped that were withdrawals.
+	// Republish re-sends dropped upserts from the location table; it cannot
+	// recover a dropped withdraw (the path is gone locally, and the CP does
+	// not tell a cluster which of its own rows it holds), so these are the
+	// drops that remain unreconciled.
+	droppedWithdrawals uint64
 }
 
 type pending struct {
 	// loc is the row to upsert; nil means withdraw path.
 	loc  *pb.GlobalLocation
 	path string
+	// republish marks an intent queued by a reconciliation pass rather than
+	// by the live write path. A live intent for the same path replaces it.
+	republish bool
 }
 
 func newPublishQueue() *publishQueue {
 	return &publishQueue{
 		pending: make(map[string]*pending),
 		lastPub: make(map[string]time.Time),
+		touched: make(map[string]time.Time),
 	}
 }
 
@@ -86,12 +119,52 @@ func (q *publishQueue) Publish(loc *pb.GlobalLocation, now time.Time) bool {
 		// is not a second publish, so the window is untouched.
 		if p, queued := q.pending[path]; queued && p.loc != nil {
 			p.loc = loc
+			if p.republish {
+				// Now a live intent; it no longer belongs to a pass.
+				p.republish = false
+				q.repPending--
+			}
+			q.touched[path] = now
 			return true
 		}
 		return false
 	}
 	q.lastPub[path] = now
+	q.touched[path] = now
 	q.enqueueLocked(&pending{loc: loc, path: path})
+	return true
+}
+
+// Republish queues a reconciliation upsert read from the location table at
+// readAt. It returns false when the row was skipped.
+//
+// Three rules keep it from ever making the index less correct than live
+// publishing would:
+//
+//   - A pending intent for the path wins. It was queued by the live write
+//     path and is at least as new as the table read.
+//   - A live intent queued at or after readAt wins, even if it has already
+//     been sent. The table read may predate that write or delete, and
+//     re-sending the older row would resurrect a withdrawn path or roll back
+//     a newer size.
+//   - It does not touch the coalescing clock. A real write right after a
+//     republish must still publish immediately, not be suppressed as a
+//     duplicate of a reconciliation row.
+func (q *publishQueue) Republish(loc *pb.GlobalLocation, readAt time.Time) bool {
+	if loc == nil || loc.GetFilePath() == "" {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	path := loc.GetFilePath()
+	if _, queued := q.pending[path]; queued {
+		return false
+	}
+	if t, ok := q.touched[path]; ok && !t.Before(readAt) {
+		return false
+	}
+	q.enqueueLocked(&pending{loc: loc, path: path, republish: true})
 	return true
 }
 
@@ -111,12 +184,18 @@ func (q *publishQueue) Withdraw(path string, now time.Time) {
 	// path must publish immediately rather than be suppressed as a
 	// duplicate of the row we are about to delete.
 	delete(q.lastPub, path)
+	q.touched[path] = now
 	q.enqueueLocked(&pending{loc: nil, path: path})
 }
 
 func (q *publishQueue) enqueueLocked(p *pending) {
-	if _, exists := q.pending[p.path]; !exists {
+	if prev, exists := q.pending[p.path]; !exists {
 		q.order = append(q.order, p.path)
+	} else if prev.republish {
+		q.repPending--
+	}
+	if p.republish {
+		q.repPending++
 	}
 	q.pending[p.path] = p
 
@@ -127,9 +206,49 @@ func (q *publishQueue) enqueueLocked(p *pending) {
 	for len(q.order) > publishQueueDepth {
 		oldest := q.order[0]
 		q.order = q.order[1:]
-		delete(q.pending, oldest)
-		q.dropped++
+		q.dropLocked(oldest)
 	}
+}
+
+// dropLocked discards the pending intent for path and counts it. order may
+// hold stale paths whose intent was already drained; those are not drops.
+func (q *publishQueue) dropLocked(path string) {
+	p, ok := q.pending[path]
+	if !ok {
+		return
+	}
+	delete(q.pending, path)
+	q.dropped++
+	if p.loc == nil {
+		q.droppedWithdrawals++
+	}
+	if p.republish {
+		q.repPending--
+		q.repDropped++
+	}
+}
+
+// republishPending reports republish-sourced intents still queued or in
+// flight, and how many upsert sends have failed so far.
+func (q *publishQueue) republishPending() (int, uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.repPending + q.repInflight, q.sendFailures
+}
+
+// AckSent records that the last drained upsert batch reached the stream.
+// There is one sender, so at most one batch is ever in flight.
+func (q *publishQueue) AckSent() {
+	q.mu.Lock()
+	q.repInflight = 0
+	q.mu.Unlock()
+}
+
+// republishDropped reports republish-sourced intents ever dropped for depth.
+func (q *publishQueue) republishDropped() uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.repDropped
 }
 
 // Drain removes up to publishBatchMax intents and returns them split into
@@ -147,6 +266,10 @@ func (q *publishQueue) Drain() (upserts []*pb.GlobalLocation, withdrawals []stri
 			continue // superseded by a later intent that re-queued the path
 		}
 		delete(q.pending, path)
+		if p.republish {
+			q.repPending--
+			q.repInflight++
+		}
 		if p.loc != nil {
 			upserts = append(upserts, p.loc)
 		} else {
@@ -165,7 +288,29 @@ func (q *publishQueue) Drain() (upserts []*pb.GlobalLocation, withdrawals []stri
 			}
 		}
 	}
+	// Same for the live-intent clock, except that an entry newer than a
+	// running republish's table read must survive: it is what stops that
+	// pass from re-sending a row the live path already superseded.
+	if len(q.touched) > 2*publishQueueDepth {
+		cutoff := time.Now().Add(-10 * publishCoalesceWindow)
+		if !q.holdSince.IsZero() && q.holdSince.Before(cutoff) {
+			cutoff = q.holdSince
+		}
+		for k, t := range q.touched {
+			if t.Before(cutoff) {
+				delete(q.touched, k)
+			}
+		}
+	}
 	return upserts, withdrawals
+}
+
+// holdTouched pins live-intent timestamps at or after since against GC for
+// the duration of a republish pass; release with the zero time.
+func (q *publishQueue) holdTouched(since time.Time) {
+	q.mu.Lock()
+	q.holdSince = since
+	q.mu.Unlock()
 }
 
 // Requeue puts a failed batch back at the FRONT of the queue.
@@ -177,6 +322,13 @@ func (q *publishQueue) Drain() (upserts []*pb.GlobalLocation, withdrawals []stri
 func (q *publishQueue) Requeue(upserts []*pb.GlobalLocation, withdrawals []string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// Requeued rows go back as live intents; whatever pass drained them
+	// sees the failure through sendFailures and reports itself incomplete.
+	if len(upserts) > 0 {
+		q.repInflight = 0
+		q.sendFailures++
+	}
 
 	var front []string
 	add := func(p *pending) {
@@ -196,8 +348,7 @@ func (q *publishQueue) Requeue(upserts []*pb.GlobalLocation, withdrawals []strin
 	for len(q.order) > publishQueueDepth {
 		last := q.order[len(q.order)-1]
 		q.order = q.order[:len(q.order)-1]
-		delete(q.pending, last)
-		q.dropped++
+		q.dropLocked(last)
 	}
 }
 
@@ -218,6 +369,14 @@ func (q *publishQueue) Dropped() uint64 {
 	return q.dropped
 }
 
+// DroppedWithdrawals reports how many of the dropped intents were
+// withdrawals. Republish heals dropped upserts; it cannot heal these.
+func (q *publishQueue) DroppedWithdrawals() uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.droppedWithdrawals
+}
+
 // publishable reports whether this path may cross the cluster boundary.
 //
 // Two conditions, both required, and the second is the one that is easy to
@@ -225,11 +384,39 @@ func (q *publishQueue) Dropped() uint64 {
 // path is object storage only, so advertising a path whose only copy is on
 // a local NVMe tells another cluster to fetch something it structurally
 // cannot reach.
+//
+// A third rule: chunk objects never cross. A chunked file is published as one
+// parent row (IsChunked, ChunkSize, FileSize) once every chunk is in the
+// bucket, and readers derive "<file>_chunk_<n>" keys from it
+// (cache.remoteObjectKey). The cache still records a cloud row per chunk in
+// the LOCAL coordinator, and before this filter every one of them was queued
+// here too: a 640-chunk checkpoint put 640 rows into an index whose premise
+// is that it stays small, and could push real parent rows out of the
+// 4096-deep queue.
 func publishable(filePath, storageTier string, allowlist []string) bool {
 	if storageTier != tierCloud {
 		return false
 	}
+	if isChunkObjectPath(filePath) {
+		return false
+	}
 	return globalcp.MatchesAny(filePath, allowlist)
+}
+
+// chunkObjectSuffix mirrors the cache's chunk key layout. Duplicated for the
+// same import-cycle reason as tierCloud; the definition must stay identical
+// to cache.parentFilePathFromChunkPath (suffix after the LAST "_chunk_" must
+// parse as an integer), so a user file named "report_chunk_draft" still
+// publishes.
+const chunkObjectSuffix = "_chunk_"
+
+func isChunkObjectPath(path string) bool {
+	idx := strings.LastIndex(path, chunkObjectSuffix)
+	if idx <= 0 {
+		return false
+	}
+	_, err := strconv.ParseInt(path[idx+len(chunkObjectSuffix):], 10, 64)
+	return err == nil
 }
 
 // tierCloud is the StorageTier string the cache uses for object storage.
