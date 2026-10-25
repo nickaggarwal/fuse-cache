@@ -67,6 +67,32 @@ func TestReadRange_WholeLocalShortFileNotServed(t *testing.T) {
 	}
 }
 
+// The switch takes effect. Disabled, each window takes the per-chunk path and
+// synthesizes a full chunk from the whole file (a 200-byte window spanning a
+// boundary reads two 1 MiB chunks); enabled, it reads exactly the window and
+// the counter records it. Both return the same bytes.
+func TestReadRange_WholeFileSwitch(t *testing.T) {
+	const chunkSize = 1 << 20
+	for _, disabled := range []bool{true, false} {
+		cm, parent, _ := benchCacheManagerWithWholeFile(t, chunkSize, 2)
+		cm.config.DisableWholeFileRangeReads = disabled
+		want, _ := os.ReadFile(filepath.Join(cm.config.NVMePath, "bench-whole.bin"))
+		got, err := cm.ReadRange(context.Background(), parent, chunkSize-100, 200)
+		if err != nil || !bytes.Equal(got, want[chunkSize-100:chunkSize+100]) {
+			t.Fatalf("disabled=%v: %d bytes, err %v", disabled, len(got), err)
+		}
+		n := cm.metrics.WholeFileRangeReads.Load()
+		switch {
+		case disabled && n != 0:
+			t.Errorf("disabled: %d whole-file reads, want 0", n)
+		case !disabled && n != 1:
+			t.Errorf("enabled: %d whole-file reads, want 1", n)
+		case !disabled && cm.metrics.WholeFileRangeReadBytes.Load() != 200:
+			t.Errorf("enabled: read %d bytes for a 200-byte window", cm.metrics.WholeFileRangeReadBytes.Load())
+		}
+	}
+}
+
 // BenchmarkReadRange_WholeLocalChunked reads a 64 MiB whole local chunked
 // file end to end in 1 MiB FUSE windows (vLLM's safetensors loader pattern).
 func BenchmarkReadRange_WholeLocalChunked(b *testing.B) {

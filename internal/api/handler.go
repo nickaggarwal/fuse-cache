@@ -1032,6 +1032,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_cache_cloud_read_ops_total", metrics["cloud_read_ops"])
 	writeMetricLine(w, "fuse_cache_cloud_read_mbps", metrics["cloud_read_mbps"])
 	writeMetricLine(w, "fuse_range_prefetch_issued_total", metrics["prefetch_issued"])
+	writeMetricLine(w, "fuse_range_whole_file_reads_total", metrics["whole_file_range_reads"])
+	writeMetricLine(w, "fuse_range_whole_file_read_bytes_total", metrics["whole_file_range_read_bytes"])
 	writeMetricLine(w, "fuse_range_prefetch_hits_total", metrics["prefetch_hits"])
 	writeMetricLine(w, "fuse_range_prefetch_wasted_total", metrics["prefetch_wasted"])
 	writeMetricLine(w, "fuse_cache_read_wall_bytes_total", metrics["read_wall_bytes"])

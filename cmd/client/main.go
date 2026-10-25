@@ -87,6 +87,7 @@ func main() {
 		rangeChunkCache      = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
 		rangeChunkCacheMaxMB = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
 		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
+		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", true, "Serve windows of a chunked file straight from its whole local copy when one exists; false forces the per-chunk path (A/B and rollback). FUSE_RANGE_WHOLE_FILE_READS env overrides")
 		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
 		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
 		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
@@ -245,6 +246,7 @@ func main() {
 		ParallelRangeReads:         *parallelReads,
 		RangePrefetchChunks:        *prefetchChunks,
 		RangePrefetchMaxChunks:     *prefetchMaxChunks,
+		DisableWholeFileRangeReads: !*rangeWholeFileReads,
 		RangeChunkCacheSize:        *rangeChunkCache,
 		RangeChunkCacheMaxBytes:    int64(*rangeChunkCacheMaxMB) * 1024 * 1024,
 		RangePrefetchMaxBytes:      int64(*rangePrefetchMaxMB) * 1024 * 1024,
@@ -322,6 +324,15 @@ func main() {
 			logger.Printf("WARNING: invalid FUSE_RANGE_PREFETCH_CHUNKS value %q: %v", v, err)
 		}
 	}
+	if v := os.Getenv("FUSE_RANGE_WHOLE_FILE_READS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cacheConfig.DisableWholeFileRangeReads = !b
+			*rangeWholeFileReads = b
+		} else {
+			logger.Printf("WARNING: invalid FUSE_RANGE_WHOLE_FILE_READS value %q: %v", v, err)
+		}
+	}
+	logger.Printf("Range reads: whole-file local reads %v (FUSE_RANGE_WHOLE_FILE_READS / -range-whole-file-reads)", !cacheConfig.DisableWholeFileRangeReads)
 	if v := os.Getenv("FUSE_RANGE_PREFETCH_MAX_CHUNKS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			cacheConfig.RangePrefetchMaxChunks = n

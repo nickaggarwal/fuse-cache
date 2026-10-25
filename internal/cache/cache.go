@@ -222,6 +222,12 @@ type CacheConfig struct {
 	// RangePrefetchChunks up to this value; random access resets to the base.
 	RangePrefetchMaxChunks int
 
+	// DisableWholeFileRangeReads turns off serving windows of a chunked file
+	// straight from its whole local copy (readWholeChunkedRange), so every
+	// window takes the per-chunk path. Off by default; it exists to A/B the
+	// read path and as an env-only rollback (FUSE_RANGE_WHOLE_FILE_READS=0).
+	DisableWholeFileRangeReads bool
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
@@ -3017,10 +3023,12 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	// stride silently mis-slices every chunk boundary.
 	chunkSize := cm.effectiveChunkSize(entry)
 
-	if isChunked && entry != nil {
+	if isChunked && entry != nil && !cm.config.DisableWholeFileRangeReads {
 		// Whole local copy (warm, assembly, FUSE write): read just this
 		// window. The chunk path below would copy a full chunk per window.
 		if out, ok := cm.readWholeChunkedRange(ctx, filePath, entry.Size, offset, size); ok {
+			cm.metrics.WholeFileRangeReads.Add(1)
+			cm.metrics.WholeFileRangeReadBytes.Add(int64(len(out)))
 			dur := time.Since(started)
 			cm.metrics.RecordHit(TierNVMe)
 			cm.metrics.RecordTierRead(TierNVMe, int64(len(out)), dur)
@@ -4178,8 +4186,13 @@ type CacheMetrics struct {
 	// Readahead effectiveness: chunks launched, consumed by a foreground read,
 	// and evicted/invalidated without ever being read.
 	PrefetchIssued atomic.Int64
-	PrefetchHits   atomic.Int64
-	PrefetchWasted atomic.Int64
+	// WholeFileRangeReads counts windows of a chunked file served straight
+	// from its whole local copy, so a run can prove which read path served
+	// it rather than infer it from timing.
+	WholeFileRangeReads     atomic.Int64
+	WholeFileRangeReadBytes atomic.Int64
+	PrefetchHits            atomic.Int64
+	PrefetchWasted          atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
 	// the all-files byte budget, and idle-expiry sweeps.
 	RangeCacheFileEvictions atomic.Int64
@@ -4360,6 +4373,8 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"cloud_read_wall_bytes":        cloudReadWall,
 		"read_wall_other_bytes":        readWallOther,
 		"prefetch_issued":              m.PrefetchIssued.Load(),
+		"whole_file_range_reads":       m.WholeFileRangeReads.Load(),
+		"whole_file_range_read_bytes":  m.WholeFileRangeReadBytes.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),
 		"prefetch_wasted":              m.PrefetchWasted.Load(),
 		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),
