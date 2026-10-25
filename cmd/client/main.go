@@ -87,7 +87,7 @@ func main() {
 		rangeChunkCache      = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
 		rangeChunkCacheMaxMB = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
 		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
-		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", true, "Serve windows of a chunked file straight from its whole local copy when one exists; false forces the per-chunk path (A/B and rollback). FUSE_RANGE_WHOLE_FILE_READS env overrides")
+		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", false, "Serve windows of a chunked file straight from its whole local copy (exact bytes, no read amplification) instead of the per-chunk path. Off by default: it has no read-ahead, so on fast local NVMe it is slower than the prefetching chunk path (A100 node, page cache dropped: 21.1 s vs 8.7 s for 15 GB). FUSE_RANGE_WHOLE_FILE_READS env overrides")
 		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
 		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
 		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")

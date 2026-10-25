@@ -224,8 +224,12 @@ type CacheConfig struct {
 
 	// DisableWholeFileRangeReads turns off serving windows of a chunked file
 	// straight from its whole local copy (readWholeChunkedRange), so every
-	// window takes the per-chunk path. Off by default; it exists to A/B the
-	// read path and as an env-only rollback (FUSE_RANGE_WHOLE_FILE_READS=0).
+	// window takes the per-chunk path. The client sets it unless
+	// -range-whole-file-reads / FUSE_RANGE_WHOLE_FILE_READS=1: the whole-file
+	// path reads exactly the requested bytes but issues them one window at a
+	// time with no read-ahead, and on fast local NVMe the prefetching chunk
+	// path wins (A100 node, page cache dropped, 15 GB: 8.7 s vs 21.1 s). The
+	// zero value keeps library callers and tests on the whole-file path.
 	DisableWholeFileRangeReads bool
 
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
