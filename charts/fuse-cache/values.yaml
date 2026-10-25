@@ -66,10 +66,13 @@ nodeInit:
   # reads the host mount table and, for a large raw/unformatted local NVMe,
   # formats it ext4 and mounts it, so the client uses the full NVMe (e.g.
   # ~700 GiB) instead of the small temp disk; falls open to the static -nvme
-  # path if discovery fails. Left OFF by default because it FORMATS a raw disk
-  # (safe only on empty, non-OS, unmounted disks — guarded, but destructive):
-  # enable per node pool once you've confirmed the target disk layout.
-  enabled: false
+  # path if discovery fails. On by default: without it the cache lands on the
+  # small temp disk (/mnt, ~250 MB/s on NC A100 v4) and the 960 GB NVMe sits
+  # unformatted. It only ever formats a disk with no filesystem signature, no
+  # partitions, no holders, not mounted, and not the OS disk; anything else is
+  # skipped and logged. Set false on pools whose spare disks must stay blank.
+  # Needs the pod's hostPID (set below) so its mounts reach the host.
+  enabled: true
   hostRootContainerPath: /host
   configPath: /var/run/fuse-client/node-init.json
   cacheSubdir: fuse-cache
