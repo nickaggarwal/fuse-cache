@@ -2,6 +2,7 @@ package nodeinit
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,29 @@ const (
 var runCmd = func(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	return string(out), err
+}
+
+// logf reports why a raw disk was skipped; injectable for tests.
+var logf = log.Printf
+
+// mountVisible reports whether device is mounted at mountPoint in the host's
+// mount table; injectable for tests. prepareRawDisk mounts through
+// "nsenter -t 1", which only reaches the host when the pod has hostPID.
+// Without it, PID 1 is the container itself: the mount lands in a namespace
+// that dies with the container, and the cache dir is then created on
+// whatever disk backs <HostRoot>/<mountPoint> — the OS or temp disk, with
+// the config still naming the NVMe.
+var mountVisible = func(hostRoot, device, mountPoint string) bool {
+	content, err := readHostMounts(hostRoot)
+	if err != nil {
+		return false
+	}
+	for _, m := range parseMounts(content) {
+		if m.Device == device && m.MountPoint == mountPoint {
+			return true
+		}
+	}
+	return false
 }
 
 // blockDeviceLister lists <hostRoot>/sys/block; injectable for tests.
@@ -90,10 +114,16 @@ func discoverAndMountRawDisks(opts Options, mounts []mountEntry) []Candidate {
 		}
 		hasFS, label := fsProbe(device)
 		if hasFS && !ownLabel(label, opts.AdoptLabels) {
+			logf("raw disk %s: has a filesystem labelled %q, not ours or adopted; skipping", device, label)
 			continue // holds another volume's data — never touch it
 		}
 		mountPoint := filepath.Join(rawMountBase, "fuse-"+name)
 		if err := prepareRawDisk(device, mountPoint, !hasFS); err != nil {
+			logf("raw disk %s: %v; skipping", device, err)
+			continue
+		}
+		if !mountVisible(opts.HostRoot, device, mountPoint) {
+			logf("raw disk %s: mounted at %s but not in the host mount table (pod needs hostPID: true); skipping", device, mountPoint)
 			continue
 		}
 		out = append(out, Candidate{

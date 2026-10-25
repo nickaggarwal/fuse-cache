@@ -47,6 +47,8 @@ func main() {
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[NODE-INIT] ", log.LstdFlags)
+	log.SetOutput(os.Stdout) // the nodeinit package logs raw-disk skips here
+	log.SetPrefix("[NODE-INIT] ")
 
 	opts := nodeinit.DefaultOptions()
 	opts.HostRoot = *hostRoot

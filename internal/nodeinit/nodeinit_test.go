@@ -475,8 +475,9 @@ func TestDiscoverAndMountRawDisks_SafetyAndIdempotency(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "queue/rotational"), []byte("0\n"), 0o644)
 	}
 
-	origList, origRun := blockDeviceLister, runCmd
-	defer func() { blockDeviceLister, runCmd = origList, origRun }()
+	origList, origRun, origVisible := blockDeviceLister, runCmd, mountVisible
+	defer func() { blockDeviceLister, runCmd, mountVisible = origList, origRun, origVisible }()
+	mountVisible = func(string, string, string) bool { return true }
 	blockDeviceLister = func(string) ([]string, error) {
 		return []string{"nvme0n1", "nvme1n1", "sdb", "sda", "sr0", "loop0"}, nil
 	}
@@ -548,8 +549,9 @@ func TestDiscoverAndMountRawDisks_AdoptLabels(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "queue"), 0o755)
 	os.WriteFile(filepath.Join(dir, "size"), []byte("1875385008\n"), 0o644) // ~894 GiB
 
-	origList, origRun := blockDeviceLister, runCmd
-	defer func() { blockDeviceLister, runCmd = origList, origRun }()
+	origList, origRun, origVisible := blockDeviceLister, runCmd, mountVisible
+	defer func() { blockDeviceLister, runCmd, mountVisible = origList, origRun, origVisible }()
+	mountVisible = func(string, string, string) bool { return true }
 	blockDeviceLister = func(string) ([]string, error) { return []string{"nvme0n1"}, nil }
 	var mkfs, mounts int
 	runCmd = func(name string, args ...string) (string, error) {
@@ -578,5 +580,57 @@ func TestDiscoverAndMountRawDisks_AdoptLabels(t *testing.T) {
 	}
 	if mounts != 1 {
 		t.Fatalf("adopted disk mounted %d times, want 1", mounts)
+	}
+}
+
+// A mount made through nsenter without hostPID lands in the container's own
+// namespace: the host never sees it, and a cache dir "on the NVMe" would be
+// created on whatever disk backs the host path. Such a disk must not become a
+// candidate. Observed on an AKS A100 node: the config named /dev/nvme0n1 while
+// the cache sat on the temp disk (/dev/sdb1).
+func TestDiscoverAndMountRawDisks_MountNotVisibleOnHost(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sys/block", "nvme0n1")
+	os.MkdirAll(filepath.Join(dir, "queue"), 0o755)
+	os.WriteFile(filepath.Join(dir, "size"), []byte("1875385008\n"), 0o644)
+
+	origList, origRun, origVisible, origLog := blockDeviceLister, runCmd, mountVisible, logf
+	defer func() { blockDeviceLister, runCmd, mountVisible, logf = origList, origRun, origVisible, origLog }()
+	blockDeviceLister = func(string) ([]string, error) { return []string{"nvme0n1"}, nil }
+	runCmd = func(name string, args ...string) (string, error) {
+		if name == "blkid" {
+			return "LABEL=fusecache\nTYPE=ext4\n", nil
+		}
+		return "", nil // nsenter "succeeds" — in the wrong namespace
+	}
+	var asked [3]string
+	mountVisible = func(hostRoot, device, mountPoint string) bool {
+		asked = [3]string{hostRoot, device, mountPoint}
+		return false
+	}
+	var logged []string
+	logf = func(format string, a ...interface{}) { logged = append(logged, fmt.Sprintf(format, a...)) }
+
+	if c := discoverAndMountRawDisks(Options{HostRoot: root}, nil); len(c) != 0 {
+		t.Fatalf("mount invisible on host: %d candidates, want 0", len(c))
+	}
+	if asked != [3]string{root, "/dev/nvme0n1", "/mnt/fuse-nvme0n1"} {
+		t.Fatalf("visibility checked for %v", asked)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "hostPID") {
+		t.Fatalf("skip not explained: %v", logged)
+	}
+}
+
+func TestMountVisible_ReadsHostTable(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "proc/1"), 0o755)
+	os.WriteFile(filepath.Join(root, "proc/1/mounts"),
+		[]byte("/dev/sdb1 /mnt ext4 rw 0 0\n/dev/nvme0n1 /mnt/fuse-nvme0n1 ext4 rw,noatime 0 0\n"), 0o644)
+	if !mountVisible(root, "/dev/nvme0n1", "/mnt/fuse-nvme0n1") {
+		t.Fatal("mount present in host table not seen")
+	}
+	if mountVisible(root, "/dev/nvme1n1", "/mnt/fuse-nvme1n1") {
+		t.Fatal("absent mount reported visible")
 	}
 }
