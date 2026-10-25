@@ -135,6 +135,40 @@ func (cm *DefaultCacheManager) readWholeFileRange(ctx context.Context, filePath 
 	return buf[:n], true
 }
 
+// readWholeChunkedRange serves a window of a chunked file from its whole local
+// copy (left by a manifest warm, chunk assembly or a FUSE write) instead of
+// synthesizing the window's 16 MiB chunks one by one. It only serves a copy
+// whose size equals the file's recorded size: a short or still-assembling
+// file falls through to the chunk path, which decides per chunk.
+func (cm *DefaultCacheManager) readWholeChunkedRange(ctx context.Context, filePath string, wantSize, offset int64, size int) ([]byte, bool) {
+	opener, ok := cm.nvmeStorage.(nvmeOpener)
+	if !ok || wantSize <= 0 {
+		return nil, false
+	}
+	reader, err := opener.Open(filePath)
+	if err != nil {
+		return nil, false
+	}
+	defer reader.Close()
+	if reader.Size() != wantSize || !cm.verifyNVMeReader(ctx, opener, filePath, reader) {
+		return nil, false
+	}
+	if offset >= wantSize {
+		return []byte{}, true
+	}
+	if end := offset + int64(size); end > wantSize {
+		size = int(wantSize - offset)
+	}
+	buf := make([]byte, size)
+	n, err := reader.ReadAt(buf, offset)
+	if err != nil && n != size {
+		cm.logger.Printf("NVMe ranged read of whole chunked file %s at offset %d failed: %v", filePath, offset, err)
+		return nil, false
+	}
+	cm.touchEntries(filePath)
+	return buf[:n], true
+}
+
 // verifyNVMeReader checks the sidecar checksum unless this exact file version
 // was already checked. A missing sidecar means unverifiable, not corrupt — the
 // whole-file path treats it the same way. A mismatch is reported as unusable

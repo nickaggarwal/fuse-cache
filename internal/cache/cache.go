@@ -3017,6 +3017,18 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 	// stride silently mis-slices every chunk boundary.
 	chunkSize := cm.effectiveChunkSize(entry)
 
+	if isChunked && entry != nil {
+		// Whole local copy (warm, assembly, FUSE write): read just this
+		// window. The chunk path below would copy a full chunk per window.
+		if out, ok := cm.readWholeChunkedRange(ctx, filePath, entry.Size, offset, size); ok {
+			dur := time.Since(started)
+			cm.metrics.RecordHit(TierNVMe)
+			cm.metrics.RecordTierRead(TierNVMe, int64(len(out)), dur)
+			cm.metrics.RecordReadWall(int64(len(out)), dur, int64(len(out)), 0, 0)
+			return out, nil
+		}
+	}
+
 	if !isChunked {
 		// Serve the window straight off the local file when we hold it.
 		// Falling through to Get() reads and hashes the whole object for every
