@@ -537,3 +537,46 @@ func TestDiscoverAndMountRawDisks_SafetyAndIdempotency(t *testing.T) {
 		t.Fatalf("mkfs calls = %v, want only [/dev/nvme0n1]", mkfsCalls)
 	}
 }
+
+// A disk an earlier provisioning step formatted under another label is
+// remounted (never reformatted) when that label is adopted, and still skipped
+// when it is not: after a reboot node-init must bring the cache disk back
+// without ever touching a foreign volume.
+func TestDiscoverAndMountRawDisks_AdoptLabels(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sys/block", "nvme0n1")
+	os.MkdirAll(filepath.Join(dir, "queue"), 0o755)
+	os.WriteFile(filepath.Join(dir, "size"), []byte("1875385008\n"), 0o644) // ~894 GiB
+
+	origList, origRun := blockDeviceLister, runCmd
+	defer func() { blockDeviceLister, runCmd = origList, origRun }()
+	blockDeviceLister = func(string) ([]string, error) { return []string{"nvme0n1"}, nil }
+	var mkfs, mounts int
+	runCmd = func(name string, args ...string) (string, error) {
+		switch {
+		case name == "blkid" && args[len(args)-1] == "/dev/nvme0n1":
+			return "LABEL=skyctl-nvme\nTYPE=ext4\n", nil
+		case name == "blkid":
+			return "", fmt.Errorf("no fs")
+		case name == "mkfs.ext4":
+			mkfs++
+		case name == "nsenter" && len(args) >= 2 && args[len(args)-2] == "/dev/nvme0n1":
+			mounts++
+		}
+		return "", nil
+	}
+
+	if c := discoverAndMountRawDisks(Options{HostRoot: root}, nil); len(c) != 0 {
+		t.Fatalf("foreign label without adoption: %d candidates, want 0", len(c))
+	}
+	c := discoverAndMountRawDisks(Options{HostRoot: root, AdoptLabels: []string{"skyctl-nvme"}}, nil)
+	if len(c) != 1 || c[0].Device != "/dev/nvme0n1" || c[0].DiskClass != "nvme" {
+		t.Fatalf("adopted label: candidates %+v, want nvme0n1 class nvme", c)
+	}
+	if mkfs != 0 {
+		t.Fatalf("adopted disk was reformatted (%d mkfs calls)", mkfs)
+	}
+	if mounts != 1 {
+		t.Fatalf("adopted disk mounted %d times, want 1", mounts)
+	}
+}

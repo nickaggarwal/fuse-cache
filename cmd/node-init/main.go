@@ -42,6 +42,7 @@ func main() {
 		exclude       = flag.String("exclude-prefixes", "", "Comma-separated extra mount-point prefixes to skip")
 		failOpen      = flag.Bool("fail-open", true, "On discovery failure, exit 0 without a config so the client falls back to its static -nvme path instead of crash-looping the pod")
 		mountRawDisks = flag.Bool("mount-raw-disks", true, "Discover, format (ext4), and mount raw unformatted local disks (e.g. a large NVMe) that mount-based discovery misses; only touches empty, unmounted, non-OS disks")
+		adoptLabels   = flag.String("adopt-labels", "", "Comma-separated extra ext4 labels to treat as an already-prepared cache disk (mount, never reformat), e.g. a disk an earlier provisioning step formatted")
 	)
 	flag.Parse()
 
@@ -57,6 +58,7 @@ func main() {
 	opts.BenchmarkBytes = int64(*benchmarkMB) << 20
 	opts.NodeName = os.Getenv("NODE_NAME")
 	opts.MountRawDisks = *mountRawDisks
+	opts.AdoptLabels = splitNonEmpty(*adoptLabels)
 	if *exclude != "" {
 		opts.ExtraExcludePrefixes = splitNonEmpty(*exclude)
 	}

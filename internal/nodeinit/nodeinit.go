@@ -90,6 +90,11 @@ type Options struct {
 	// MountRawDisks enables discovering, formatting, and mounting raw local
 	// disks (e.g. a large unformatted NVMe) that mount-based discovery misses.
 	MountRawDisks bool
+	// AdoptLabels are extra filesystem labels treated as a cache disk this
+	// node already prepared (mounted, never reformatted), besides
+	// "fusecache". For a disk formatted by an earlier provisioning step under
+	// another label, so a reboot remounts it instead of ignoring it.
+	AdoptLabels []string
 }
 
 // DefaultOptions returns production defaults.

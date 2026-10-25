@@ -76,6 +76,10 @@ spec:
             - "-max-cache-gb"
             - "{{ .Values.nodeInit.maxCacheGB }}"
             - "-benchmark={{ .Values.nodeInit.benchmark }}"
+            - "-mount-raw-disks={{ .Values.nodeInit.mountRawDisks }}"
+            {{- if .Values.nodeInit.adoptLabels }}
+            - "-adopt-labels={{ .Values.nodeInit.adoptLabels }}"
+            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -151,6 +155,11 @@ spec:
             - "{{ .Values.nodeInit.maxCacheGB }}"
             - "-refresh-interval-sec"
             - "{{ .Values.nodeInit.refreshIntervalSeconds }}"
+            # Re-discovery after the cache dir vanishes must see the same disks.
+            - "-mount-raw-disks={{ .Values.nodeInit.mountRawDisks }}"
+            {{- if .Values.nodeInit.adoptLabels }}
+            - "-adopt-labels={{ .Values.nodeInit.adoptLabels }}"
+            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:

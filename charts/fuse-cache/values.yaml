@@ -77,6 +77,13 @@ nodeInit:
   cacheFraction: "0.8"
   maxCacheGB: 0        # 0 = uncapped
   benchmark: true
+  # Raw-disk handling (needs enabled: true). mountRawDisks formats an EMPTY,
+  # unmounted, non-OS local disk (e.g. the 960 GB NVMe on NC A100 v4 nodes)
+  # as ext4 label "fusecache" and mounts it under /mnt/fuse-<dev>; a disk that
+  # already carries "fusecache" (or an adoptLabels label) is remounted, never
+  # reformatted, so a reboot or reimage brings the cache disk back.
+  mountRawDisks: true
+  adoptLabels: ""      # e.g. "skyctl-nvme": labels from an earlier provisioning step
   refreshIntervalSeconds: 60
   daemonSidecar: true  # keep refreshing capacity after init
 

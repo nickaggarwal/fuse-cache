@@ -89,7 +89,7 @@ func discoverAndMountRawDisks(opts Options, mounts []mountEntry) []Candidate {
 			continue
 		}
 		hasFS, label := fsProbe(device)
-		if hasFS && label != fuseCacheLabel {
+		if hasFS && !ownLabel(label, opts.AdoptLabels) {
 			continue // holds another volume's data — never touch it
 		}
 		mountPoint := filepath.Join(rawMountBase, "fuse-"+name)
@@ -106,6 +106,20 @@ func discoverAndMountRawDisks(opts Options, mounts []mountEntry) []Candidate {
 		})
 	}
 	return out
+}
+
+// ownLabel reports whether a filesystem label marks a disk this node prepared
+// as a cache disk: ours, or one of the explicitly adopted labels.
+func ownLabel(label string, adopt []string) bool {
+	if label == fuseCacheLabel {
+		return true
+	}
+	for _, a := range adopt {
+		if a != "" && label == a {
+			return true
+		}
+	}
+	return false
 }
 
 func readDiskSize(hostRoot, name string) int64 {
