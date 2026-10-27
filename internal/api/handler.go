@@ -160,6 +160,13 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/files/{path:.*}/size", h.handleFileSize).Methods("GET")
 	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
 
+	// OCI blobs by digest, for nydusd's http-proxy backend (oci_blob.go).
+	router.HandleFunc("/oci/blobs/{digest}", h.handleOCIBlob).Methods("GET", "HEAD")
+	// The same blobs at registry paths, so nydusd's registry backend can use
+	// this node as its proxy.url (nydus-snapshotter has no http-proxy type).
+	router.HandleFunc("/v2/", h.handleRegistryPing).Methods("GET", "HEAD")
+	router.HandleFunc("/v2/{repo:.+}/blobs/{digest}", h.handleRegistryBlob).Methods("GET", "HEAD")
+
 	// Peer operations
 	router.HandleFunc("/api/peer/read", h.handlePeerRead).Methods("GET")
 	router.HandleFunc("/api/peers", h.handlePeers).Methods("GET")
