@@ -333,7 +333,7 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	preferred, fallback := ps.partitionPeersForPath(ctx, path, peers)
-	preferred = orderedPeersForPath(preferred, path)
+	preferred = storeFirst(orderedPeersForPath(preferred, path))
 	fallback = orderedPeersForPath(fallback, path+"#fallback")
 
 	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
@@ -517,6 +517,45 @@ func (ps *PeerStorage) readFromPeersParallel(ctx context.Context, path string, p
 		lastErr = fmt.Errorf("parallel peer read failed")
 	}
 	return nil, lastErr
+}
+
+// RoleLabel is the peer label that marks a dedicated cluster storage node
+// (the cluster tier): a peer with no workload that holds a release ahead of
+// launches, so a model node's miss is served inside the cluster, from NVMe on
+// a node that is not running a model, before any other peer or cloud.
+const (
+	RoleLabel = "fuse.skycontrol.io/role"
+	RoleStore = "store"
+)
+
+// IsStorePeer reports whether a peer is a dedicated cluster storage node.
+func IsStorePeer(p *coordinator.PeerInfo) bool {
+	return p != nil && p.Labels[RoleLabel] == RoleStore
+}
+
+// storeFirst moves store peers ahead of the rest, keeping each group's order
+// (the per-path rotation that spreads chunk reads over holders is preserved
+// among the stores). Applied to holders only: a store that does not hold the
+// path is no better than any other peer.
+func storeFirst(peers []*coordinator.PeerInfo) []*coordinator.PeerInfo {
+	if len(peers) <= 1 {
+		return peers
+	}
+	out := make([]*coordinator.PeerInfo, 0, len(peers))
+	for _, p := range peers {
+		if IsStorePeer(p) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 || len(out) == len(peers) {
+		return peers
+	}
+	for _, p := range peers {
+		if !IsStorePeer(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func orderedPeersForPath(peers []*coordinator.PeerInfo, key string) []*coordinator.PeerInfo {

@@ -118,6 +118,20 @@ func (ps *PeerStorage) pairScore(peer *coordinator.PeerInfo) float64 {
 	return est.scoreWith(success)
 }
 
+// storeFailingSuccess is the measured success ratio below which a store peer
+// loses its precedence over workload peers.
+const storeFailingSuccess = 0.5
+
+// pairFailing reports whether a peer has enough samples to trust and they
+// show it mostly failing. Unmeasured is not failing.
+func (ps *PeerStorage) pairFailing(peer *coordinator.PeerInfo) bool {
+	if peer == nil {
+		return true
+	}
+	_, success, ok := ps.pairLatency.measured(peer.ID)
+	return ok && success < storeFailingSuccess
+}
+
 // hasMeasuredPair reports whether any candidate has trusted pair samples.
 func (ps *PeerStorage) hasMeasuredPair(peers []*coordinator.PeerInfo) bool {
 	for _, p := range peers {
@@ -140,6 +154,18 @@ func (ps *PeerStorage) sortByObservedLatency(peers []*coordinator.PeerInfo, key 
 		return
 	}
 	sort.SliceStable(peers, func(i, j int) bool {
+		// A store peer stays ahead of a workload peer unless it has been
+		// measured as failing: reads should land on the cluster tier, not
+		// on a node running a model, as long as the tier is healthy.
+		if a, b := IsStorePeer(peers[i]), IsStorePeer(peers[j]); a != b {
+			bad := peers[j]
+			if a {
+				bad = peers[i]
+			}
+			if !ps.pairFailing(bad) {
+				return a
+			}
+		}
 		si := ps.pairScore(peers[i])
 		sj := ps.pairScore(peers[j])
 		if si == sj {

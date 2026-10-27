@@ -30,8 +30,10 @@ import (
 type WarmupOptions struct {
 	// Mode: "none"/"" (no-op), "metadata" (enumerate only), "full" (pull bytes).
 	Mode string
-	// Source picks the tier order for fetches: ""/"peer-first"/"hybrid" use
-	// the normal adaptive order (peers before cloud), "cloud-first" prefers
+	// Source picks the tier order for fetches: ""/"peer-first"/"hybrid"/
+	// "cluster" use the normal adaptive order (peers before cloud, store
+	// nodes first among holders), "cluster-only" never reads cloud,
+	// "cloud-first" prefers
 	// cloud with peer fallback (spare the peers, e.g. pre-scale warm of many
 	// nodes at once), "cloud-only" never touches peers.
 	Source string
@@ -79,8 +81,16 @@ type PrefixWarmer interface {
 // means "use the adaptive per-chunk order" (peer-first).
 func warmupPlan(opts WarmupOptions) (order []CacheTier, fileConcurrency, chunkWorkers int, err error) {
 	switch strings.ToLower(strings.TrimSpace(opts.Source)) {
-	case "", "peer-first", "hybrid":
+	case "", "peer-first", "hybrid", "cluster":
+		// "cluster": peers first, and among holders the dedicated store
+		// nodes first (storeFirst), then cloud. Same as the adaptive order
+		// now that stores lead the holder list; named for callers that
+		// mean "from the cluster tier".
 		order = nil
+	case "cluster-only":
+		// Never leave the cluster: a node warm that must not pull from
+		// object storage (the store is expected to hold it).
+		order = []CacheTier{TierPeer}
 	case "cloud-first":
 		order = []CacheTier{TierCloud, TierPeer}
 	case "cloud-only":
