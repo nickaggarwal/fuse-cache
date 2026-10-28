@@ -917,10 +917,14 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 	if hasParent && !chunked {
 		// A whole parent indexed as unchunked: a restart re-indexes a
 		// multi-chunk file from disk without its chunk shape, and readers
-		// still ask for its _chunk_N paths. The chunk stride is this node's
-		// configured size, which is what it was written with.
-		if info, err := os.Stat(parentLocal); err == nil && !info.IsDir() && info.Size() > cm.config.ChunkSize {
-			size, chunked, chunkSize = info.Size(), true, cm.config.ChunkSize
+		// still ask for its _chunk_N paths. Serve them only at the stride the
+		// file was published with (coordinator metadata): this node's own
+		// -chunk-size may differ, and slicing at the wrong stride hands peers
+		// the wrong bytes, which nothing downstream checks.
+		if info, err := os.Stat(parentLocal); err == nil && !info.IsDir() {
+			if stride, ok := cm.publishedChunkSize(ctx, parent, info.Size()); ok {
+				size, chunked, chunkSize = info.Size(), true, stride
+			}
 		}
 	}
 	if chunkSize <= 0 {
@@ -944,6 +948,18 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 		return "", 0, 0, false
 	}
 	return parentLocal, offset, length, true
+}
+
+// publishedChunkSize is the chunk stride filePath was published with,
+// from coordinator metadata, when that record is chunked and matches the
+// local file's size. Without one (no coordinator, unchunked or mismatched
+// record) the stride is unknown and chunk ranges are not served.
+func (cm *DefaultCacheManager) publishedChunkSize(ctx context.Context, filePath string, localSize int64) (int64, bool) {
+	entry, found, err := cm.lookupRemoteEntry(ctx, filePath)
+	if err != nil || !found || entry == nil || !entry.IsChunked || entry.ChunkSize <= 0 || entry.Size != localSize {
+		return 0, false
+	}
+	return entry.ChunkSize, true
 }
 
 func (cm *DefaultCacheManager) remoteReadOrder(filePath string) []CacheTier {

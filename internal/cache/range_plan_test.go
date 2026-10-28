@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"fuse-client/internal/coordinator"
 )
 
 func planBytes(t *testing.T, pieces []RangePiece) []byte {
@@ -127,16 +129,32 @@ func TestPlanRange_MissingChunkFails(t *testing.T) {
 }
 
 // After a restart the store re-indexes a whole multi-chunk blob from disk as
-// unchunked, but model nodes still ask it for _chunk_N. It must serve those
-// ranges (seen on cpu-w3: every chunk request answered "not held" and node
-// reads fell through to blob storage).
+// unchunked, but model nodes still ask it for _chunk_N. It serves those
+// ranges at the stride the file was published with (seen on cpu-w3: every
+// chunk request answered "not held" and node reads fell through to blob
+// storage), and refuses when the published stride is unknown rather than
+// guess this node's own -chunk-size.
 func TestLocalChunkFile_WholeParentIndexedUnchunked(t *testing.T) {
-	const chunkSize = 1 << 20
-	cm, parent, _ := benchCacheManagerWithWholeFile(t, chunkSize, 3)
-	cm.entries.put(&CacheEntry{FilePath: parent, Size: 3 * chunkSize, Tier: TierNVMe}) // as re-indexed
+	const published = 1 << 20
+	cm, parent, _ := benchCacheManagerWithWholeFile(t, published, 3)
+	cm.config.ChunkSize = published / 2                                                // this node runs a different stride
+	cm.entries.put(&CacheEntry{FilePath: parent, Size: 3 * published, Tier: TierNVMe}) // as re-indexed
+
+	if _, _, _, ok := cm.LocalChunkFile(context.Background(), parent+"_chunk_2"); ok {
+		t.Fatal("served a chunk range with no published stride")
+	}
+
+	coord := coordinator.NewCoordinatorService()
+	cm.config.Coordinator = coord
+	if err := coord.UpdateFileLocation(context.Background(), &coordinator.FileLocation{
+		FilePath: parent, PeerID: "store", StorageTier: "nvme", StoragePath: parent,
+		FileSize: 3 * published, IsChunked: true, ChunkSize: published,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	path, off, n, ok := cm.LocalChunkFile(context.Background(), parent+"_chunk_2")
-	if !ok || off != 2*chunkSize || n != chunkSize || path == "" {
-		t.Fatalf("LocalChunkFile = %q %d %d %t, want whole file at %d+%d", path, off, n, ok, 2*chunkSize, chunkSize)
+	if !ok || off != 2*published || n != published || path == "" {
+		t.Fatalf("LocalChunkFile = %q %d %d %t, want whole file at %d+%d (published stride)", path, off, n, ok, 2*published, published)
 	}
 	if _, _, _, ok := cm.LocalChunkFile(context.Background(), parent+"_chunk_3"); ok {
 		t.Fatal("served a chunk past the end of the file")
@@ -192,5 +210,30 @@ func TestPlanRange_RemoteChunkFilledAfterQuiet(t *testing.T) {
 	}
 	if got := planBytes(t, pieces); !bytes.Equal(got, want[chunkSize+10:chunkSize+110]) {
 		t.Fatal("filled chunk bytes mismatch")
+	}
+}
+
+// A fill that fails (no tier holds the chunk yet) is retried on later
+// drains, up to blobFillMaxAttempts, then dropped.
+func TestBlobFillRetriesThenDrops(t *testing.T) {
+	const chunkSize = 1 << 20
+	cm, parent, _ := chunkWindowManager(t, chunkSize, 2)
+	ctx := context.Background()
+	cm.blobFillQ.started = true // drive the drain by hand
+	if err := os.Remove(filepath.Join(cm.config.NVMePath, "chunked.bin_chunk_1")); err != nil {
+		t.Fatal(err)
+	}
+	cm.deferBlobFill(parent, parent+"_chunk_1", 1)
+	quiet := time.Now().Add(blobFillQuietPeriod)
+	for i := 0; i < blobFillMaxAttempts; i++ {
+		if n := cm.drainBlobFills(ctx, quiet); n == 0 {
+			t.Fatalf("drain %d ran nothing", i)
+		}
+		if i < blobFillMaxAttempts-1 && len(cm.blobFillQ.pending) != 1 {
+			t.Fatalf("after failed attempt %d the fill was not re-queued", i+1)
+		}
+	}
+	if len(cm.blobFillQ.pending) != 0 || len(cm.blobFillQ.queued) != 0 {
+		t.Fatalf("fill still queued after %d attempts", blobFillMaxAttempts)
 	}
 }

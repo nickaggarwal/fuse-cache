@@ -426,6 +426,12 @@ func sortPeersByNetwork(peers []*coordinator.PeerInfo, key string) {
 		return
 	}
 	sort.SliceStable(peers, func(i, j int) bool {
+		// Store peers stay ahead of workload peers (storeFirst): a model
+		// node's faster reported link must not pull reads off the cluster
+		// tier and onto a node serving a model.
+		if si, sj := IsStorePeer(peers[i]), IsStorePeer(peers[j]); si != sj {
+			return si
+		}
 		pi := peerSortScore(peers[i])
 		pj := peerSortScore(peers[j])
 		if pi == pj {
@@ -1380,6 +1386,11 @@ func (ps *PeerStorage) readRangeFromPeerRaw(ctx context.Context, httpAddr, path 
 		return nil, &peerMissError{addr: httpAddr, path: path}
 	default:
 		return nil, fmt.Errorf("peer range read %s: status %d", httpAddr, resp.StatusCode)
+	}
+	if resp.ContentLength < 0 {
+		// Unknown length: cannot tell a window from a whole object, and
+		// guessing returns wrong bytes. Let the caller take the chunk path.
+		return nil, fmt.Errorf("peer range read %s: response without Content-Length", httpAddr)
 	}
 	if resp.ContentLength > n { // an older holder ignored off/len: whole object
 		data, err := io.ReadAll(resp.Body)

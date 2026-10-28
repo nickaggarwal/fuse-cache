@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/mux"
 
@@ -86,6 +88,17 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 		return
 	}
 
+	if r.Header.Get("Range") == "" {
+		// A plain GET is a whole-blob fetch (containerd, skopeo): answer 200
+		// with every byte, not a capped 206 the client would not check.
+		rp, ok := h.cacheManager.(rangePlanner)
+		if !ok {
+			http.Error(w, "whole-blob reads not supported", http.StatusNotImplemented)
+			return
+		}
+		h.writeWholeBlob(w, ctx, rp, entry, m[2][:12])
+		return
+	}
 	start, end, err := parseByteRange(r.Header.Get("Range"), size)
 	if err != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
@@ -93,7 +106,7 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 		return
 	}
 	if end-start+1 > ociBlobMaxRange {
-		end = start + ociBlobMaxRange - 1
+		end = start + ociBlobMaxRange - 1 // Content-Range tells the client
 	}
 
 	if rp, ok := h.cacheManager.(rangePlanner); ok {
@@ -143,14 +156,58 @@ func (h *Handler) writePlannedRange(w http.ResponseWriter, ctx context.Context, 
 	}
 }
 
+// writeWholeBlob streams the whole blob with 200, ociBlobMaxRange at a time
+// so memory stays bounded. The first window is resolved before the status
+// line (a failure is a 502 nydusd/containerd fall back on); a failure after
+// that cuts the response short, which the client sees against
+// Content-Length.
+func (h *Handler) writeWholeBlob(w http.ResponseWriter, ctx context.Context, rp rangePlanner, entry *cache.CacheEntry, id string) {
+	var off int64
+	for off < entry.Size {
+		n := min(int64(ociBlobMaxRange), entry.Size-off)
+		pieces, release, err := rp.PlanRange(ctx, entry, off, n)
+		if err != nil {
+			release()
+			h.logger.Printf("oci blob %s whole read at %d: %v", id, off, err)
+			if off == 0 {
+				http.Error(w, "read failed", http.StatusBadGateway)
+			}
+			return
+		}
+		if off == 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(entry.Size, 10))
+			w.WriteHeader(http.StatusOK)
+		}
+		for _, p := range pieces {
+			if _, err := p.WriteTo(w); err != nil {
+				release()
+				return
+			}
+		}
+		release()
+		off += n
+	}
+}
+
+// ociMissTTL is how long a blob the cluster does not hold is answered 503
+// without asking the coordinator again. A cold image means thousands of
+// chunk requests from every node's nydusd; each miss would otherwise be a
+// forced coordinator lookup (the burst that OOM-killed the coordinators on
+// 2026-10-10). Short, so a blob filled into the store is seen within seconds.
+const ociMissTTL = 5 * time.Second
+
 func (h *Handler) ociBlobEntry(ctx context.Context, filePath string) (*cache.CacheEntry, bool) {
 	if l, ok := h.cacheManager.(entryLookup); ok {
 		if e, found := l.LookupEntry(ctx, filePath, false); found && e != nil {
 			return e, true
 		}
+		if h.ociMisses.recent(filePath) {
+			return nil, false
+		}
 		if e, found := l.LookupEntry(ctx, filePath, true); found && e != nil {
 			return e, true
 		}
+		h.ociMisses.note(filePath)
 		return nil, false
 	}
 	e, err := h.cacheManager.Get(ctx, filePath)
@@ -192,4 +249,58 @@ func parseByteRange(header string, size int64) (int64, int64, error) {
 		}
 	}
 	return start, end, nil
+}
+
+// ociBlobDigestFromPath returns the hex digest when filePath is an OCI blob
+// path (/oci/sha256/<64 hex>), else "".
+func ociBlobDigestFromPath(filePath string) string {
+	hex, ok := strings.CutPrefix(filePath, OCIBlobPrefix)
+	if !ok || len(hex) != 64 || strings.ContainsAny(hex, "/_") {
+		return ""
+	}
+	for _, c := range hex {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return hex
+}
+
+// missCache remembers recent lookups that found nothing. The zero value is
+// usable.
+type missCache struct {
+	mu sync.Mutex
+	at map[string]time.Time
+}
+
+func (c *missCache) recent(k string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.at[k]
+	if ok && time.Since(t) >= ociMissTTL {
+		delete(c.at, k)
+		return false
+	}
+	return ok
+}
+
+func (c *missCache) note(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.at == nil {
+		c.at = make(map[string]time.Time)
+	}
+	if len(c.at) > 65536 { // bound memory: drop everything, it is a cache
+		c.at = make(map[string]time.Time)
+	}
+	c.at[k] = time.Now()
+}
+
+// isOCIBlobRoute matches the read-only registry-proxy routes.
+func isOCIBlobRoute(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	p := r.URL.Path
+	return p == "/v2/" || strings.HasPrefix(p, "/oci/blobs/") || (strings.HasPrefix(p, "/v2/") && strings.Contains(p, "/blobs/"))
 }

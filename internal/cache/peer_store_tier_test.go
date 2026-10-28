@@ -78,3 +78,20 @@ func ids(ps []*coordinator.PeerInfo) []string {
 	}
 	return out
 }
+
+// The network sort runs after storeFirst in Read; a workload peer reporting a
+// faster link must not move ahead of a store.
+func TestNetworkSortKeepsStoreFirst(t *testing.T) {
+	fast := workPeer("fast")
+	fast.NetworkSpeedMBps = 10000
+	store := storePeer("store")
+	store.NetworkSpeedMBps = 100
+	peers := []*coordinator.PeerInfo{store, fast, workPeer("slow")}
+	sortPeersByNetwork(peers, "/p")
+	if peers[0].ID != "store" {
+		t.Fatalf("order after network sort = %s, %s, %s; store must stay first", peers[0].ID, peers[1].ID, peers[2].ID)
+	}
+	if peers[1].ID != "fast" {
+		t.Fatalf("workload peers lost their score order: %s before fast", peers[1].ID)
+	}
+}

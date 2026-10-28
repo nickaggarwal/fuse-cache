@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -151,11 +153,12 @@ func TestRegistryBlobPlannedPath(t *testing.T) {
 	srv := httptest.NewServer(NewHandler(cm, nil, "p", "").SetupRoutes())
 	defer srv.Close()
 
-	digest := strings.Repeat("9a", 32)
 	blob := make([]byte, 3<<20+12345)
 	for i := range blob {
 		blob[i] = byte(i * 31 % 253)
 	}
+	sum := sha256.Sum256(blob)
+	digest := hex.EncodeToString(sum[:])
 	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/files/oci/sha256/"+digest, bytes.NewReader(blob))
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("upload: %v %v", err, resp)
@@ -217,5 +220,79 @@ func TestPeerReadSubRange(t *testing.T) {
 	}
 	if got := get("path=/w.bin_chunk_2&off=1048000&len=1000"); !bytes.Equal(got, blob[2<<20+1048000:3<<20]) {
 		t.Fatalf("clamped chunk window mismatch: %d bytes", len(got))
+	}
+}
+
+// A PUT of an OCI blob whose body does not hash to its digest is refused and
+// nothing is stored; a matching body is stored.
+func TestOCIBlobPutVerifiesDigest(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{NVMePath: t.TempDir(), MaxNVMeSize: 64 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.Shutdown()
+	srv := httptest.NewServer(NewHandler(cm, nil, "p", "").SetupRoutes())
+	defer srv.Close()
+	body := []byte("real layer bytes")
+	sum := sha256.Sum256(body)
+	good := hex.EncodeToString(sum[:])
+	put := func(digest string, b []byte) int {
+		req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/files/oci/sha256/"+digest, bytes.NewReader(b))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := put(good, []byte("tampered layer!!")); code != http.StatusBadRequest {
+		t.Fatalf("mismatched blob: status %d, want 400", code)
+	}
+	if resp, _ := http.Head(srv.URL + "/v2/r/blobs/sha256:" + good); resp.StatusCode == 200 {
+		t.Fatal("a rejected blob is being served")
+	}
+	if code := put(good, body); code != 200 {
+		t.Fatalf("matching blob: status %d, want 200", code)
+	}
+	if resp, _ := http.Head(srv.URL + "/v2/r/blobs/sha256:" + good); resp.StatusCode != 200 || resp.ContentLength != int64(len(body)) {
+		t.Fatalf("stored blob not served: %d %d", resp.StatusCode, resp.ContentLength)
+	}
+}
+
+// A plain GET returns the whole blob with 200; a node with an API key still
+// serves the blob routes to nydusd (which sends no key) but not the file API.
+func TestOCIBlobWholeGetAndAPIKey(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{NVMePath: t.TempDir(), MaxNVMeSize: 64 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.Shutdown()
+	srv := httptest.NewServer(NewHandler(cm, nil, "p", "secret").SetupRoutes())
+	defer srv.Close()
+	blob := make([]byte, 2<<20+777)
+	for i := range blob {
+		blob[i] = byte(i * 7 % 251)
+	}
+	sum := sha256.Sum256(blob)
+	d := hex.EncodeToString(sum[:])
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/files/oci/sha256/"+d, bytes.NewReader(blob))
+	req.Header.Set("X-API-Key", "secret")
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("upload: %v %v", err, resp)
+	}
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/sha256:" + d) // no key, no Range
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !bytes.Equal(got, blob) {
+		t.Fatalf("whole GET: status %d, %d bytes, match=%t", resp.StatusCode, len(got), bytes.Equal(got, blob))
+	}
+	if resp, _ := http.Get(srv.URL + "/v2/"); resp.StatusCode != 200 {
+		t.Fatalf("ping without key: %d", resp.StatusCode)
+	}
+	if resp, _ := http.Get(srv.URL + "/api/files/oci/sha256/" + d); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("file API without key: %d, want 401", resp.StatusCode)
 	}
 }

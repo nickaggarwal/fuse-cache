@@ -164,7 +164,7 @@ func (h *Handler) serveSubRange(w http.ResponseWriter, localPath string, offset,
 		http.Error(w, "range outside object", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	if subOff+subLen > length {
+	if subLen > length-subOff { // no subOff+subLen: it can overflow int64
 		subLen = length - subOff
 	}
 	h.serveFileRange(w, localPath, offset+subOff, subLen)

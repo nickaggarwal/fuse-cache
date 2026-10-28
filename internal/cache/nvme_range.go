@@ -42,6 +42,31 @@ type nvmeFileID struct {
 type nvmeVerifier struct {
 	mu   sync.Mutex
 	seen map[string]nvmeVerifyRecord
+	// busy serialises verification of one path (lockPath).
+	busy map[string]*sync.Mutex
+}
+
+// lockPath serialises verification of path; the returned func releases it.
+func (v *nvmeVerifier) lockPath(path string) func() {
+	v.mu.Lock()
+	if v.busy == nil {
+		v.busy = make(map[string]*sync.Mutex)
+	}
+	m := v.busy[path]
+	if m == nil {
+		m = &sync.Mutex{}
+		v.busy[path] = m
+	}
+	v.mu.Unlock()
+	m.Lock()
+	return func() {
+		m.Unlock()
+		v.mu.Lock()
+		if len(v.busy) > nvmeVerifyLimit { // bound memory; locks are cheap to recreate
+			delete(v.busy, path)
+		}
+		v.mu.Unlock()
+	}
 }
 
 type nvmeVerifyRecord struct {
@@ -179,6 +204,14 @@ func (cm *DefaultCacheManager) verifyNVMeReader(ctx context.Context, opener nvme
 	if cm.nvmeVerify.verified(filePath, id) {
 		return true
 	}
+	// One hash per file version: concurrent first readers of a fresh large
+	// file (nydusd's threads, several peers) wait for it instead of each
+	// streaming SHA-256 over the whole file.
+	release := cm.nvmeVerify.lockPath(filePath)
+	defer release()
+	if cm.nvmeVerify.verified(filePath, id) {
+		return true
+	}
 	sidecar, err := opener.Read(ctx, filePath+".sha256")
 	if err != nil {
 		// No sidecar: nothing to check against, same as the whole-file path.
@@ -235,7 +268,11 @@ func (cm *DefaultCacheManager) readChunkWindow(ctx context.Context, filePath str
 		return nil, false
 	}
 	defer reader.Close()
-	if reader.Size() > chunkSize || !cm.verifyNVMeReader(ctx, opener, chunkPath, reader) {
+	// The chunk file must be exactly the chunk's length at this stride: a
+	// longer or shorter one was written with another stride, and slicing it
+	// would return wrong or short bytes as if they were the file's.
+	if want := expectedChunkLen(chunkIndex, chunkSize, cm.entrySize(filePath)); want <= 0 || reader.Size() != want ||
+		!cm.verifyNVMeReader(ctx, opener, chunkPath, reader) {
 		return nil, false
 	}
 	from := offset - chunkIndex*chunkSize
@@ -266,4 +303,27 @@ func (cm *DefaultCacheManager) isSequentialRead(filePath string, offset, chunkSi
 		return false
 	}
 	return offset >= fileCache.lastReadEnd-chunkSize && offset <= fileCache.lastReadEnd+chunkSize
+}
+
+// expectedChunkLen is the byte length of chunk idx of a file of size total at
+// stride chunkSize (the last chunk may be short); 0 when out of range.
+func expectedChunkLen(idx, chunkSize, total int64) int64 {
+	if chunkSize <= 0 || total <= 0 || idx < 0 {
+		return 0
+	}
+	start := idx * chunkSize
+	if start >= total {
+		return 0
+	}
+	return min(chunkSize, total-start)
+}
+
+// entrySize is the recorded size of filePath, or 0 when unknown.
+func (cm *DefaultCacheManager) entrySize(filePath string) int64 {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if e, ok := cm.entries.get(filePath); ok && e != nil {
+		return e.Size
+	}
+	return 0
 }

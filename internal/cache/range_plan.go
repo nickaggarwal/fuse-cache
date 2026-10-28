@@ -194,7 +194,12 @@ const (
 type blobFillKey struct {
 	filePath, chunkPath string
 	chunkIndex          int64
+	attempts            int
 }
+
+// blobFillMaxAttempts bounds retries of a failed fill (store busy, peer
+// timeout). After that the chunk is left for a later read to queue again.
+const blobFillMaxAttempts = 3
 
 type blobFillQueue struct {
 	mu       sync.Mutex
@@ -228,7 +233,7 @@ func (cm *DefaultCacheManager) deferBlobFill(filePath, chunkPath string, chunkIn
 		return
 	}
 	q.queued[chunkPath] = struct{}{}
-	q.pending = append(q.pending, blobFillKey{filePath, chunkPath, chunkIndex})
+	q.pending = append(q.pending, blobFillKey{filePath: filePath, chunkPath: chunkPath, chunkIndex: chunkIndex})
 	cm.metrics.BlobFillQueued.Add(1)
 	if !q.started {
 		q.started = true
@@ -261,7 +266,13 @@ func (cm *DefaultCacheManager) runBlobFills() {
 func (cm *DefaultCacheManager) drainBlobFills(ctx context.Context, now time.Time) int {
 	q := &cm.blobFillQ
 	n := 0
-	for ctx.Err() == nil {
+	// One attempt per queued fill per pass: a failure goes to the back and
+	// waits for the next pass (a second later at the earliest), so a store
+	// that is briefly busy is not hit with every retry back to back.
+	q.mu.Lock()
+	budget := len(q.pending)
+	q.mu.Unlock()
+	for ; budget > 0 && ctx.Err() == nil; budget-- {
 		q.mu.Lock()
 		if now.Sub(q.lastRead) < blobFillQuietPeriod || len(q.pending) == 0 {
 			q.mu.Unlock()
@@ -269,9 +280,19 @@ func (cm *DefaultCacheManager) drainBlobFills(ctx context.Context, now time.Time
 		}
 		k := q.pending[0]
 		q.pending = q.pending[1:]
-		delete(q.queued, k.chunkPath)
 		q.mu.Unlock()
-		cm.fillBlobChunk(ctx, k.filePath, k.chunkPath, k.chunkIndex)
+		ok := cm.fillBlobChunk(ctx, k.filePath, k.chunkPath, k.chunkIndex)
+		q.mu.Lock()
+		if !ok && k.attempts+1 < blobFillMaxAttempts && ctx.Err() == nil {
+			k.attempts++
+			q.pending = append(q.pending, k) // retried on the next pass
+		} else {
+			delete(q.queued, k.chunkPath)
+			if !ok {
+				cm.metrics.BlobPromoteSkipped.Add(1)
+			}
+		}
+		q.mu.Unlock()
 		n++
 		now = time.Now() // a read that landed during the fill pauses the drain
 	}
@@ -308,22 +329,36 @@ func (cm *DefaultCacheManager) readBlobWindowFromPeer(ctx context.Context, fileP
 
 // fillBlobChunk fetches a whole chunk (store/peer first) and lands it on
 // NVMe, once per chunk. Called from the deferred-fill loop, one at a time.
-func (cm *DefaultCacheManager) fillBlobChunk(ctx context.Context, filePath, chunkPath string, chunkIndex int64) {
+// It reports whether the chunk is on NVMe afterwards (false: retry later).
+// A chunk still in the range cache (fetched by the read that queued it) is
+// written from memory rather than fetched again.
+func (cm *DefaultCacheManager) fillBlobChunk(ctx context.Context, filePath, chunkPath string, chunkIndex int64) bool {
 	if !cm.blobFills.start(chunkPath) {
-		return
+		return true // another fill has it
 	}
 	defer cm.blobFills.done(chunkPath)
 	if _, ok := cm.openLocalExactCheck(chunkPath); ok {
-		return
+		return true
 	}
-	data, tier, err := cm.readChunkData(ctx, filePath, chunkIndex, remoteReadOrderPeerFirst, false)
-	if err != nil || tier == TierNVMe {
-		return
+	data, tier, cached := cm.getChunkFromRangeCache(filePath, chunkIndex)
+	if !cached {
+		var err error
+		data, tier, err = cm.readChunkData(ctx, filePath, chunkIndex, remoteReadOrderPeerFirst, false)
+		if err != nil {
+			return false
+		}
+	}
+	if tier == TierNVMe {
+		return true
 	}
 	dataCopy := make([]byte, len(data)) // data is shared with the range cache
 	copy(dataCopy, data)
 	cm.promoteChunkAndAdvertise(ctx, filePath, chunkPath, dataCopy)
+	if _, ok := cm.openLocalExactCheck(chunkPath); !ok {
+		return false
+	}
 	cm.metrics.BlobPromoted.Add(1)
+	return true
 }
 
 // openLocalExactCheck reports whether chunkPath already has a local file.

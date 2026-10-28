@@ -3,10 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -66,6 +69,9 @@ type Handler struct {
 	// enabled. Atomic because it is installed after the API server is already
 	// serving and is read from request handlers.
 	modelKV atomic.Pointer[cache.ModelKVStore]
+	// ociMisses answers repeat lookups of absent blobs without the
+	// coordinator (oci_blob.go).
+	ociMisses missCache
 }
 
 // SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
@@ -131,7 +137,11 @@ func NewHandler(cacheManager cache.CacheManager, coord coordinator.Coordinator, 
 func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Health endpoint is always public
-		if r.URL.Path == "/api/health" || r.URL.Path == "/metrics" || r.URL.Path == "/api/netprobe" {
+		// The registry-proxy blob routes are public too: nydusd sends no
+		// X-API-Key, and a 401 is a 4xx it does not fall back on, so a keyed
+		// node would fail every image read. They are read-only and serve
+		// content-addressed bytes that were digest-checked on the way in.
+		if r.URL.Path == "/api/health" || r.URL.Path == "/metrics" || r.URL.Path == "/api/netprobe" || isOCIBlobRoute(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -287,6 +297,12 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, r *http.Request, ctx cont
 		h.handleFilePutStreaming(w, r, ctx, filePath, sw)
 		return
 	}
+	if ociBlobDigestFromPath(filePath) != "" {
+		// Only the streaming path verifies blob digests; never store an
+		// unverified content-addressed blob.
+		http.Error(w, "OCI blob uploads need the streaming store", http.StatusNotImplemented)
+		return
+	}
 
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -328,8 +344,26 @@ func (h *Handler) handleFilePutStreaming(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	size, copyErr := io.Copy(f, r.Body)
+	// An OCI blob is content-addressed: hash it on the way in and refuse a
+	// body that does not match its digest, so a truncated or wrong copy can
+	// never be stored, served to nydusd and spread through peers.
+	var digester hash.Hash
+	wantDigest := ociBlobDigestFromPath(filePath)
+	var body io.Reader = r.Body
+	if wantDigest != "" {
+		digester = sha256.New()
+		body = io.TeeReader(r.Body, digester)
+	}
+	size, copyErr := io.Copy(f, body)
 	closeErr := f.Close()
+	if copyErr == nil && closeErr == nil && digester != nil {
+		if got := hex.EncodeToString(digester.Sum(nil)); got != wantDigest {
+			os.Remove(tmpPath)
+			h.logger.Printf("Rejected OCI blob %s: content hashes to %s", filePath, got)
+			http.Error(w, "content does not match the blob digest", http.StatusBadRequest)
+			return
+		}
+	}
 	if copyErr != nil {
 		os.Remove(tmpPath)
 		var maxErr *http.MaxBytesError
