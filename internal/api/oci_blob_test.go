@@ -90,6 +90,15 @@ func TestOCIBlob(t *testing.T) {
 }
 
 // nydusd sends registry requests through its proxy in absolute form.
+// A blob uploaded through the file API must be the blob nydusd reads.
+func TestOCIBlobPathMatchesFileAPI(t *testing.T) {
+	digest := strings.Repeat("ef", 32)
+	stored, _ := sanitizePath("oci/sha256/" + digest)
+	if stored != OCIBlobPrefix+digest {
+		t.Fatalf("PUT /api/files/oci/sha256/<hex> stores %q, blob endpoint reads %q", stored, OCIBlobPrefix+digest)
+	}
+}
+
 func TestRegistryBlobViaProxy(t *testing.T) {
 	digest := strings.Repeat("ab", 32)
 	blob := bytes.Repeat([]byte("x"), 64)

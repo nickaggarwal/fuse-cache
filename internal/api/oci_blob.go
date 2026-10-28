@@ -14,9 +14,10 @@ import (
 )
 
 // OCIBlobPrefix is where OCI blobs live in the cache namespace, by digest:
-// oci/sha256/<hex>. A blob two images share is one cache file, whatever
-// repository either image came from.
-const OCIBlobPrefix = "oci/sha256/"
+// /oci/sha256/<hex>, the path a PUT to /api/files/oci/sha256/<hex> stores
+// (sanitizePath roots every path). A blob two images share is one cache
+// file, whatever repository either image came from.
+const OCIBlobPrefix = "/oci/sha256/"
 
 // ociBlobMaxRange bounds one GET. nydusd asks for a chunk or a merged
 // prefetch window (1 MiB by default, a few MiB merged); the cap keeps a
