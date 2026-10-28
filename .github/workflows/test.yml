@@ -1,0 +1,64 @@
+name: test
+
+# Unit tests and vet on every push to main and every PR. The other workflows
+# only benchmark (bench-regression) and build images (images), so before this
+# a change that broke the suite could reach main with every check green.
+#
+# Packages are listed explicitly: the repo root holds tracked tmp_s3probe*.go
+# scratch files that each declare main(), so ./... does not build.
+# integrations/llm-d-fuse-residency is a separate module with its own tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./cmd/... ./internal/...
+
+      - name: Vet
+        run: go vet ./cmd/... ./internal/...
+
+      # -short skips the 100 MB and 1 GB large-file tests: under the race
+      # detector the 1 GB one alone needs more than 7 GiB, and the runner's
+      # 7 GiB gets the binary killed. They run below without -race.
+      - name: Test (race)
+        run: go test -race -short -count=1 ./cmd/... ./internal/...
+
+      - name: Large-file tests (no race)
+        run: go test -count=1 -run 'TestLargeFile' ./internal/cache/
+
+  llmd-integration:
+    # Separate module, on a newer Go than the root module (its go.mod pins
+    # the llm-d router's requirement).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: integrations/llm-d-fuse-residency
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: integrations/llm-d-fuse-residency/go.mod
+          cache-dependency-path: integrations/llm-d-fuse-residency/go.sum
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...

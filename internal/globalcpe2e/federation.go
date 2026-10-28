@@ -138,6 +138,12 @@ const sharedBucket = "shared-federation-bucket"
 // to the control plane.
 func newCluster(t *testing.T, cp *controlPlane, store *s3Server, cfg clusterConfig) *cluster {
 	t.Helper()
+	// The S3 client resolves credentials through the SDK's default chain
+	// before it reaches the in-process store, which ignores them. Without
+	// these the suite passed only on machines that happened to have AWS
+	// credentials set and failed in CI with NoCredentialProviders.
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 
 	coord := coordinator.NewCoordinatorService()
 
