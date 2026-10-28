@@ -1,0 +1,12 @@
+# Linux lab for the read-path benchmarks: FUSE userspace tools + Go (for
+# pprof) + profiling helpers. Binaries are built outside and bind-mounted in.
+#
+#   docker build -t fusedata-lab -f rust/fusedata/bench/Dockerfile.lab rust/fusedata/bench
+#   docker run -d --name fusedata-lab --privileged --device /dev/fuse \
+#     -v "$PWD":/src:ro fusedata-lab sleep infinity
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 procps python3 ca-certificates curl golang-go linux-perf \
+    && rm -rf /var/lib/apt/lists/*
+RUN echo user_allow_other >> /etc/fuse.conf
+WORKDIR /work
