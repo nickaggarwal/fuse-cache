@@ -1004,6 +1004,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	gf := fusemetrics.Snapshot()
 	fmt.Fprintf(w, "fuse_gofuse_passthrough_enabled %d\n", gf.PassthroughEnabled)
+	fmt.Fprintf(w, "fuse_gofuse_passthrough_opens_total %d\n", gf.PassthroughOpens)
+	fmt.Fprintf(w, "fuse_gofuse_passthrough_fallbacks_total %d\n", gf.PassthroughFallbacks)
 	fmt.Fprintf(w, "fuse_gofuse_writeback_cache_enabled %d\n", gf.WritebackCacheEnabled)
 	fmt.Fprintf(w, "fuse_gofuse_max_write_bytes %d\n", gf.MaxWriteBytes)
 	fmt.Fprintf(w, "fuse_gofuse_write_append_buffer_bytes %d\n", gf.WriteAppendBufferBytes)

@@ -126,6 +126,9 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 		},
 		EntryTimeout: &entryTTL,
 		AttrTimeout:  &attrTTL,
+		// Bridge messages (e.g. a refused passthrough backing file) go to
+		// the client log.
+		Logger: g.logger,
 	}
 
 	server, err := gfs.Mount(mountPoint, root, opts)
@@ -438,18 +441,44 @@ func (n *goFuseNode) Open(ctx context.Context, flags uint32) (gfs.FileHandle, ui
 	}
 
 	if n.gfs.enablePassthrough && (flags&uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY) {
-		if resolver, ok := n.gfs.cacheManager.(localFilePathResolver); ok {
-			if localPath, ok := resolver.LocalFilePath(ctx, n.path); ok {
-				f, err := os.Open(localPath)
-				if err == nil {
-					return &goFusePassthroughHandle{file: f}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
-				}
-				n.gfs.logger.Printf("Passthrough open fallback for %s (%s): %v", n.path, localPath, err)
-			}
+		if f, ok := n.passthroughFile(ctx); ok {
+			fusemetrics.RecordPassthroughOpen(true)
+			return &goFusePassthroughHandle{file: f}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
 		}
+		fusemetrics.RecordPassthroughOpen(false)
 	}
 
 	return n, gfuse.FOPEN_KEEP_CACHE, 0
+}
+
+// passthroughFile opens the whole local copy of this file for kernel
+// passthrough. Only a copy whose size matches the file's recorded size is
+// used: a chunked file still landing as _chunk_N pieces (or a short whole
+// file mid-assembly) is served through the daemon instead, since the kernel
+// would read the backing file as-is.
+func (n *goFuseNode) passthroughFile(ctx context.Context) (*os.File, bool) {
+	resolver, ok := n.gfs.cacheManager.(localFilePathResolver)
+	if !ok {
+		return nil, false
+	}
+	localPath, ok := resolver.LocalFilePath(ctx, n.path)
+	if !ok {
+		return nil, false
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		n.gfs.logger.Printf("Passthrough open fallback for %s (%s): %v", n.path, localPath, err)
+		return nil, false
+	}
+	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
+		if entry, found := ml.LookupEntry(ctx, n.path, false); found && entry != nil {
+			if info, err := f.Stat(); err != nil || info.Size() != entry.Size {
+				f.Close()
+				return nil, false
+			}
+		}
+	}
+	return f, true
 }
 
 func (h *goFusePassthroughHandle) PassthroughFd() (int, bool) {

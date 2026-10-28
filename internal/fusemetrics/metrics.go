@@ -4,6 +4,8 @@ import "sync/atomic"
 
 type GoFuseMetricsSnapshot struct {
 	PassthroughEnabled     int64
+	PassthroughOpens       int64
+	PassthroughFallbacks   int64
 	WritebackCacheEnabled  int64
 	MaxWriteBytes          int64
 	WriteAppendBufferBytes int64
@@ -21,7 +23,11 @@ type GoFuseMetricsSnapshot struct {
 }
 
 type goFuseMetrics struct {
-	passthroughEnabled     atomic.Int64
+	passthroughEnabled atomic.Int64
+	// passthroughOpens / passthroughFallbacks count read-only opens served
+	// by a kernel backing file vs through the daemon (no whole local copy).
+	passthroughOpens       atomic.Int64
+	passthroughFallbacks   atomic.Int64
 	writebackCacheEnabled  atomic.Int64
 	maxWriteBytes          atomic.Int64
 	writeAppendBufferBytes atomic.Int64
@@ -55,6 +61,16 @@ func RecordGoFuseMountConfig(passthrough bool, writeback bool, maxWriteBytes int
 	}
 }
 
+// RecordPassthroughOpen counts a read-only open that was offered a kernel
+// backing file (served=true) or fell back to the daemon read path.
+func RecordPassthroughOpen(served bool) {
+	if served {
+		globalGoFuseMetrics.passthroughOpens.Add(1)
+	} else {
+		globalGoFuseMetrics.passthroughFallbacks.Add(1)
+	}
+}
+
 func RecordGoFuseWriteSummary(writeBytes int64, writeCalls int64, stageWriteCalls int64, stageWriteBytes int64, bufferFlushCalls int64, writePhaseNanos int64, bufferFlushNanos int64, syncNanos int64, putNanos int64, flushTotalNanos int64) {
 	globalGoFuseMetrics.writeSummaries.Add(1)
 	globalGoFuseMetrics.writeBytes.Add(writeBytes)
@@ -72,6 +88,8 @@ func RecordGoFuseWriteSummary(writeBytes int64, writeCalls int64, stageWriteCall
 func Snapshot() GoFuseMetricsSnapshot {
 	return GoFuseMetricsSnapshot{
 		PassthroughEnabled:     globalGoFuseMetrics.passthroughEnabled.Load(),
+		PassthroughOpens:       globalGoFuseMetrics.passthroughOpens.Load(),
+		PassthroughFallbacks:   globalGoFuseMetrics.passthroughFallbacks.Load(),
 		WritebackCacheEnabled:  globalGoFuseMetrics.writebackCacheEnabled.Load(),
 		MaxWriteBytes:          globalGoFuseMetrics.maxWriteBytes.Load(),
 		WriteAppendBufferBytes: globalGoFuseMetrics.writeAppendBufferBytes.Load(),

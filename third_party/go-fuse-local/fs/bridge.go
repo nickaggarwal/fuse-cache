@@ -791,6 +791,9 @@ func (b *rawBridge) addBackingID(n *Inode, f FileHandle, out *fuse.OpenOut) {
 		id, errno := bc.RegisterBackingFd(&m)
 		if errno != 0 {
 			// This happens if we're not root or CAP_PASSTHROUGH is missing.
+			// Said once, loudly: every later open silently takes the daemon
+			// read path, which otherwise looks exactly like passthrough on.
+			b.logf("passthrough: BACKING_OPEN failed (%v); backing files disabled for this mount", errno)
 			b.disableBackingFiles = true
 		} else {
 			n.backingID = id
