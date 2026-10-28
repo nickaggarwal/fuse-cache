@@ -406,14 +406,9 @@ type DefaultCacheManager struct {
 	warmIntents      *warmIntentRegistry
 	chunkAds         *chunkAdvertiser
 	chunkPromoteGate chan struct{}
-	// blobPromote bounds background promotion of chunks PlanRange fetched
-	// (range_plan.go); created on first use so hand-built managers work.
-	blobPromote     chan struct{}
-	blobPromoteOnce sync.Once
-	// blobFill bounds and blobFills dedupes background whole-chunk fills
-	// behind ranged blob reads (range_plan.go).
-	blobFill        chan struct{}
-	blobFillOnce    sync.Once
+	// blobFillQ holds whole-chunk fills deferred until blob reads go quiet;
+	// blobFills dedupes fills in progress (range_plan.go).
+	blobFillQ       blobFillQueue
 	blobFills       inflightSet
 	tierPerf        *tierPerfTracker
 	chunkCompletion chunkCompletionState
@@ -4246,6 +4241,7 @@ type CacheMetrics struct {
 	BlobRangeRemoteBytes atomic.Int64
 	BlobPromoted         atomic.Int64
 	BlobPromoteSkipped   atomic.Int64
+	BlobFillQueued       atomic.Int64
 	PrefetchHits         atomic.Int64
 	PrefetchWasted       atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
@@ -4436,6 +4432,7 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"blob_range_remote_bytes":      m.BlobRangeRemoteBytes.Load(),
 		"blob_promoted":                m.BlobPromoted.Load(),
 		"blob_promote_skipped":         m.BlobPromoteSkipped.Load(),
+		"blob_fill_queued":             m.BlobFillQueued.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),
 		"prefetch_wasted":              m.PrefetchWasted.Load(),
 		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),

@@ -1049,6 +1049,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_blob_range_remote_bytes_total", metrics["blob_range_remote_bytes"])
 	writeMetricLine(w, "fuse_blob_promoted_total", metrics["blob_promoted"])
 	writeMetricLine(w, "fuse_blob_promote_skipped_total", metrics["blob_promote_skipped"])
+	writeMetricLine(w, "fuse_blob_fill_queued_total", metrics["blob_fill_queued"])
 	writeMetricLine(w, "fuse_range_prefetch_hits_total", metrics["prefetch_hits"])
 	writeMetricLine(w, "fuse_range_prefetch_wasted_total", metrics["prefetch_wasted"])
 	writeMetricLine(w, "fuse_cache_read_wall_bytes_total", metrics["read_wall_bytes"])

@@ -77,6 +77,7 @@ func (cm *DefaultCacheManager) PlanRange(ctx context.Context, entry *CacheEntry,
 		end = entry.Size
 	}
 	started := time.Now()
+	cm.noteBlobRead()
 	var localBytes, remoteBytes int64
 
 	// A whole local copy (store node, warm, or assembled file) serves any range.
@@ -135,12 +136,9 @@ func (cm *DefaultCacheManager) PlanRange(ctx context.Context, entry *CacheEntry,
 			return nil, func() {}, err
 		}
 		if tier != TierNVMe {
-			// Keep the chunk: nydusd caches what it reads, but the next
-			// container start on this node (nydus cache reset, new image
-			// sharing the blob) and peers reading from this node need it on
-			// NVMe. The promotion gate in maybeAdvertiseFetchedChunk is for
-			// FUSE read bursts and skipped most chunks of a blob read.
-			cm.promoteBlobChunk(entry.FilePath, chunkPath, data)
+			// Keep the chunk for the next start on this node and for peers,
+			// but not now: see deferBlobFill.
+			cm.deferBlobFill(entry.FilePath, chunkPath, idx)
 		}
 		from, to = clampChunkSlice(from, to, int64(len(data)))
 		pieces = append(pieces, RangePiece{data: data[from:to], Tier: tier})
@@ -181,34 +179,96 @@ func (cm *DefaultCacheManager) openLocalExact(path string, want int64) (*os.File
 	return reader.f, true
 }
 
-// promoteBlobChunk lands a remotely fetched blob chunk on NVMe and advertises
-// this node as a holder, in the background and at most blobPromoteInflight at
-// a time. A chunk that cannot get a slot is dropped from promotion, not
-// queued: the read already succeeded.
-func (cm *DefaultCacheManager) promoteBlobChunk(filePath, chunkPath string, data []byte) {
-	if len(data) == 0 {
+// Deferred blob fills. Writing fetched chunks to NVMe while the container is
+// starting doubled the node's disk work: nydusd writes its own cache of the
+// same bytes, and the fill wrote all 13 GB of a 7B image's chunks at the same
+// time (~35 s of write at the disk's ~350 MB/s), on the disk vLLM was
+// starting from. Fills now queue and run only after blob reads have been
+// quiet for blobFillQuietPeriod, so the start gets the disk and the chunks
+// still land for the next start and for peers.
+const (
+	blobFillQuietPeriod = 15 * time.Second
+	blobFillQueueMax    = 4096 // chunks; ~64 GiB at 16 MiB, beyond any image
+)
+
+type blobFillKey struct {
+	filePath, chunkPath string
+	chunkIndex          int64
+}
+
+type blobFillQueue struct {
+	mu       sync.Mutex
+	pending  []blobFillKey
+	queued   map[string]struct{}
+	lastRead time.Time
+	started  bool
+}
+
+// noteBlobRead records blob-read activity, which holds deferred fills back.
+func (cm *DefaultCacheManager) noteBlobRead() {
+	q := &cm.blobFillQ
+	q.mu.Lock()
+	q.lastRead = time.Now()
+	q.mu.Unlock()
+}
+
+// deferBlobFill queues a whole-chunk fill for after reads go quiet.
+func (cm *DefaultCacheManager) deferBlobFill(filePath, chunkPath string, chunkIndex int64) {
+	q := &cm.blobFillQ
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.queued == nil {
+		q.queued = make(map[string]struct{})
+	}
+	if _, ok := q.queued[chunkPath]; ok {
 		return
 	}
-	select {
-	case cm.blobPromoteSem() <- struct{}{}:
-	default:
+	if len(q.pending) >= blobFillQueueMax {
 		cm.metrics.BlobPromoteSkipped.Add(1)
 		return
 	}
-	dataCopy := make([]byte, len(data)) // data is shared with the range cache
-	copy(dataCopy, data)
-	cm.goBackground(func() {
-		defer func() { <-cm.blobPromoteSem() }()
-		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, dataCopy)
-		cm.metrics.BlobPromoted.Add(1)
-	})
+	q.queued[chunkPath] = struct{}{}
+	q.pending = append(q.pending, blobFillKey{filePath, chunkPath, chunkIndex})
+	cm.metrics.BlobFillQueued.Add(1)
+	if !q.started {
+		q.started = true
+		cm.goLoop(cm.runBlobFills)
+	}
 }
 
-const blobPromoteInflight = 32
-
-func (cm *DefaultCacheManager) blobPromoteSem() chan struct{} {
-	cm.blobPromoteOnce.Do(func() { cm.blobPromote = make(chan struct{}, blobPromoteInflight) })
-	return cm.blobPromote
+// runBlobFills drains the queue once blob reads have been quiet long enough,
+// pausing again whenever reads resume. Exits on shutdown.
+func (cm *DefaultCacheManager) runBlobFills() {
+	q := &cm.blobFillQ
+	ctx := cm.shutdownCtx
+	if ctx == nil { // hand-built managers (tests) have no shutdown context
+		ctx = context.Background()
+	}
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		for {
+			q.mu.Lock()
+			quiet := time.Since(q.lastRead) >= blobFillQuietPeriod
+			if !quiet || len(q.pending) == 0 {
+				q.mu.Unlock()
+				break
+			}
+			k := q.pending[0]
+			q.pending = q.pending[1:]
+			delete(q.queued, k.chunkPath)
+			q.mu.Unlock()
+			cm.fillBlobChunk(ctx, k.filePath, k.chunkPath, k.chunkIndex)
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
 }
 
 // peerRangeReader is PeerStorage's ranged read (store first).
@@ -235,45 +295,28 @@ func (cm *DefaultCacheManager) readBlobWindowFromPeer(ctx context.Context, fileP
 	if err != nil || int64(len(data)) != n {
 		return nil, false
 	}
-	cm.fillBlobChunk(filePath, chunkPath, chunkIndex)
+	cm.deferBlobFill(filePath, chunkPath, chunkIndex)
 	return data, true
 }
 
 // fillBlobChunk fetches a whole chunk (store/peer first) and lands it on
-// NVMe, once per chunk, at most blobFillInflight at a time. A chunk that
-// cannot get a slot is left for a later read to fill.
-func (cm *DefaultCacheManager) fillBlobChunk(filePath, chunkPath string, chunkIndex int64) {
+// NVMe, once per chunk. Called from the deferred-fill loop, one at a time.
+func (cm *DefaultCacheManager) fillBlobChunk(ctx context.Context, filePath, chunkPath string, chunkIndex int64) {
 	if !cm.blobFills.start(chunkPath) {
 		return
 	}
-	select {
-	case cm.blobFillSem() <- struct{}{}:
-	default:
-		cm.blobFills.done(chunkPath)
-		cm.metrics.BlobPromoteSkipped.Add(1)
+	defer cm.blobFills.done(chunkPath)
+	if _, ok := cm.openLocalExactCheck(chunkPath); ok {
 		return
 	}
-	cm.goBackground(func() {
-		defer func() { <-cm.blobFillSem(); cm.blobFills.done(chunkPath) }()
-		if _, ok := cm.openLocalExactCheck(chunkPath); ok {
-			return
-		}
-		data, tier, err := cm.readChunkData(cm.shutdownCtx, filePath, chunkIndex, remoteReadOrderPeerFirst, false)
-		if err != nil || tier == TierNVMe {
-			return
-		}
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
-		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, dataCopy)
-		cm.metrics.BlobPromoted.Add(1)
-	})
-}
-
-const blobFillInflight = 32
-
-func (cm *DefaultCacheManager) blobFillSem() chan struct{} {
-	cm.blobFillOnce.Do(func() { cm.blobFill = make(chan struct{}, blobFillInflight) })
-	return cm.blobFill
+	data, tier, err := cm.readChunkData(ctx, filePath, chunkIndex, remoteReadOrderPeerFirst, false)
+	if err != nil || tier == TierNVMe {
+		return
+	}
+	dataCopy := make([]byte, len(data)) // data is shared with the range cache
+	copy(dataCopy, data)
+	cm.promoteChunkAndAdvertise(ctx, filePath, chunkPath, dataCopy)
+	cm.metrics.BlobPromoted.Add(1)
 }
 
 // openLocalExactCheck reports whether chunkPath already has a local file.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func planBytes(t *testing.T, pieces []RangePiece) []byte {
@@ -142,12 +143,15 @@ func TestLocalChunkFile_WholeParentIndexedUnchunked(t *testing.T) {
 	}
 }
 
-// A chunk PlanRange fetched remotely lands on NVMe, so the next range over it
-// is served from the local file.
-func TestPlanRange_RemoteChunkPromoted(t *testing.T) {
+// A chunk PlanRange fetched remotely is not written while reads are active
+// (the container start owns the disk); it lands once reads go quiet, and the
+// next range over it is then served from the local file.
+func TestPlanRange_RemoteChunkFilledAfterQuiet(t *testing.T) {
 	const chunkSize = 1 << 20
 	cm, parent, want := chunkWindowManager(t, chunkSize, 3)
-	cm.shutdownCtx = context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cm.shutdownCtx = ctx
 	cm.config.MaxNVMeSize = 64 << 20
 	entry, _ := cm.entries.get(parent)
 	local := filepath.Join(cm.config.NVMePath, "chunked.bin_chunk_1")
@@ -162,9 +166,24 @@ func TestPlanRange_RemoteChunkPromoted(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
-	cm.bgWg.Wait()
+	if cm.metrics.BlobFillQueued.Load() != 1 {
+		t.Fatalf("queued fills = %d, want 1", cm.metrics.BlobFillQueued.Load())
+	}
+	time.Sleep(1500 * time.Millisecond) // reads just happened: not quiet yet
+	if _, err := os.Stat(local); err == nil {
+		t.Fatal("chunk written while reads were active")
+	}
+
+	// Pretend reads went quiet long ago; the fill loop drains on its next tick.
+	cm.blobFillQ.mu.Lock()
+	cm.blobFillQ.lastRead = time.Now().Add(-time.Hour)
+	cm.blobFillQ.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for cm.metrics.BlobPromoted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
 	if info, err := os.Stat(local); err != nil || info.Size() != chunkSize {
-		t.Fatalf("chunk not promoted to NVMe: %v", err)
+		t.Fatalf("chunk not filled after reads went quiet: %v", err)
 	}
 	pieces, release, err := cm.PlanRange(context.Background(), entry, chunkSize+10, 100)
 	defer release()
@@ -172,6 +191,6 @@ func TestPlanRange_RemoteChunkPromoted(t *testing.T) {
 		t.Fatalf("second read not served from the local file: err=%v pieces=%d", err, len(pieces))
 	}
 	if got := planBytes(t, pieces); !bytes.Equal(got, want[chunkSize+10:chunkSize+110]) {
-		t.Fatal("promoted chunk bytes mismatch")
+		t.Fatal("filled chunk bytes mismatch")
 	}
 }
