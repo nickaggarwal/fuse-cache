@@ -1,0 +1,5 @@
+*
+!rust/store/Cargo.toml
+!rust/store/Cargo.lock
+!rust/store/rust-toolchain.toml
+!rust/store/crates/

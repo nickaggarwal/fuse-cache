@@ -1,0 +1,33 @@
+# store-front image: the Rust front server (and the burst load generator)
+# for store nodes. linux/amd64. Build from the repo root:
+#
+#   docker buildx build --platform linux/amd64 -f rust/store/Dockerfile.store \
+#     -t <registry>/fusedata-store-front:<tag> --push .
+#
+# The Go client keeps running from the fuse-client image; this image only
+# carries the front server. See rust/store/STORE.md.
+FROM --platform=$BUILDPLATFORM rust:1.90-slim-bookworm AS build
+ARG TARGETARCH
+WORKDIR /w
+RUN if [ "$TARGETARCH" = amd64 ] && [ "$(uname -m)" != x86_64 ]; then \
+      apt-get update && apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+      && rm -rf /var/lib/apt/lists/* && rustup target add x86_64-unknown-linux-gnu; \
+    fi
+COPY rust/store/Cargo.toml rust/store/Cargo.lock rust/store/rust-toolchain.toml ./
+COPY rust/store/crates ./crates
+RUN set -e; \
+    if [ "$TARGETARCH" = amd64 ] && [ "$(uname -m)" != x86_64 ]; then \
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc; \
+      cargo build --release --locked --target x86_64-unknown-linux-gnu -p store-front; \
+      mkdir -p target/release && cp target/x86_64-unknown-linux-gnu/release/store-front target/x86_64-unknown-linux-gnu/release/burst target/release/; \
+    else \
+      cargo build --release --locked -p store-front; \
+    fi; \
+    strip target/release/store-front target/release/burst 2>/dev/null || true
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /w/target/release/store-front /usr/local/bin/store-front
+COPY --from=build /w/target/release/burst /usr/local/bin/burst
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/store-front"]

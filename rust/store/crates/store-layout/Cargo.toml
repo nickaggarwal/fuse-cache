@@ -1,0 +1,17 @@
+[package]
+name = "store-layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Resolve fuse-client cache-dir paths the way the Go client does (peer reads, OCI blob ranges)"
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+percent-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

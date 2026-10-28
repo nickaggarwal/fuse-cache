@@ -84,6 +84,8 @@ func main() {
 		err = cmdAzurePut(args)
 	case "gen-blob":
 		err = cmdGenBlob(args)
+	case "serve-api":
+		err = cmdServeAPI(args)
 	case "bench-blob":
 		err = cmdBenchBlob(args)
 	default:
@@ -600,7 +602,38 @@ func parsePub(coord coordinator.Coordinator, specs []string) error {
 func coordHandler(coord coordinator.Coordinator) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/files/location", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			var loc coordinator.FileLocation
+			if err := json.NewDecoder(r.Body).Decode(&loc); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			if err := coord.UpdateFileLocation(r.Context(), &loc); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.Write([]byte(`{"success": true}`))
+			return
+		case http.MethodDelete:
+			q := r.URL.Query()
+			if err := coord.DeleteFileLocation(r.Context(), q.Get("path"), q.Get("peer_id"), q.Get("whole_path") == "true"); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.Write([]byte(`{"success": true}`))
+			return
+		}
 		locs, err := coord.GetFileLocation(r.Context(), r.URL.Query().Get("path"))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(locs)
+	})
+	mux.HandleFunc("/api/files/locations", func(w http.ResponseWriter, r *http.Request) {
+		locs, err := coord.ListFileLocations(r.Context(), r.URL.Query().Get("prefix"))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
