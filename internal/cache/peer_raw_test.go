@@ -60,3 +60,28 @@ func TestReadFromPeerRaw_ErrorStatus(t *testing.T) {
 		t.Fatal("expected error on 404, got nil")
 	}
 }
+
+// A ranged read asks for off/len and returns exactly that window; a holder
+// that ignores off/len (older build) answers the whole object, which is
+// sliced client-side.
+func TestReadRangeFromPeerRaw(t *testing.T) {
+	obj := []byte(strings.Repeat("0123456789", 100))
+	for _, honours := range []bool{true, false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body := obj
+			if honours {
+				off, _ := strconv.Atoi(r.URL.Query().Get("off"))
+				n, _ := strconv.Atoi(r.URL.Query().Get("len"))
+				body = obj[off : off+n]
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Write(body)
+		}))
+		ps := newRawPeerStorage()
+		got, err := ps.readRangeFromPeerRaw(context.Background(), strings.TrimPrefix(srv.URL, "http://"), "/b_chunk_0", 123, 40)
+		srv.Close()
+		if err != nil || string(got) != string(obj[123:163]) {
+			t.Fatalf("honours=%t: err=%v got %q", honours, err, got)
+		}
+	}
+}

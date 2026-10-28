@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -123,6 +124,11 @@ func (cm *DefaultCacheManager) PlanRange(ctx context.Context, entry *CacheEntry,
 			localBytes += to - from
 			continue
 		}
+		if win, ok := cm.readBlobWindowFromPeer(ctx, entry.FilePath, chunkPath, idx, from, to-from); ok {
+			pieces = append(pieces, RangePiece{data: win, Tier: TierPeer})
+			remoteBytes += int64(len(win))
+			continue
+		}
 		data, tier, err := cm.readChunkData(ctx, entry.FilePath, idx, remoteReadOrderPeerFirst, false)
 		if err != nil {
 			release()
@@ -198,9 +204,109 @@ func (cm *DefaultCacheManager) promoteBlobChunk(filePath, chunkPath string, data
 	})
 }
 
-const blobPromoteInflight = 16
+const blobPromoteInflight = 32
 
 func (cm *DefaultCacheManager) blobPromoteSem() chan struct{} {
 	cm.blobPromoteOnce.Do(func() { cm.blobPromote = make(chan struct{}, blobPromoteInflight) })
 	return cm.blobPromote
+}
+
+// peerRangeReader is PeerStorage's ranged read (store first).
+type peerRangeReader interface {
+	ReadRange(ctx context.Context, path string, off, n int64) ([]byte, error)
+}
+
+// readBlobWindowFromPeer answers a window of a missing chunk with a ranged
+// read from the store or a peer, and fills the whole chunk onto NVMe in the
+// background. Waiting for the whole 16 MiB chunk before answering a ~1 MiB
+// window kept first reads from the store at 38-52 s of weight loading
+// against Zot's 18 s on cpu-w3, which streams just the range. Reports false
+// when no holder answers, so the caller takes the whole-chunk path (which
+// also tries the cloud).
+func (cm *DefaultCacheManager) readBlobWindowFromPeer(ctx context.Context, filePath, chunkPath string, chunkIndex, from, n int64) ([]byte, bool) {
+	if _, _, cached := cm.getChunkFromRangeCache(filePath, chunkIndex); cached {
+		return nil, false // a fill already landed it in memory: use that
+	}
+	pr, ok := cm.peerStorage.(peerRangeReader)
+	if !ok || n <= 0 {
+		return nil, false
+	}
+	data, err := pr.ReadRange(ctx, chunkPath, from, n)
+	if err != nil || int64(len(data)) != n {
+		return nil, false
+	}
+	cm.fillBlobChunk(filePath, chunkPath, chunkIndex)
+	return data, true
+}
+
+// fillBlobChunk fetches a whole chunk (store/peer first) and lands it on
+// NVMe, once per chunk, at most blobFillInflight at a time. A chunk that
+// cannot get a slot is left for a later read to fill.
+func (cm *DefaultCacheManager) fillBlobChunk(filePath, chunkPath string, chunkIndex int64) {
+	if !cm.blobFills.start(chunkPath) {
+		return
+	}
+	select {
+	case cm.blobFillSem() <- struct{}{}:
+	default:
+		cm.blobFills.done(chunkPath)
+		cm.metrics.BlobPromoteSkipped.Add(1)
+		return
+	}
+	cm.goBackground(func() {
+		defer func() { <-cm.blobFillSem(); cm.blobFills.done(chunkPath) }()
+		if _, ok := cm.openLocalExactCheck(chunkPath); ok {
+			return
+		}
+		data, tier, err := cm.readChunkData(cm.shutdownCtx, filePath, chunkIndex, remoteReadOrderPeerFirst, false)
+		if err != nil || tier == TierNVMe {
+			return
+		}
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, dataCopy)
+		cm.metrics.BlobPromoted.Add(1)
+	})
+}
+
+const blobFillInflight = 32
+
+func (cm *DefaultCacheManager) blobFillSem() chan struct{} {
+	cm.blobFillOnce.Do(func() { cm.blobFill = make(chan struct{}, blobFillInflight) })
+	return cm.blobFill
+}
+
+// openLocalExactCheck reports whether chunkPath already has a local file.
+func (cm *DefaultCacheManager) openLocalExactCheck(chunkPath string) (int64, bool) {
+	full := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(chunkPath, "/"))
+	info, err := os.Stat(full)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		return 0, false
+	}
+	return info.Size(), true
+}
+
+// inflightSet tracks keys with a fill in progress. The zero value is usable.
+type inflightSet struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+func (s *inflightSet) start(k string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = make(map[string]struct{})
+	}
+	if _, ok := s.m[k]; ok {
+		return false
+	}
+	s.m[k] = struct{}{}
+	return true
+}
+
+func (s *inflightSet) done(k string) {
+	s.mu.Lock()
+	delete(s.m, k)
+	s.mu.Unlock()
 }

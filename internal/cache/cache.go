@@ -410,6 +410,11 @@ type DefaultCacheManager struct {
 	// (range_plan.go); created on first use so hand-built managers work.
 	blobPromote     chan struct{}
 	blobPromoteOnce sync.Once
+	// blobFill bounds and blobFills dedupes background whole-chunk fills
+	// behind ranged blob reads (range_plan.go).
+	blobFill        chan struct{}
+	blobFillOnce    sync.Once
+	blobFills       inflightSet
 	tierPerf        *tierPerfTracker
 	chunkCompletion chunkCompletionState
 	// evictSignal wakes the watermark evictor between its periodic sweeps.

@@ -1311,3 +1311,85 @@ func (ps *PeerStorage) sizeOnPeer(ctx context.Context, grpcAddr, path string) (i
 	}
 	return resp.Size, nil
 }
+
+// ReadRange reads [off, off+n) of path from one holder, store first, over the
+// raw HTTP transport. It is for readers that need a window now and do not
+// want to wait for the whole object (the blob endpoint on a chunk miss); the
+// caller lands the whole object separately. Busy and miss move on to the next
+// holder; a holder without sub-range support answers the whole object, which
+// is sliced here.
+func (ps *PeerStorage) ReadRange(ctx context.Context, path string, off, n int64) ([]byte, error) {
+	if !ps.rawTransport || ps.httpClient == nil {
+		return nil, fmt.Errorf("peer range read needs the raw transport")
+	}
+	peers, err := ps.getPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	preferred, _ := ps.partitionPeersForPath(ctx, path, peers)
+	preferred = storeFirst(orderedPeersForPath(preferred, path))
+	var lastErr error = &peerMissError{addr: "none", path: path}
+	for _, peer := range preferred {
+		if peer == nil || peer.Status != "active" || peer.Address == "" {
+			continue
+		}
+		start := time.Now()
+		data, err := ps.readRangeFromPeerRaw(ctx, peer.Address, path, off, n)
+		switch {
+		case err == nil:
+			ps.pairLatency.record(peer.ID, time.Since(start), true)
+			return data, nil
+		case isPeerMiss(err):
+			ps.missSkipsTotal.Add(1)
+		case isPeerBusy(err):
+		default:
+			ps.pairLatency.record(peer.ID, time.Since(start), false)
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
+func (ps *PeerStorage) readRangeFromPeerRaw(ctx context.Context, httpAddr, path string, off, n int64) ([]byte, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, ps.timeout)
+	defer cancel()
+	endpoint := fmt.Sprintf("http://%s/api/peer/read?path=%s&off=%d&len=%d", httpAddr, url.QueryEscape(path), off, n)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ps.apiKey != "" {
+		req.Header.Set("X-API-Key", ps.apiKey)
+	}
+	resp, err := ps.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusServiceUnavailable:
+		return nil, &peerBusyError{addr: httpAddr}
+	case http.StatusNotFound:
+		return nil, &peerMissError{addr: httpAddr, path: path}
+	default:
+		return nil, fmt.Errorf("peer range read %s: status %d", httpAddr, resp.StatusCode)
+	}
+	if resp.ContentLength > n { // an older holder ignored off/len: whole object
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if off >= int64(len(data)) {
+			return []byte{}, nil
+		}
+		return data[off:min(off+n, int64(len(data)))], nil
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, n))
+}

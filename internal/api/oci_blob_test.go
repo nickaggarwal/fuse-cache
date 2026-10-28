@@ -180,3 +180,42 @@ func TestRegistryBlobPlannedPath(t *testing.T) {
 		}
 	}
 }
+
+// The peer read endpoint serves an off/len window of a chunk of a whole
+// parent, and of a whole file.
+func TestPeerReadSubRange(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{NVMePath: t.TempDir(), MaxNVMeSize: 64 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.Shutdown()
+	srv := httptest.NewServer(NewHandler(cm, nil, "p", "").SetupRoutes())
+	defer srv.Close()
+	blob := make([]byte, 3<<20)
+	for i := range blob {
+		blob[i] = byte(i * 13 % 251)
+	}
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/files/w.bin", bytes.NewReader(blob))
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("upload: %v", err)
+	}
+	get := func(q string) []byte {
+		resp, err := http.Get(srv.URL + "/api/peer/read?" + q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s: status %d %s", q, resp.StatusCode, b)
+		}
+		return b
+	}
+	// Chunked upload: the chunk files exist; whole-parent and chunk paths both work.
+	if got := get("path=/w.bin_chunk_1&off=100&len=50"); !bytes.Equal(got, blob[1<<20+100:1<<20+150]) {
+		t.Fatalf("chunk window mismatch: %d bytes", len(got))
+	}
+	if got := get("path=/w.bin_chunk_2&off=1048000&len=1000"); !bytes.Equal(got, blob[2<<20+1048000:3<<20]) {
+		t.Fatalf("clamped chunk window mismatch: %d bytes", len(got))
+	}
+}

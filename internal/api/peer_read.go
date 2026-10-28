@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -62,13 +63,29 @@ func (h *Handler) handlePeerRead(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
+	// Optional sub-range of the object: off/len (bytes). A reader that needs
+	// a 1 MiB window of a 16 MiB chunk gets 1 MiB, not the chunk.
+	subOff, subLen, sub, err := peerReadSubRange(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Whole file held locally: stream it directly (sendfile).
 	if localPath, ok := lcs.LocalFilePath(ctx, clean); ok {
+		if sub {
+			h.serveSubRange(w, localPath, 0, -1, subOff, subLen)
+			return
+		}
 		h.serveFileRange(w, localPath, 0, -1)
 		return
 	}
 	// Chunk of a whole parent file: stream the byte range (sendfile).
 	if localPath, offset, length, ok := lcs.LocalChunkFile(ctx, clean); ok {
+		if sub {
+			h.serveSubRange(w, localPath, offset, length, subOff, subLen)
+			return
+		}
 		h.serveFileRange(w, localPath, offset, length)
 		return
 	}
@@ -115,4 +132,40 @@ func (h *Handler) serveFileRange(w http.ResponseWriter, localPath string, offset
 		// Header/Content-Length already written; nothing to do but stop.
 		h.logger.Printf("peer read stream error path=%s off=%d len=%d: %v", localPath, offset, length, err)
 	}
+}
+
+// peerReadSubRange parses the optional off/len query parameters.
+func peerReadSubRange(r *http.Request) (off, n int64, ok bool, err error) {
+	q := r.URL.Query()
+	if q.Get("off") == "" && q.Get("len") == "" {
+		return 0, 0, false, nil
+	}
+	off, err1 := strconv.ParseInt(q.Get("off"), 10, 64)
+	n, err2 := strconv.ParseInt(q.Get("len"), 10, 64)
+	if err1 != nil || err2 != nil || off < 0 || n <= 0 {
+		return 0, 0, false, fmt.Errorf("off and len must be a byte offset and a positive length")
+	}
+	return off, n, true, nil
+}
+
+// serveSubRange serves [subOff, subOff+subLen) of the object held at
+// [offset, offset+length) of localPath (length < 0: to end of file), clamped
+// to the object.
+func (h *Handler) serveSubRange(w http.ResponseWriter, localPath string, offset, length, subOff, subLen int64) {
+	if length < 0 {
+		info, err := os.Stat(localPath)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		length = info.Size() - offset
+	}
+	if subOff >= length {
+		http.Error(w, "range outside object", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if subOff+subLen > length {
+		subLen = length - subOff
+	}
+	h.serveFileRange(w, localPath, offset+subOff, subLen)
 }
