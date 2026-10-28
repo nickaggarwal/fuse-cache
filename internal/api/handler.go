@@ -1043,6 +1043,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_range_whole_file_read_bytes_total", metrics["whole_file_range_read_bytes"])
 	writeMetricLine(w, "fuse_range_chunk_window_reads_total", metrics["chunk_window_reads"])
 	writeMetricLine(w, "fuse_range_chunk_window_read_bytes_total", metrics["chunk_window_read_bytes"])
+	writeMetricLine(w, "fuse_blob_range_local_bytes_total", metrics["blob_range_local_bytes"])
+	writeMetricLine(w, "fuse_blob_range_remote_bytes_total", metrics["blob_range_remote_bytes"])
 	writeMetricLine(w, "fuse_range_prefetch_hits_total", metrics["prefetch_hits"])
 	writeMetricLine(w, "fuse_range_prefetch_wasted_total", metrics["prefetch_wasted"])
 	writeMetricLine(w, "fuse_cache_read_wall_bytes_total", metrics["read_wall_bytes"])

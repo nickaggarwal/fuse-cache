@@ -3,11 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"fuse-client/internal/cache"
 )
@@ -128,5 +131,52 @@ func TestRegistryBlobViaProxy(t *testing.T) {
 	}
 	if resp := get("/v2/models/qwen7b-cpu/blobs/sha256:"+strings.Repeat("cd", 32), "bytes=0-15"); resp.StatusCode != 503 {
 		t.Fatalf("missing blob: %d, want 503 so nydusd falls back", resp.StatusCode)
+	}
+}
+
+// End to end on a real cache manager: a multi-chunk blob uploaded through the
+// file API is served by the planned path (local chunk files, sendfile) with
+// exact bytes for ranges inside a chunk, across chunks and at the tail.
+func TestRegistryBlobPlannedPath(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{
+		NVMePath:     t.TempDir(),
+		MaxNVMeSize:  64 << 20,
+		ChunkSize:    1 << 20,
+		CloudTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.Shutdown()
+	srv := httptest.NewServer(NewHandler(cm, nil, "p", "").SetupRoutes())
+	defer srv.Close()
+
+	digest := strings.Repeat("9a", 32)
+	blob := make([]byte, 3<<20+12345)
+	for i := range blob {
+		blob[i] = byte(i * 31 % 253)
+	}
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/api/files/oci/sha256/"+digest, bytes.NewReader(blob))
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("upload: %v %v", err, resp)
+	}
+
+	for _, c := range []struct{ start, end int }{
+		{10, 4095},
+		{1<<20 - 100, 1<<20 + 99},
+		{100, 2<<20 + 500},
+		{3 << 20, len(blob) - 1},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/r/blobs/sha256:"+digest, nil)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", c.start, c.end))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 206 || !bytes.Equal(got, blob[c.start:c.end+1]) {
+			t.Fatalf("range %d-%d: status %d, %d bytes, match=%t", c.start, c.end, resp.StatusCode, len(got), bytes.Equal(got, blob[c.start:c.end+1]))
+		}
 	}
 }

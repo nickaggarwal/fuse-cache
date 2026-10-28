@@ -32,13 +32,19 @@ type entryLookup interface {
 	LookupEntry(ctx context.Context, filePath string, forceRefresh bool) (*cache.CacheEntry, bool)
 }
 
+// rangePlanner is DefaultCacheManager's read path for callers that do their
+// own read-ahead (cache/range_plan.go).
+type rangePlanner interface {
+	PlanRange(ctx context.Context, entry *cache.CacheEntry, offset, length int64) ([]cache.RangePiece, func(), error)
+}
+
 type rangeReader interface {
 	ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error)
 }
 
 // handleOCIBlob serves nydusd's http-proxy backend: HEAD for the blob size,
-// GET with a Range header for the bytes. The bytes come through the normal
-// read path, so a miss is filled from a peer, the store or the cloud.
+// GET with a Range header for the bytes. A miss is filled from the store, a
+// peer or the cloud.
 func (h *Handler) handleOCIBlob(w http.ResponseWriter, r *http.Request) {
 	h.serveOCIBlob(w, r, http.StatusNotFound)
 }
@@ -65,11 +71,12 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 	filePath := OCIBlobPrefix + m[2]
 	ctx := r.Context()
 
-	size, ok := h.ociBlobSize(ctx, filePath)
+	entry, ok := h.ociBlobEntry(ctx, filePath)
 	if !ok {
 		http.Error(w, "blob not found", missing)
 		return
 	}
+	size := entry.Size
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", "application/octet-stream")
 
@@ -89,6 +96,10 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 		end = start + ociBlobMaxRange - 1
 	}
 
+	if rp, ok := h.cacheManager.(rangePlanner); ok {
+		h.writePlannedRange(w, r.Context(), rp, entry, start, end, m[2][:12])
+		return
+	}
 	rr, ok := h.cacheManager.(rangeReader)
 	if !ok {
 		http.Error(w, "range reads not supported", http.StatusNotImplemented)
@@ -106,21 +117,47 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 	_, _ = w.Write(data)
 }
 
-func (h *Handler) ociBlobSize(ctx context.Context, filePath string) (int64, bool) {
+// writePlannedRange serves a range through PlanRange: local chunk files go to
+// the socket with sendfile, missing chunks are fetched once (store/peer
+// first, no read-ahead). Every piece is resolved before the status line, so
+// a failed fetch still answers 502 and nydusd falls back.
+func (h *Handler) writePlannedRange(w http.ResponseWriter, ctx context.Context, rp rangePlanner, entry *cache.CacheEntry, start, end int64, id string) {
+	pieces, release, err := rp.PlanRange(ctx, entry, start, end-start+1)
+	defer release()
+	if err != nil {
+		h.logger.Printf("oci blob %s range %d-%d: %v", id, start, end, err)
+		http.Error(w, "read failed", http.StatusBadGateway) // 5xx: nydusd falls back
+		return
+	}
+	var n int64
+	for _, p := range pieces {
+		n += p.Len()
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+n-1, entry.Size))
+	w.WriteHeader(http.StatusPartialContent)
+	for _, p := range pieces {
+		if _, err := p.WriteTo(w); err != nil {
+			return // client went away; the status is already sent
+		}
+	}
+}
+
+func (h *Handler) ociBlobEntry(ctx context.Context, filePath string) (*cache.CacheEntry, bool) {
 	if l, ok := h.cacheManager.(entryLookup); ok {
 		if e, found := l.LookupEntry(ctx, filePath, false); found && e != nil {
-			return e.Size, true
+			return e, true
 		}
 		if e, found := l.LookupEntry(ctx, filePath, true); found && e != nil {
-			return e.Size, true
+			return e, true
 		}
-		return 0, false
+		return nil, false
 	}
 	e, err := h.cacheManager.Get(ctx, filePath)
 	if err != nil {
-		return 0, false
+		return nil, false
 	}
-	return e.Size, true
+	return &cache.CacheEntry{FilePath: filePath, Size: e.Size}, true
 }
 
 // parseByteRange parses a single "bytes=a-b" or "bytes=a-" range. No header

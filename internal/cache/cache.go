@@ -4222,6 +4222,10 @@ type CacheMetrics struct {
 	// window from a local chunk file (readChunkWindow).
 	ChunkWindowReads     atomic.Int64
 	ChunkWindowReadBytes atomic.Int64
+	// BlobRange{Local,Remote}Bytes count bytes PlanRange served from local
+	// files and from remote tiers (the blob endpoint's path).
+	BlobRangeLocalBytes  atomic.Int64
+	BlobRangeRemoteBytes atomic.Int64
 	PrefetchHits         atomic.Int64
 	PrefetchWasted       atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
@@ -4408,6 +4412,8 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"whole_file_range_read_bytes":  m.WholeFileRangeReadBytes.Load(),
 		"chunk_window_reads":           m.ChunkWindowReads.Load(),
 		"chunk_window_read_bytes":      m.ChunkWindowReadBytes.Load(),
+		"blob_range_local_bytes":       m.BlobRangeLocalBytes.Load(),
+		"blob_range_remote_bytes":      m.BlobRangeRemoteBytes.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),
 		"prefetch_wasted":              m.PrefetchWasted.Load(),
 		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),
