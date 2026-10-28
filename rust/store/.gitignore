@@ -1,2 +1,4 @@
 /target/
 /target-linux/
+# The repo root ignores bin/ (Go build output); Cargo's src/bin/ is source.
+!crates/*/src/bin/
