@@ -89,6 +89,7 @@ func main() {
 		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
 		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", false, "Serve windows of a chunked file straight from its whole local copy (exact bytes, no read amplification) instead of the per-chunk path. Off by default: it has no read-ahead, so on fast local NVMe it is slower than the prefetching chunk path (A100 node, page cache dropped: 21.1 s vs 8.7 s for 15 GB). FUSE_RANGE_WHOLE_FILE_READS env overrides")
 		noChunkWindowReads   = flag.Bool("no-chunk-window-reads", false, "Read a whole chunk for every random window that misses the range cache, instead of only the window's bytes from the local chunk file. Off by default; sequential streams use the per-chunk path either way")
+		noBlobFill           = flag.Bool("no-blob-fill", false, "Do not keep fetched OCI blob chunks on this node (the blob endpoint still serves them). For model nodes where nydusd's own cache already holds the image; FUSE_NO_BLOB_FILL=1 sets it")
 		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
 		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
 		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
@@ -249,6 +250,7 @@ func main() {
 		RangePrefetchMaxChunks:     *prefetchMaxChunks,
 		DisableWholeFileRangeReads: !*rangeWholeFileReads,
 		DisableChunkWindowReads:    *noChunkWindowReads,
+		NoBlobFill:                 *noBlobFill || os.Getenv("FUSE_NO_BLOB_FILL") == "1",
 		RangeChunkCacheSize:        *rangeChunkCache,
 		RangeChunkCacheMaxBytes:    int64(*rangeChunkCacheMaxMB) * 1024 * 1024,
 		RangePrefetchMaxBytes:      int64(*rangePrefetchMaxMB) * 1024 * 1024,

@@ -238,6 +238,13 @@ type CacheConfig struct {
 	// streams take the per-chunk path either way.
 	DisableChunkWindowReads bool
 
+	// NoBlobFill stops the blob endpoint from keeping fetched blob chunks on
+	// this node's NVMe. nydusd already keeps every byte it reads in its own
+	// cache on the same disk, so on a model node the fuse copy is a second
+	// copy of the image. With it set the node holds no image chunks and is
+	// never a peer for them; the store and other nodes serve them instead.
+	NoBlobFill bool
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64

@@ -219,6 +219,9 @@ func (cm *DefaultCacheManager) noteBlobRead() {
 
 // deferBlobFill queues a whole-chunk fill for after reads go quiet.
 func (cm *DefaultCacheManager) deferBlobFill(filePath, chunkPath string, chunkIndex int64) {
+	if cm.config.NoBlobFill {
+		return // nydusd's cache is this node's only copy (single copy, option C)
+	}
 	q := &cm.blobFillQ
 	q.mu.Lock()
 	defer q.mu.Unlock()

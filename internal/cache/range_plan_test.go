@@ -237,3 +237,24 @@ func TestBlobFillRetriesThenDrops(t *testing.T) {
 		t.Fatalf("fill still queued after %d attempts", blobFillMaxAttempts)
 	}
 }
+
+// With NoBlobFill a remote blob chunk is served but never queued to land on
+// this node: nydusd's cache is the node's only copy.
+func TestPlanRange_NoBlobFill(t *testing.T) {
+	const chunkSize = 1 << 20
+	cm, parent, want := chunkWindowManager(t, chunkSize, 2)
+	cm.config.NoBlobFill = true
+	entry, _ := cm.entries.get(parent)
+	if err := os.Remove(filepath.Join(cm.config.NVMePath, "chunked.bin_chunk_1")); err != nil {
+		t.Fatal(err)
+	}
+	_ = cm.peerStorage.(*mockStorage).Write(context.Background(), parent+"_chunk_1", want[chunkSize:])
+	pieces, release, err := cm.PlanRange(context.Background(), entry, chunkSize+5, 50)
+	defer release()
+	if err != nil || !bytes.Equal(planBytes(t, pieces), want[chunkSize+5:chunkSize+55]) {
+		t.Fatalf("remote read failed: %v", err)
+	}
+	if q := cm.metrics.BlobFillQueued.Load(); q != 0 {
+		t.Fatalf("queued %d fills with NoBlobFill; want 0", q)
+	}
+}
