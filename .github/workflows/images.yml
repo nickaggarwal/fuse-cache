@@ -1,6 +1,8 @@
 # Build and push the fuse-client image (client, coordinator, csi-driver,
-# node-init, globalcp) on each main commit, and publish its digest in the
-# artifacts.json format that sky-control's deploy/skyfleet deploys from.
+# node-init, globalcp) and the store-front image (rust/store, the Rust
+# server in front of the client on store nodes) on each main commit, and
+# publish their digests in the artifacts.json format that sky-control's
+# deploy/skyfleet deploys from.
 # Building is automatic; rolling out is `skyfleet deploy` (manual).
 #
 # Registry login: repository variable ACR_NAME and either OIDC
@@ -21,6 +23,7 @@ concurrency:
 env:
   ACR_NAME: ${{ vars.ACR_NAME }}
   REPO: skyctl-mb/fuse-client
+  STORE_FRONT_REPO: skyctl-mb/fusedata-store-front
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -61,10 +64,27 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=fuse-client
           cache-to: type=gha,mode=max,scope=fuse-client
+      - id: build-store-front
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: rust/store/Dockerfile.store
+          platforms: linux/amd64
+          push: ${{ steps.login.outputs.mode != 'none' }}
+          tags: |
+            ${{ env.ACR_NAME || 'local' }}.azurecr.io/${{ env.STORE_FRONT_REPO }}:main-${{ github.sha }}
+            ${{ env.ACR_NAME || 'local' }}.azurecr.io/${{ env.STORE_FRONT_REPO }}:main
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=fusedata-store-front
+          cache-to: type=gha,mode=max,scope=fusedata-store-front
       - if: steps.login.outputs.mode != 'none'
         run: |
-          printf '{"commit":"%s","repo":"%s","images":{"fuse-client":"%s.azurecr.io/%s@%s"}}\n' \
-            "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$ACR_NAME" "$REPO" "${{ steps.build.outputs.digest }}" | tee artifacts.json
+          printf '{"commit":"%s","repo":"%s","images":{"fuse-client":"%s.azurecr.io/%s@%s","fusedata-store-front":"%s.azurecr.io/%s@%s"}}\n' \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
+            "$ACR_NAME" "$REPO" "${{ steps.build.outputs.digest }}" \
+            "$ACR_NAME" "$STORE_FRONT_REPO" "${{ steps.build-store-front.outputs.digest }}" | tee artifacts.json
       - if: steps.login.outputs.mode != 'none'
         uses: actions/upload-artifact@v4
         with:

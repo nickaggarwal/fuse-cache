@@ -1,0 +1,28 @@
+# cargo-deny policy for the store workspace (the merge candidate).
+# Run: cargo deny --manifest-path rust/store/Cargo.toml check
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory DB; any vulnerability or unsound advisory fails the check.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Exactly the licences in the current tree (all permissive). Adding a
+# dependency under another licence fails the check until it is reviewed.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
