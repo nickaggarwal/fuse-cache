@@ -128,6 +128,14 @@ func (cm *DefaultCacheManager) PlanRange(ctx context.Context, entry *CacheEntry,
 			release()
 			return nil, func() {}, err
 		}
+		if tier != TierNVMe {
+			// Keep the chunk: nydusd caches what it reads, but the next
+			// container start on this node (nydus cache reset, new image
+			// sharing the blob) and peers reading from this node need it on
+			// NVMe. The promotion gate in maybeAdvertiseFetchedChunk is for
+			// FUSE read bursts and skipped most chunks of a blob read.
+			cm.promoteBlobChunk(entry.FilePath, chunkPath, data)
+		}
 		from, to = clampChunkSlice(from, to, int64(len(data)))
 		pieces = append(pieces, RangePiece{data: data[from:to], Tier: tier})
 		if tier == TierNVMe {
@@ -165,4 +173,34 @@ func (cm *DefaultCacheManager) openLocalExact(path string, want int64) (*os.File
 		return nil, false
 	}
 	return reader.f, true
+}
+
+// promoteBlobChunk lands a remotely fetched blob chunk on NVMe and advertises
+// this node as a holder, in the background and at most blobPromoteInflight at
+// a time. A chunk that cannot get a slot is dropped from promotion, not
+// queued: the read already succeeded.
+func (cm *DefaultCacheManager) promoteBlobChunk(filePath, chunkPath string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	select {
+	case cm.blobPromoteSem() <- struct{}{}:
+	default:
+		cm.metrics.BlobPromoteSkipped.Add(1)
+		return
+	}
+	dataCopy := make([]byte, len(data)) // data is shared with the range cache
+	copy(dataCopy, data)
+	cm.goBackground(func() {
+		defer func() { <-cm.blobPromoteSem() }()
+		cm.promoteChunkAndAdvertise(cm.shutdownCtx, filePath, chunkPath, dataCopy)
+		cm.metrics.BlobPromoted.Add(1)
+	})
+}
+
+const blobPromoteInflight = 16
+
+func (cm *DefaultCacheManager) blobPromoteSem() chan struct{} {
+	cm.blobPromoteOnce.Do(func() { cm.blobPromote = make(chan struct{}, blobPromoteInflight) })
+	return cm.blobPromote
 }

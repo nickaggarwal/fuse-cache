@@ -406,8 +406,12 @@ type DefaultCacheManager struct {
 	warmIntents      *warmIntentRegistry
 	chunkAds         *chunkAdvertiser
 	chunkPromoteGate chan struct{}
-	tierPerf         *tierPerfTracker
-	chunkCompletion  chunkCompletionState
+	// blobPromote bounds background promotion of chunks PlanRange fetched
+	// (range_plan.go); created on first use so hand-built managers work.
+	blobPromote     chan struct{}
+	blobPromoteOnce sync.Once
+	tierPerf        *tierPerfTracker
+	chunkCompletion chunkCompletionState
 	// evictSignal wakes the watermark evictor between its periodic sweeps.
 	// Depth 1, non-blocking send: a pending wake already covers a burst.
 	evictSignal    chan struct{}
@@ -909,6 +913,16 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 		chunkSize = cm.effectiveChunkSize(entry)
 	}
 	cm.mu.RUnlock()
+	parentLocal := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(parent, "/"))
+	if hasParent && !chunked {
+		// A whole parent indexed as unchunked: a restart re-indexes a
+		// multi-chunk file from disk without its chunk shape, and readers
+		// still ask for its _chunk_N paths. The chunk stride is this node's
+		// configured size, which is what it was written with.
+		if info, err := os.Stat(parentLocal); err == nil && !info.IsDir() && info.Size() > cm.config.ChunkSize {
+			size, chunked, chunkSize = info.Size(), true, cm.config.ChunkSize
+		}
+	}
 	if chunkSize <= 0 {
 		return "", 0, 0, false
 	}
@@ -925,9 +939,8 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 		length = remaining
 	}
 
-	parentLocal := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(parent, "/"))
 	info, err := os.Stat(parentLocal)
-	if err != nil || info.IsDir() {
+	if err != nil || info.IsDir() || info.Size() < offset+length {
 		return "", 0, 0, false
 	}
 	return parentLocal, offset, length, true
@@ -4226,6 +4239,8 @@ type CacheMetrics struct {
 	// files and from remote tiers (the blob endpoint's path).
 	BlobRangeLocalBytes  atomic.Int64
 	BlobRangeRemoteBytes atomic.Int64
+	BlobPromoted         atomic.Int64
+	BlobPromoteSkipped   atomic.Int64
 	PrefetchHits         atomic.Int64
 	PrefetchWasted       atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
@@ -4414,6 +4429,8 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"chunk_window_read_bytes":      m.ChunkWindowReadBytes.Load(),
 		"blob_range_local_bytes":       m.BlobRangeLocalBytes.Load(),
 		"blob_range_remote_bytes":      m.BlobRangeRemoteBytes.Load(),
+		"blob_promoted":                m.BlobPromoted.Load(),
+		"blob_promote_skipped":         m.BlobPromoteSkipped.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),
 		"prefetch_wasted":              m.PrefetchWasted.Load(),
 		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),
