@@ -456,13 +456,7 @@ impl PeerServer {
                                     return Ok(());
                                 }
                             }
-                            break (
-                                req.method.unwrap_or("").to_string(),
-                                req.path.unwrap_or("").to_string(),
-                                key,
-                                close,
-                                n + body_len,
-                            );
+                            break (req.method.unwrap_or("").to_string(), req.path.unwrap_or("").to_string(), key, close, n + body_len);
                         }
                         Ok(httparse::Status::Partial) => {}
                         Err(_) => {

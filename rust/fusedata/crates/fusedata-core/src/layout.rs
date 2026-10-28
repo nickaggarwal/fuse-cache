@@ -278,12 +278,20 @@ pub enum PrefetchMode {
 }
 
 enum Layout {
-    Whole { cf: Arc<ChunkFile> },
+    Whole {
+        cf: Arc<ChunkFile>,
+    },
     /// Chunk files are opened lazily and cached once found. A slot is never
     /// cached as missing, so a chunk promoted later is picked up.
-    Chunked { stride: i64, total: i64, slots: Vec<OnceLock<Arc<ChunkFile>>> },
+    Chunked {
+        stride: i64,
+        total: i64,
+        slots: Vec<OnceLock<Arc<ChunkFile>>>,
+    },
     /// Known to exist remotely (hint), unchunked, not local.
-    Remote { size: i64 },
+    Remote {
+        size: i64,
+    },
 }
 
 struct Entry {
@@ -674,9 +682,7 @@ impl CacheDir {
                     return false;
                 }
                 match e.id {
-                    Some(id) => std::fs::metadata(self.local_path(&chunk_path(path, 0)))
-                        .map(|m| FileId::of(&m) == id)
-                        .unwrap_or(false),
+                    Some(id) => std::fs::metadata(self.local_path(&chunk_path(path, 0))).map(|m| FileId::of(&m) == id).unwrap_or(false),
                     // Nothing local when resolved: re-resolve at most once a
                     // revalidation period so promoted chunk 0 is noticed.
                     None => self.now_ms().saturating_sub(e.resolved_ms) < self.opts.revalidate.as_millis() as u64,
@@ -1014,7 +1020,6 @@ impl CacheDir {
             cur += take;
         }
     }
-
 
     /// Serve `[off, off+len)` to `f`, without copying when possible.
     ///

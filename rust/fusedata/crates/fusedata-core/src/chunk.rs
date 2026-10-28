@@ -181,11 +181,7 @@ mod tests {
         assert_eq!(plan_range(10, 4, 0, 4), vec![ChunkSpan { index: 0, from: 0, to: 4 }]);
         assert_eq!(
             plan_range(10, 4, 3, 6),
-            vec![
-                ChunkSpan { index: 0, from: 3, to: 9 },
-                ChunkSpan { index: 1, from: 0, to: 5 },
-                ChunkSpan { index: 2, from: 0, to: 1 },
-            ]
+            vec![ChunkSpan { index: 0, from: 3, to: 9 }, ChunkSpan { index: 1, from: 0, to: 5 }, ChunkSpan { index: 2, from: 0, to: 1 },]
         );
         // offset 3 size 6 -> end 9: chunk0 [3,9)->clamped [3,4), chunk1 [0,5)->[0,4), chunk2 [0,1).
         let p = plan_range(10, 4, 3, 6);

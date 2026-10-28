@@ -154,11 +154,12 @@ fn read_view_matches_and_releases_mappings() {
                 let mut off = 0u64;
                 let mut all = Vec::with_capacity(f.size as usize);
                 while (off as i64) < f.size {
-                    let n = c.read_view(&f.path, off, window, |d| {
-                        all.extend_from_slice(d);
-                        d.len()
-                    })
-                    .unwrap();
+                    let n = c
+                        .read_view(&f.path, off, window, |d| {
+                            all.extend_from_slice(d);
+                            d.len()
+                        })
+                        .unwrap();
                     assert!(n > 0, "{} {view:?} zero read at {off}", f.path);
                     off += n as u64;
                 }
@@ -253,11 +254,7 @@ fn wait_port(port: u16) {
 }
 
 fn publish_args(files: &[FixtureFile]) -> Vec<String> {
-    files
-        .iter()
-        .filter(|f| f.chunk_size > 0)
-        .flat_map(|f| ["-publish".to_string(), format!("{}:{}:{}", f.path, f.size, f.chunk_size / MB)])
-        .collect()
+    files.iter().filter(|f| f.chunk_size > 0).flat_map(|f| ["-publish".to_string(), format!("{}:{}:{}", f.path, f.size, f.chunk_size / MB)]).collect()
 }
 
 fn start_go_peer(rb: &Path, dir: &Path, files: &[FixtureFile], key: &str) -> (Proc, String) {

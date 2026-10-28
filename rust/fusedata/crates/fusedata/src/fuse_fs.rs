@@ -14,8 +14,8 @@
 //!   threads (the reply handle is `Send`); with `FUSE_ASYNC_READ` the kernel
 //!   keeps several reads in flight and they are served concurrently.
 
-use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, Request};
 use fusedata_core::tiered::TieredReader;
+use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, Request};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;

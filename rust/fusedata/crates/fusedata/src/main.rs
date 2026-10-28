@@ -276,7 +276,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::Bench { cache, path, work } => {
             let c = cache.open()?;
             let shape = c.shape(&path).with_context(|| format!("stat {path}"))?;
-            let w = bench::Workload { size: shape.size, window: work.window_kib << 10, pattern: work.pattern, threads: work.threads, total_bytes: work.total_mb << 20, seed: 42 };
+            let w = bench::Workload {
+                size: shape.size,
+                window: work.window_kib << 10,
+                pattern: work.pattern,
+                threads: work.threads,
+                total_bytes: work.total_mb << 20,
+                seed: 42,
+            };
             let verify = work.verify;
             // Default: the API the FUSE frontend uses (read_view, zero-copy
             // for sequential local windows, the caller consumes the slice in
@@ -368,22 +375,16 @@ fn main() -> anyhow::Result<()> {
             let n_chunks = (size + stride - 1) / stride;
             let client = PeerClient::new(PeerClientConfig { api_key, ..Default::default() });
             let w = bench::Workload { size: n_chunks * stride, window: stride, pattern: "seq".into(), threads, total_bytes: total_mb << 20, seed: 42 };
-            let mut r = bench::run(
-                &w,
-                "rust",
-                "peer-client",
-                Vec::<u8>::new,
-                |buf, off, _| {
-                    let idx = off / stride;
-                    let n = client.fetch(&addr, &format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
-                    if verify {
-                        if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
-                            bail!("content mismatch at {bad}");
-                        }
+            let mut r = bench::run(&w, "rust", "peer-client", Vec::<u8>::new, |buf, off, _| {
+                let idx = off / stride;
+                let n = client.fetch(&addr, &format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
+                if verify {
+                    if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
+                        bail!("content mismatch at {bad}");
                     }
-                    Ok(n)
-                },
-            )?;
+                }
+                Ok(n)
+            })?;
             r["pattern"] = "chunk".into();
             emit(r, format!("server={server} dials={}", client.stats.dials.load(std::sync::atomic::Ordering::Relaxed)));
         }
@@ -392,22 +393,16 @@ fn main() -> anyhow::Result<()> {
             let stride = stride_mb << 20;
             let n_chunks = (size + stride - 1) / stride;
             let w = bench::Workload { size: n_chunks * stride, window: stride, pattern: "seq".into(), threads, total_bytes: total_mb << 20, seed: 42 };
-            let mut r = bench::run(
-                &w,
-                "rust",
-                "azure",
-                Vec::<u8>::new,
-                |buf, off, _| {
-                    let idx = off / stride;
-                    let n = az.read_object(&format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
-                    if verify {
-                        if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
-                            bail!("content mismatch at {bad}");
-                        }
+            let mut r = bench::run(&w, "rust", "azure", Vec::<u8>::new, |buf, off, _| {
+                let idx = off / stride;
+                let n = az.read_object(&format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
+                if verify {
+                    if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
+                        bail!("content mismatch at {bad}");
                     }
-                    Ok(n)
-                },
-            )?;
+                }
+                Ok(n)
+            })?;
             r["pattern"] = "chunk".into();
             emit(r, String::new());
         }

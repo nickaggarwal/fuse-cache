@@ -185,7 +185,8 @@ impl AzureReader {
         let (url, resource) = self.url(name);
         let date = httpdate::fmt_http_date(SystemTime::now());
         let range_hdr = range.map(|(off, len)| format!("bytes={}-{}", off, off + len - 1)).unwrap_or_default();
-        let mut req = self.agent.get(&url).set("x-ms-date", &date).set("x-ms-version", API_VERSION).set("Authorization", &self.sign(&date, &range_hdr, &resource));
+        let mut req =
+            self.agent.get(&url).set("x-ms-date", &date).set("x-ms-version", API_VERSION).set("Authorization", &self.sign(&date, &range_hdr, &resource));
         if !range_hdr.is_empty() {
             req = req.set("x-ms-range", &range_hdr);
         }
