@@ -183,15 +183,26 @@ impl PeerClient {
     /// The body lands in `buf[..n]`; `buf` only ever grows, so a reused
     /// buffer costs no allocation or zero-fill in steady state.
     pub fn fetch(&self, addr: &str, path: &str, buf: &mut Vec<u8>) -> Result<usize, PeerError> {
+        self.fetch_query(addr, path, "", buf)
+    }
+
+    /// Fetch `[off, off+len)` of `path` (`off`/`len` query parameters, the
+    /// sub-range form of `/api/peer/read` the Go blob path uses). The server
+    /// clamps to the object.
+    pub fn fetch_range(&self, addr: &str, path: &str, off: u64, len: u64, buf: &mut Vec<u8>) -> Result<usize, PeerError> {
+        self.fetch_query(addr, path, &format!("&off={off}&len={len}"), buf)
+    }
+
+    fn fetch_query(&self, addr: &str, path: &str, extra: &str, buf: &mut Vec<u8>) -> Result<usize, PeerError> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         // A pooled connection may have been closed by the server while
         // idle; retry exactly once on a fresh dial in that case.
         let (s, reused) = self.checkout(addr)?;
-        let r = self.fetch_on(addr, s, path, buf);
+        let r = self.fetch_on(addr, s, path, extra, buf);
         let r = match r {
             Err(PeerError::Other(ref m)) if reused && m.starts_with("stale:") => {
                 let (s, _) = self.checkout_fresh(addr)?;
-                self.fetch_on(addr, s, path, buf)
+                self.fetch_on(addr, s, path, extra, buf)
             }
             other => other,
         };
@@ -217,10 +228,11 @@ impl PeerClient {
         self.checkout(addr)
     }
 
-    fn fetch_on(&self, addr: &str, mut s: TcpStream, path: &str, buf: &mut Vec<u8>) -> Result<usize, PeerError> {
+    fn fetch_on(&self, addr: &str, mut s: TcpStream, path: &str, extra: &str, buf: &mut Vec<u8>) -> Result<usize, PeerError> {
         let mut req = String::with_capacity(160 + path.len() * 3);
         req.push_str("GET /api/peer/read?path=");
         req.push_str(&query_escape(path));
+        req.push_str(extra);
         req.push_str(" HTTP/1.1\r\nHost: ");
         req.push_str(addr);
         req.push_str("\r\nUser-Agent: fusedata/0.1\r\nAccept-Encoding: identity\r\n");
@@ -382,6 +394,7 @@ pub struct PeerServerStats {
 
 pub struct PeerServer {
     cache: Arc<CacheDir>,
+    blob: Option<Arc<crate::blob::BlobServer>>,
     cfg: PeerServerConfig,
     inflight: AtomicUsize,
     pub stats: PeerServerStats,
@@ -397,7 +410,13 @@ impl Drop for Gate<'_> {
 
 impl PeerServer {
     pub fn new(cache: Arc<CacheDir>, cfg: PeerServerConfig) -> Arc<Self> {
-        Arc::new(PeerServer { cache, cfg, inflight: AtomicUsize::new(0), stats: PeerServerStats::default() })
+        Arc::new(PeerServer { cache, blob: None, cfg, inflight: AtomicUsize::new(0), stats: PeerServerStats::default() })
+    }
+
+    /// Also serve the OCI blob routes (`/v2/<repo>/blobs/<digest>`,
+    /// `/oci/blobs/<digest>`, `/v2/`).
+    pub fn with_blobs(cache: Arc<CacheDir>, cfg: PeerServerConfig, blob: Arc<crate::blob::BlobServer>) -> Arc<Self> {
+        Arc::new(PeerServer { cache, blob: Some(blob), cfg, inflight: AtomicUsize::new(0), stats: PeerServerStats::default() })
     }
 
     /// Accept loop: one thread per connection (connections are long-lived
@@ -426,11 +445,13 @@ impl PeerServer {
     }
 
     pub fn handle_conn(&self, mut s: TcpStream) -> io::Result<()> {
+        let mut range: Option<String>;
         s.set_nodelay(true).ok();
         let mut buf = vec![0u8; 16 * 1024];
         let mut have = 0usize;
         loop {
             // Read one request head.
+            range = None;
             let (method, target, api_key, close, head_len) = loop {
                 if have > 0 {
                     let mut hdrs = [httparse::EMPTY_HEADER; 64];
@@ -445,6 +466,8 @@ impl PeerServer {
                                     key = Some(String::from_utf8_lossy(h.value).into_owned());
                                 } else if h.name.eq_ignore_ascii_case("connection") {
                                     close = h.value.eq_ignore_ascii_case(b"close");
+                                } else if h.name.eq_ignore_ascii_case("range") {
+                                    range = Some(String::from_utf8_lossy(h.value).into_owned());
                                 } else if h.name.eq_ignore_ascii_case("content-length") {
                                     body_len = std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
                                 }
@@ -477,7 +500,7 @@ impl PeerServer {
             buf.copy_within(head_len..have, 0);
             have -= head_len;
 
-            self.respond(&mut s, &method, &target, api_key.as_deref())?;
+            self.respond(&mut s, &method, &target, api_key.as_deref(), range.as_deref())?;
             if close {
                 let _ = s.shutdown(Shutdown::Write);
                 return Ok(());
@@ -485,10 +508,24 @@ impl PeerServer {
         }
     }
 
-    fn respond(&self, s: &mut TcpStream, method: &str, target: &str, api_key: Option<&str>) -> io::Result<()> {
+    fn respond(&self, s: &mut TcpStream, method: &str, target: &str, api_key: Option<&str>, range: Option<&str>) -> io::Result<()> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if path == "/api/health" {
             return write_simple(s, 200, "OK", "ok\n", &[]);
+        }
+        // OCI blob routes are unauthenticated in Go too (isOCIBlobRoute).
+        if path == "/v2/" && (method == "GET" || method == "HEAD") {
+            return write_simple(s, 200, "OK", "", &[("Docker-Distribution-API-Version", "registry/2.0")]);
+        }
+        if let Some(digest) = blob_route_digest(path) {
+            if method != "GET" && method != "HEAD" {
+                return write_simple(s, 405, "Method Not Allowed", "Method Not Allowed\n", &[]);
+            }
+            let missing = if path.starts_with("/v2/") { 503 } else { 404 };
+            return match self.blob.as_ref() {
+                Some(b) => b.serve(s, method == "HEAD", digest, range, missing),
+                None => write_simple(s, 404, "Not Found", "404 page not found\n", &[]),
+            };
         }
         if let Some(k) = &self.cfg.api_key {
             if api_key != Some(k.as_str()) {
@@ -513,8 +550,21 @@ impl PeerServer {
             _ => return write_simple(s, 400, "Bad Request", "path query parameter required\n", &[]),
         };
         let clean = clean_path(&raw);
+        // Optional sub-range of the object (Go peerReadSubRange).
+        let sub = match (query_get(query, "off"), query_get(query, "len")) {
+            (None, None) => None,
+            (o, l) => match (o.and_then(|v| v.parse::<i64>().ok()), l.and_then(|v| v.parse::<i64>().ok())) {
+                (Some(o), Some(l)) if o >= 0 && l > 0 => Some((o as u64, l as u64)),
+                _ => return write_simple(s, 400, "Bad Request", "off and len must be a byte offset and a positive length\n", &[]),
+            },
+        };
         match self.cache.peer_serve_target(&clean) {
             Some((file, off, len)) => {
+                let (off, len) = match sub {
+                    None => (off, len),
+                    Some((so, _)) if so >= len => return write_simple(s, 416, "Requested Range Not Satisfiable", "range outside object\n", &[]),
+                    Some((so, sl)) => (off + so, sl.min(len - so)),
+                };
                 self.stats.served.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes.fetch_add(len, Ordering::Relaxed);
                 send_file_response(s, &file, off, len)
@@ -527,7 +577,18 @@ impl PeerServer {
     }
 }
 
-fn write_simple(s: &mut TcpStream, code: u16, reason: &str, body: &str, extra: &[(&str, &str)]) -> io::Result<()> {
+/// The digest segment of `/oci/blobs/{digest}` or `/v2/<repo>/blobs/{digest}`.
+fn blob_route_digest(path: &str) -> Option<&str> {
+    if let Some(d) = path.strip_prefix("/oci/blobs/") {
+        return (!d.is_empty() && !d.contains('/')).then_some(d);
+    }
+    let rest = path.strip_prefix("/v2/")?;
+    let i = rest.rfind("/blobs/")?;
+    let d = &rest[i + "/blobs/".len()..];
+    (i > 0 && !d.is_empty() && !d.contains('/')).then_some(d)
+}
+
+pub(crate) fn write_simple(s: &mut TcpStream, code: u16, reason: &str, body: &str, extra: &[(&str, &str)]) -> io::Result<()> {
     let mut out = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nDate: {}\r\nContent-Length: {}\r\n",
         httpdate::fmt_http_date(std::time::SystemTime::now()),
@@ -554,7 +615,7 @@ fn send_file_response(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Re
 }
 
 #[cfg(target_os = "linux")]
-fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+pub(crate) fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let mut d = data;
     while !d.is_empty() {
@@ -572,12 +633,12 @@ fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+pub(crate) fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     s.write_all(data)
 }
 
 #[cfg(target_os = "linux")]
-fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
+pub(crate) fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let mut o = off as libc::off_t;
     let end = (off + len) as libc::off_t;
@@ -599,7 +660,7 @@ fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
+pub(crate) fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; 1 << 20];
     let mut o = off;
@@ -619,6 +680,16 @@ fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_routes() {
+        let d = "sha256:".to_string() + &"a".repeat(64);
+        assert_eq!(blob_route_digest(&format!("/oci/blobs/{d}")), Some(d.as_str()));
+        assert_eq!(blob_route_digest(&format!("/v2/library/x/blobs/{d}")), Some(d.as_str()));
+        assert_eq!(blob_route_digest(&format!("/v2/blobs/{d}")), None);
+        assert_eq!(blob_route_digest("/oci/blobs/"), None);
+        assert_eq!(blob_route_digest("/api/peer/read"), None);
+    }
 
     #[test]
     fn escape_matches_go_query_escape() {

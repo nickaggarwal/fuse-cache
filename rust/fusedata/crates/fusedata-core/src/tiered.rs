@@ -152,6 +152,55 @@ impl TieredReader {
         })
     }
 
+    /// `[off, off+len)` of a remote object into `dst` (len = `dst.len()`),
+    /// the blob endpoint's miss path, like Go's `readBlobWindowFromPeer`:
+    /// a ranged read of just the window from a holder (`/api/peer/read`
+    /// with `off`/`len`), then a ranged cloud read, and only if neither
+    /// answers the whole object through `fetch_object`. Nothing is promoted
+    /// (Go defers blob fills until reads go quiet, or skips them with
+    /// `-no-blob-fill`).
+    pub fn fetch_window(&self, object: &str, off: u64, dst: &mut [u8]) -> io::Result<usize> {
+        let parent = crate::chunk::parse_chunk_path(object).map(|(p, _)| p).unwrap_or(object);
+        if let Some((coord, client)) = &self.peers {
+            thread_local! {
+                static WBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            for addr in coord.candidates(parent, object) {
+                self.stats.peer_fetches.fetch_add(1, Ordering::Relaxed);
+                let got = WBUF.with(|b| {
+                    let mut b = b.borrow_mut();
+                    match client.fetch_range(&addr, object, off, dst.len() as u64, &mut b) {
+                        Ok(n) if n == dst.len() => {
+                            dst.copy_from_slice(&b[..n]);
+                            Some(n)
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(n) = got {
+                    self.stats.peer_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    return Ok(n);
+                }
+            }
+        }
+        if let Some(az) = &self.cloud {
+            self.stats.cloud_fetches.fetch_add(1, Ordering::Relaxed);
+            if let Ok(n) = az.read_range(object, off, dst) {
+                self.stats.cloud_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                return Ok(n);
+            }
+        }
+        let data = self.fetch_object(object)?;
+        let (f, t) = crate::chunk::clamp_chunk_slice(off as i64, off as i64 + dst.len() as i64, data.len() as i64);
+        let n = (t - f) as usize;
+        dst[..n].copy_from_slice(&data[f as usize..t as usize]);
+        Ok(n)
+    }
+
+    pub fn has_remote(&self) -> bool {
+        self.peers.is_some() || self.cloud.is_some()
+    }
+
     /// One remote object (chunk or whole small file), single-flighted.
     pub fn fetch_object(&self, object: &str) -> io::Result<Arc<Vec<u8>>> {
         {

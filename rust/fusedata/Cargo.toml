@@ -23,7 +23,7 @@ hex = "=0.4.3"
 httpdate = "=1.0.3"
 percent-encoding = "=2.3.2"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
-fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-31"] }
+fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-40"] }
 clap = { version = "=4.5.51", features = ["derive", "env"] }
 anyhow = "=1.0.100"
 tempfile = "=3.23.0"

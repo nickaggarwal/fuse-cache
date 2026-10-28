@@ -262,6 +262,39 @@ impl ChunkFile {
     }
 }
 
+/// A cached open file, shared with the layout reader (fds stay open across
+/// requests, so the kernel's per-file readahead state survives).
+#[derive(Clone)]
+pub struct FileRef(Arc<ChunkFile>);
+
+impl FileRef {
+    pub fn file(&self) -> &File {
+        &self.0.file
+    }
+}
+
+/// One part of a planned range (see `CacheDir::plan_pieces`).
+#[derive(Clone)]
+pub enum Piece {
+    /// `[off, off+len)` of a local file.
+    Local { file: FileRef, off: u64, len: u64 },
+    /// `[off, off+len)` of a cache object (`<path>_chunk_N` or a whole small
+    /// file) that is not on this node.
+    Remote { object: String, off: u64, len: u64 },
+}
+
+impl Piece {
+    pub fn len(&self) -> u64 {
+        match self {
+            Piece::Local { len, .. } | Piece::Remote { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// How prefetch workers bring a piece into the page cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefetchMode {
@@ -832,6 +865,61 @@ impl CacheDir {
             v.clear();
         }
         v.insert(path.to_string(), id);
+    }
+
+    /// Resolve `[off, off+len)` of `path` into pieces, the way Go's
+    /// `PlanRange` does for the blob endpoint: each piece is a region of a
+    /// local file (to be sent with `sendfile`) or a region of a chunk object
+    /// that is not local (to be fetched). No read-ahead: the caller (nydusd)
+    /// prefetches the exact ranges it wants. `NotFound` when the path is
+    /// unknown locally and no hint describes it.
+    pub fn plan_pieces(&self, path: &str, off: u64, len: u64) -> io::Result<Vec<Piece>> {
+        let p = clean_path(path);
+        let e = self.entry(&p)?;
+        let mut out = Vec::new();
+        match &e.layout {
+            Layout::Whole { cf } => {
+                let end = (off + len).min(cf.len.max(0) as u64);
+                if off < end {
+                    out.push(Piece::Local { file: FileRef(cf.clone()), off, len: end - off });
+                }
+            }
+            Layout::Remote { size } => {
+                let end = (off + len).min((*size).max(0) as u64);
+                if off < end {
+                    out.push(Piece::Remote { object: p.clone(), off, len: end - off });
+                }
+            }
+            Layout::Chunked { stride, total, slots } => {
+                for s in plan_range(*total, *stride, off as i64, len as i64) {
+                    let chunk_len = (*stride).min(*total - s.index * *stride);
+                    let (from, to) = clamp_chunk_slice(s.from, s.to, chunk_len);
+                    if to <= from {
+                        continue;
+                    }
+                    match self.chunk_file(&p, slots, s.index) {
+                        // Go's openLocalExact: only a chunk file of exactly
+                        // the expected length is served from disk.
+                        Some(cf) if cf.len == chunk_len => out.push(Piece::Local { file: FileRef(cf), off: from as u64, len: (to - from) as u64 }),
+                        _ => out.push(Piece::Remote { object: chunk_path(&p, s.index), off: from as u64, len: (to - from) as u64 }),
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The local file holding all of `path` when it is stored whole (and,
+    /// if chunked metadata exists, at exactly the recorded size): what FUSE
+    /// passthrough can hand to the kernel. Mirrors Go's `LocalFilePath`
+    /// test in the go-fuse passthrough open; per-chunk files cannot be
+    /// passed through.
+    pub fn whole_local_file(&self, path: &str) -> Option<File> {
+        let e = self.entry(&clean_path(path)).ok()?;
+        match &e.layout {
+            Layout::Whole { cf } => cf.file.try_clone().ok(),
+            _ => None,
+        }
     }
 
     /// Logical size of `path` without probing chunk files (FUSE getattr).

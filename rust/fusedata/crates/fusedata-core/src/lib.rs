@@ -9,6 +9,7 @@
 //! * [`tiered`] falls through local -> peer -> cloud for one read.
 
 pub mod azure;
+pub mod blob;
 pub mod chunk;
 pub mod coord;
 pub mod layout;

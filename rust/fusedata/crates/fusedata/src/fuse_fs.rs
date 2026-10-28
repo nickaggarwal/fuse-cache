@@ -55,6 +55,17 @@ pub struct Fs {
     uid: u32,
     gid: u32,
     pool: Option<std::sync::mpsc::SyncSender<ReadJob>>,
+    /// FUSE passthrough for files stored whole (kernel 6.9+): the kernel
+    /// reads the backing file directly, no daemon round trip per read.
+    passthrough: bool,
+    passthrough_ok: Arc<std::sync::atomic::AtomicBool>,
+    /// One backing id per inode (the kernel allows a single backing file
+    /// per inode), refcounted by open handles; dropping it closes it in the
+    /// kernel, so it lives until the last release.
+    backing: Arc<std::sync::Mutex<HashMap<u64, (Arc<fuser::BackingId>, usize)>>>,
+    /// fh -> inode, for release.
+    handles: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    next_fh: Arc<std::sync::atomic::AtomicU64>,
 }
 
 thread_local! {
@@ -74,7 +85,24 @@ impl Fs {
         let mut ino = Inodes { next: ROOT, ..Default::default() };
         ino.by_ino.insert(ROOT, ("/".into(), true));
         ino.by_path.insert("/".into(), ROOT);
-        Fs { reader, inodes: Arc::new(RwLock::new(ino)), uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, pool: None }
+        Fs {
+            reader,
+            inodes: Arc::new(RwLock::new(ino)),
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            pool: None,
+            passthrough: false,
+            passthrough_ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backing: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_fh: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        }
+    }
+
+    /// Ask for FUSE passthrough on read-only opens of files stored whole.
+    pub fn with_passthrough(mut self, on: bool) -> Self {
+        self.passthrough = on;
+        self
     }
 
     /// Serve reads on `threads` workers (0 or 1 = inline on the loop).
@@ -154,6 +182,15 @@ impl Filesystem for Fs {
         let _ = config.set_max_write(1024 * 1024);
         let _ = config.set_max_background(512);
         let _ = config.set_congestion_threshold(384);
+        if self.passthrough {
+            // Passthrough needs the capability and a stacking depth of 1
+            // (backing files are on a plain fs, not another FUSE/overlay).
+            // The kernel also requires max_write unchanged from its
+            // default to be compatible; keep going without on refusal.
+            let ok = config.add_capabilities(fuser::consts::FUSE_PASSTHROUGH).is_ok() && config.set_max_stack_depth(1).is_ok();
+            self.passthrough_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[FUSE] passthrough {}", if ok { "enabled" } else { "NOT supported by this kernel" });
+        }
         Ok(())
     }
 
@@ -189,10 +226,54 @@ impl Filesystem for Fs {
             return reply.error(libc::EROFS);
         }
         match self.path_of(ino) {
-            Some((_, false)) => reply.opened(0, FOPEN_KEEP_CACHE),
+            Some((path, false)) => {
+                if self.passthrough_ok.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut backing = self.backing.lock().unwrap();
+                    let id = match backing.get_mut(&ino) {
+                        Some((id, refs)) => {
+                            *refs += 1;
+                            Some(id.clone())
+                        }
+                        None => match self.reader.cache.whole_local_file(&path).map(|f| reply.open_backing(&f)) {
+                            Some(Ok(id)) => {
+                                let id = Arc::new(id);
+                                backing.insert(ino, (id.clone(), 1));
+                                Some(id)
+                            }
+                            Some(Err(e)) => {
+                                eprintln!("[FUSE] passthrough open of {path} refused: {e}");
+                                None
+                            }
+                            None => None, // per-chunk layout: no single backing file
+                        },
+                    };
+                    if let Some(id) = id {
+                        let fh = self.next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.handles.lock().unwrap().insert(fh, ino);
+                        // The kernel refuses FOPEN_KEEP_CACHE together with
+                        // FOPEN_PASSTHROUGH (EIO on open), as go-fuse notes.
+                        reply.opened_passthrough(fh, 0, &id);
+                        return;
+                    }
+                }
+                reply.opened(0, FOPEN_KEEP_CACHE)
+            }
             Some((_, true)) => reply.error(libc::EISDIR),
             None => reply.error(libc::ENOENT),
         }
+    }
+
+    fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: fuser::ReplyEmpty) {
+        if let Some(ino) = self.handles.lock().unwrap().remove(&fh) {
+            let mut backing = self.backing.lock().unwrap();
+            if let Some((_, refs)) = backing.get_mut(&ino) {
+                *refs -= 1;
+                if *refs == 0 {
+                    backing.remove(&ino);
+                }
+            }
+        }
+        reply.ok();
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {

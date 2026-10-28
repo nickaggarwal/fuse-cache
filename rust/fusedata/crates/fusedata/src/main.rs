@@ -198,13 +198,16 @@ enum Cmd {
         window_kib: usize,
     },
     /// Serve /api/peer/read over a cache dir (Go-compatible).
+    /// Serve /api/peer/read and the OCI blob routes (/v2/<repo>/blobs/,
+    /// /oci/blobs/) over a cache dir. With --coord, blob windows that are
+    /// not local are fetched from holders (and Azure with --azure-account).
     ServePeer {
         #[command(flatten)]
         cache: CacheArgs,
+        #[command(flatten)]
+        remote: RemoteArgs,
         #[arg(long, default_value = "127.0.0.1:18082")]
         listen: String,
-        #[arg(long, env = "FUSE_API_KEY")]
-        api_key: Option<String>,
         #[arg(long, default_value_t = 64)]
         max_inflight: usize,
     },
@@ -256,6 +259,9 @@ enum Cmd {
         mnt: String,
         #[arg(long, default_value_t = 8)]
         workers: usize,
+        /// FUSE passthrough for files stored whole (kernel 6.9+).
+        #[arg(long)]
+        passthrough: bool,
         /// Kernel readahead for the mount in KiB (0 = leave the 128 KiB
         /// default).
         #[arg(long, default_value_t = 4096)]
@@ -363,11 +369,19 @@ fn main() -> anyhow::Result<()> {
                 s.promotions.load(Relaxed)
             );
         }
-        Cmd::ServePeer { cache, listen, api_key, max_inflight } => {
+        Cmd::ServePeer { cache, remote, listen, max_inflight } => {
             let c = cache.open()?;
-            let srv = PeerServer::new(c, PeerServerConfig { api_key, max_inflight });
+            let api_key = remote.api_key.clone();
+            let t = Arc::new(remote.tiered(c.clone())?.with_promotion(false));
+            let blob = fusedata_core::blob::BlobServer::new(t);
+            let srv = PeerServer::with_blobs(c, PeerServerConfig { api_key, max_inflight }, blob);
+            // Views are not used here, but keep the reaper contract.
+            std::thread::spawn(|| loop {
+                std::thread::sleep(Duration::from_millis(500));
+                fusedata_core::layout::reap_mapped(Duration::from_secs(1));
+            });
             let l = std::net::TcpListener::bind(&listen)?;
-            eprintln!("rust peer server on {listen}");
+            eprintln!("rust peer+blob server on {listen}");
             srv.serve(l)?;
         }
         Cmd::BenchPeer { addr, path, size, stride_mb, threads, total_mb, verify, api_key, server } => {
@@ -406,15 +420,15 @@ fn main() -> anyhow::Result<()> {
             r["pattern"] = "chunk".into();
             emit(r, String::new());
         }
-        Cmd::Mount { cache, remote, mnt, workers, kernel_readahead_kb } => {
+        Cmd::Mount { cache, remote, mnt, workers, passthrough, kernel_readahead_kb } => {
             #[cfg(target_os = "linux")]
             {
                 let t = Arc::new(remote.tiered(cache.open()?)?);
-                fuse_fs::mount(fuse_fs::Fs::new(t).with_workers(workers), &mnt, kernel_readahead_kb)?;
+                fuse_fs::mount(fuse_fs::Fs::new(t).with_workers(workers).with_passthrough(passthrough), &mnt, kernel_readahead_kb)?;
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (cache, remote, mnt, workers, kernel_readahead_kb);
+                let _ = (cache, remote, mnt, workers, passthrough, kernel_readahead_kb);
                 bail!("mount is Linux-only");
             }
         }
