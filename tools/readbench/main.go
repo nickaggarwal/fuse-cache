@@ -82,6 +82,10 @@ func main() {
 		err = cmdFixture(args)
 	case "azure-put":
 		err = cmdAzurePut(args)
+	case "gen-blob":
+		err = cmdGenBlob(args)
+	case "bench-blob":
+		err = cmdBenchBlob(args)
 	default:
 		usage()
 	}
@@ -158,6 +162,7 @@ type cmOpts struct {
 	prefetchMax  int
 	rangeChunks  int
 	rangeCacheMB int
+	noBlobFill   bool
 }
 
 func newCacheManager(o cmOpts) (*cache.DefaultCacheManager, error) {
@@ -199,6 +204,7 @@ func newCacheManager(o cmOpts) (*cache.DefaultCacheManager, error) {
 		// The benchmark must not rewrite the layout under itself: completion
 		// assembles chunk files into a whole file once a reader goes idle.
 		ChunkCompletionDisabled: true,
+		NoBlobFill:              o.noBlobFill,
 		WatermarkEvictDisabled:  true,
 		WarmReconcileDisabled:   true,
 		// No real cloud: S3 at a closed port fails fast instead of probing
@@ -642,16 +648,25 @@ func cmdServePeer(args []string) error {
 	listen := fs.String("listen", "127.0.0.1:18081", "listen address")
 	chunkMB := fs.Int("chunk-mb", 16, "configured -chunk-size")
 	apiKey := fs.String("api-key", "", "X-API-Key")
+	coordAddr := fs.String("coord", "", "coordinator HTTP address (readbench coord): enables the peer tier, so blob windows that are not local are read from holders")
+	peerID := fs.String("peer-id", "bench-local", "this server's peer id (holders named by the coordinator other than this one are asked)")
+	noBlobFill := fs.Bool("no-blob-fill", true, "-no-blob-fill (model nodes run with nydusd's cache as the node copy)")
 	var pubs pubFlag
 	fs.Var(&pubs, "publish", "path:size:strideMiB (repeatable) so LocalChunkFile knows chunked parents")
 	fs.Parse(args)
 	restore := hideJournal(*dir)
 	defer restore()
-	coord := coordinator.NewCoordinatorService()
-	if err := parsePub(coord, pubs); err != nil {
-		return err
+	var coord coordinator.Coordinator
+	if *coordAddr != "" {
+		coord = coordinator.NewCoordinatorClient(*coordAddr, 10*time.Second)
+	} else {
+		svc := coordinator.NewCoordinatorService()
+		if err := parsePub(svc, pubs); err != nil {
+			return err
+		}
+		coord = svc
 	}
-	cm, err := newCacheManager(cmOpts{dir: *dir, chunkMB: *chunkMB, coord: coord, localPeerID: "bench-local"})
+	cm, err := newCacheManager(cmOpts{dir: *dir, chunkMB: *chunkMB, coord: coord, localPeerID: *peerID, noBlobFill: *noBlobFill})
 	if err != nil {
 		return err
 	}
@@ -663,7 +678,7 @@ func cmdServePeer(args []string) error {
 		path := strings.Split(p, ":")[0]
 		cm.ReadRange(context.Background(), path, 0, 1)
 	}
-	h := api.NewHandler(cm, coord, "bench-local", *apiKey)
+	h := api.NewHandler(cm, coord, *peerID, *apiKey)
 	srv := &http.Server{Addr: *listen, Handler: h.SetupRoutes()}
 	log.Printf("go peer server on %s dir=%s", *listen, *dir)
 	return srv.ListenAndServe()
