@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -210,4 +211,59 @@ func (cm *DefaultCacheManager) noteNVMeVerified(filePath string) {
 	}
 	defer reader.Close()
 	cm.nvmeVerify.markVerified(filePath, nvmeFileID{size: reader.Size(), mtime: reader.ModTimeNanos()})
+}
+
+// readChunkWindow serves a window that falls inside one chunk straight from
+// that chunk's local file, reading only the window's bytes. The per-chunk
+// path reads the whole chunk into memory for every window that misses the
+// range cache: a 128 KiB random read moved 16 MiB, which was 95% of the CPU
+// in the read profile and held random reads near 110 MB/s from page cache.
+// Sequential streams keep the per-chunk path, whose range cache and
+// read-ahead serve the following windows; see isSequentialRead.
+//
+// Reports ok=false when the chunk is not held locally, or its file is larger
+// than the stride (the chunk-size mismatch clampChunkSlice guards against),
+// so the caller takes the per-chunk path.
+func (cm *DefaultCacheManager) readChunkWindow(ctx context.Context, filePath string, chunkIndex, chunkSize, offset, end int64) ([]byte, bool) {
+	opener, ok := cm.nvmeStorage.(nvmeOpener)
+	if !ok || chunkSize <= 0 || end <= offset {
+		return nil, false
+	}
+	chunkPath := fmt.Sprintf("%s_chunk_%d", filePath, chunkIndex)
+	reader, err := opener.Open(chunkPath)
+	if err != nil {
+		return nil, false
+	}
+	defer reader.Close()
+	if reader.Size() > chunkSize || !cm.verifyNVMeReader(ctx, opener, chunkPath, reader) {
+		return nil, false
+	}
+	from := offset - chunkIndex*chunkSize
+	to := end - chunkIndex*chunkSize
+	from, to = clampChunkSlice(from, to, reader.Size())
+	buf := make([]byte, to-from)
+	n, err := reader.ReadAt(buf, from)
+	if err != nil && int64(n) != to-from {
+		cm.logger.Printf("NVMe window read of %s at offset %d failed: %v", chunkPath, from, err)
+		return nil, false
+	}
+	cm.touchEntries(filePath, chunkPath)
+	return buf[:n], true
+}
+
+// isSequentialRead reports whether a window continues the file's current read
+// stream, using the same test observeReadPattern applies. A read at offset 0
+// counts as sequential: it is how a stream starts, and the per-chunk path is
+// what starts its read-ahead.
+func (cm *DefaultCacheManager) isSequentialRead(filePath string, offset, chunkSize int64) bool {
+	if offset == 0 {
+		return true
+	}
+	cm.rangeMu.RLock()
+	defer cm.rangeMu.RUnlock()
+	fileCache, ok := cm.rangeChunks[filePath]
+	if !ok || fileCache == nil || fileCache.lastReadEnd <= 0 {
+		return false
+	}
+	return offset >= fileCache.lastReadEnd-chunkSize && offset <= fileCache.lastReadEnd+chunkSize
 }

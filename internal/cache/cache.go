@@ -232,6 +232,12 @@ type CacheConfig struct {
 	// zero value keeps library callers and tests on the whole-file path.
 	DisableWholeFileRangeReads bool
 
+	// DisableChunkWindowReads turns off serving a random window from its
+	// local chunk file by reading only the window (readChunkWindow), so every
+	// window that misses the range cache reads its whole chunk. Sequential
+	// streams take the per-chunk path either way.
+	DisableChunkWindowReads bool
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
@@ -3112,6 +3118,23 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 		workerCount = chunkCount
 	}
 
+	if chunkCount == 1 && !cm.config.DisableChunkWindowReads && !cm.isSequentialRead(filePath, offset, chunkSize) {
+		if _, _, cached := cm.getChunkFromRangeCache(filePath, startChunk); !cached {
+			if out, ok := cm.readChunkWindow(ctx, filePath, startChunk, chunkSize, offset, end); ok {
+				// Keep the stream tracker current so a stream that turns
+				// sequential is seen and gets read-ahead on its next window.
+				cm.observeReadPattern(filePath, totalSize, offset, end, endChunk, chunkSize)
+				dur := time.Since(started)
+				cm.metrics.ChunkWindowReads.Add(1)
+				cm.metrics.ChunkWindowReadBytes.Add(int64(len(out)))
+				cm.metrics.RecordHit(TierNVMe)
+				cm.metrics.RecordTierRead(TierNVMe, int64(len(out)), dur)
+				cm.metrics.RecordReadWall(int64(len(out)), dur, int64(len(out)), 0, 0)
+				return out, nil
+			}
+		}
+	}
+
 	if chunkCount == 1 {
 		data, tier, err := cm.readChunkData(ctx, filePath, startChunk, remoteOrder, hybridRead)
 		if err != nil {
@@ -4195,8 +4218,12 @@ type CacheMetrics struct {
 	// it rather than infer it from timing.
 	WholeFileRangeReads     atomic.Int64
 	WholeFileRangeReadBytes atomic.Int64
-	PrefetchHits            atomic.Int64
-	PrefetchWasted          atomic.Int64
+	// ChunkWindowReads counts random windows served by reading only the
+	// window from a local chunk file (readChunkWindow).
+	ChunkWindowReads     atomic.Int64
+	ChunkWindowReadBytes atomic.Int64
+	PrefetchHits         atomic.Int64
+	PrefetchWasted       atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
 	// the all-files byte budget, and idle-expiry sweeps.
 	RangeCacheFileEvictions atomic.Int64
@@ -4379,6 +4406,8 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"prefetch_issued":              m.PrefetchIssued.Load(),
 		"whole_file_range_reads":       m.WholeFileRangeReads.Load(),
 		"whole_file_range_read_bytes":  m.WholeFileRangeReadBytes.Load(),
+		"chunk_window_reads":           m.ChunkWindowReads.Load(),
+		"chunk_window_read_bytes":      m.ChunkWindowReadBytes.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),
 		"prefetch_wasted":              m.PrefetchWasted.Load(),
 		"range_cache_file_evictions":   m.RangeCacheFileEvictions.Load(),
