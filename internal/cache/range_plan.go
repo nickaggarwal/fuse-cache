@@ -236,10 +236,9 @@ func (cm *DefaultCacheManager) deferBlobFill(filePath, chunkPath string, chunkIn
 	}
 }
 
-// runBlobFills drains the queue once blob reads have been quiet long enough,
-// pausing again whenever reads resume. Exits on shutdown.
+// runBlobFills drains the queue whenever blob reads have gone quiet,
+// checking once a second. Exits on shutdown.
 func (cm *DefaultCacheManager) runBlobFills() {
-	q := &cm.blobFillQ
 	ctx := cm.shutdownCtx
 	if ctx == nil { // hand-built managers (tests) have no shutdown context
 		ctx = context.Background()
@@ -250,25 +249,33 @@ func (cm *DefaultCacheManager) runBlobFills() {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
-		}
-		for {
-			q.mu.Lock()
-			quiet := time.Since(q.lastRead) >= blobFillQuietPeriod
-			if !quiet || len(q.pending) == 0 {
-				q.mu.Unlock()
-				break
-			}
-			k := q.pending[0]
-			q.pending = q.pending[1:]
-			delete(q.queued, k.chunkPath)
-			q.mu.Unlock()
-			cm.fillBlobChunk(ctx, k.filePath, k.chunkPath, k.chunkIndex)
-			if ctx.Err() != nil {
-				return
-			}
+		case now := <-tick.C:
+			cm.drainBlobFills(ctx, now)
 		}
 	}
+}
+
+// drainBlobFills runs queued fills one at a time while blob reads have been
+// quiet for blobFillQuietPeriod as of now, stopping as soon as a read lands.
+// Returns the number of fills run.
+func (cm *DefaultCacheManager) drainBlobFills(ctx context.Context, now time.Time) int {
+	q := &cm.blobFillQ
+	n := 0
+	for ctx.Err() == nil {
+		q.mu.Lock()
+		if now.Sub(q.lastRead) < blobFillQuietPeriod || len(q.pending) == 0 {
+			q.mu.Unlock()
+			return n
+		}
+		k := q.pending[0]
+		q.pending = q.pending[1:]
+		delete(q.queued, k.chunkPath)
+		q.mu.Unlock()
+		cm.fillBlobChunk(ctx, k.filePath, k.chunkPath, k.chunkIndex)
+		n++
+		now = time.Now() // a read that landed during the fill pauses the drain
+	}
+	return n
 }
 
 // peerRangeReader is PeerStorage's ranged read (store first).

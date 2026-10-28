@@ -161,6 +161,10 @@ func TestPlanRange_RemoteChunkFilledAfterQuiet(t *testing.T) {
 	peer := cm.peerStorage.(*mockStorage)
 	_ = peer.Write(context.Background(), fmt.Sprintf("%s_chunk_1", parent), want[chunkSize:2*chunkSize])
 
+	// Drive the drain by hand, with explicit clocks: no background loop, no
+	// sleeps racing the fill.
+	cm.blobFillQ.started = true
+
 	_, release, err := cm.PlanRange(context.Background(), entry, chunkSize+10, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -169,18 +173,14 @@ func TestPlanRange_RemoteChunkFilledAfterQuiet(t *testing.T) {
 	if cm.metrics.BlobFillQueued.Load() != 1 {
 		t.Fatalf("queued fills = %d, want 1", cm.metrics.BlobFillQueued.Load())
 	}
-	time.Sleep(1500 * time.Millisecond) // reads just happened: not quiet yet
+	if n := cm.drainBlobFills(ctx, time.Now()); n != 0 {
+		t.Fatalf("drained %d fills right after a read; want 0", n)
+	}
 	if _, err := os.Stat(local); err == nil {
 		t.Fatal("chunk written while reads were active")
 	}
-
-	// Pretend reads went quiet long ago; the fill loop drains on its next tick.
-	cm.blobFillQ.mu.Lock()
-	cm.blobFillQ.lastRead = time.Now().Add(-time.Hour)
-	cm.blobFillQ.mu.Unlock()
-	deadline := time.Now().Add(5 * time.Second)
-	for cm.metrics.BlobPromoted.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+	if n := cm.drainBlobFills(ctx, time.Now().Add(blobFillQuietPeriod)); n != 1 {
+		t.Fatalf("drained %d fills once quiet; want 1", n)
 	}
 	if info, err := os.Stat(local); err != nil || info.Size() != chunkSize {
 		t.Fatalf("chunk not filled after reads went quiet: %v", err)
