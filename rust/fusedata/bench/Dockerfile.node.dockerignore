@@ -1,0 +1,15 @@
+# BuildKit uses this instead of the repo-root .dockerignore for
+# Dockerfile.node: ship only what the two build stages copy.
+*
+!go.mod
+!go.sum
+!third_party/
+!internal/
+!proto/
+!tools/readbench/
+!rust/fusedata/Cargo.toml
+!rust/fusedata/Cargo.lock
+!rust/fusedata/rust-toolchain.toml
+!rust/fusedata/crates/
+!rust/fusedata/bench/node-bench.sh
+rust/fusedata/crates/fusedata-core/tests/

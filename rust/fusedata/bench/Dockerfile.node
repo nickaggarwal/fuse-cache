@@ -1,0 +1,40 @@
+# Node benchmark image: the Rust fusedata binary, the Go readbench harness
+# (built from this branch, with the chunk-window fix 2c047d1), and
+# node-bench.sh, on ubuntu:24.04 with fuse3. linux/amd64 for the AKS model
+# nodes (Standard_E8ds_v6, Ubuntu 24.04, kernel 6.x).
+#
+# Build from the repo root (both binaries are compiled in the image):
+#   docker buildx build --platform linux/amd64 \
+#     -f rust/fusedata/bench/Dockerfile.node -t <registry>/fusedata-nodebench:<tag> --load .
+#
+# Run privileged on the node, with the cache disk mounted in:
+#   docker run --rm --privileged --device /dev/fuse \
+#     -v /mnt/nvme:/data <image> node-bench.sh /data/nodebench-cache /data/nodebench-scratch
+
+FROM --platform=linux/amd64 rust:1.90-slim-bookworm AS rust
+WORKDIR /w
+COPY rust/fusedata/Cargo.toml rust/fusedata/Cargo.lock rust/fusedata/rust-toolchain.toml ./
+COPY rust/fusedata/crates ./crates
+RUN cargo build --release --locked -p fusedata && strip target/release/fusedata
+
+FROM --platform=linux/amd64 golang:1.26-bookworm AS go
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY third_party ./third_party
+RUN go mod download
+COPY internal ./internal
+COPY proto ./proto
+COPY tools/readbench ./tools/readbench
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/readbench ./tools/readbench
+
+FROM --platform=linux/amd64 ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 python3 util-linux procps ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo user_allow_other >> /etc/fuse.conf
+COPY --from=rust /w/target/release/fusedata /usr/local/bin/fusedata
+COPY --from=go /out/readbench /usr/local/bin/readbench
+COPY rust/fusedata/bench/node-bench.sh /usr/local/bin/node-bench.sh
+RUN chmod +x /usr/local/bin/node-bench.sh
+ENTRYPOINT []
+CMD ["node-bench.sh", "--help"]

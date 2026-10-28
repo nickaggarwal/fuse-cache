@@ -69,9 +69,16 @@ by materialising whole chunks in user memory.**
 
 ## Results
 
-Full tables, environment and caveats: [`bench/RESULTS.md`](bench/RESULTS.md)
-(raw JSONL in `bench/results/`). Docker linuxkit VM, not an AKS node, so
-read the ratios, not the MB/s.
+**Update (sequential tuning, vs Go with the chunk-window fix 2c047d1):**
+see [`bench/TUNING.md`](bench/TUNING.md) for what changed, what moved the
+number, and the before/after table. To measure on a real node:
+[`bench/node-bench.sh`](bench/node-bench.sh) in the image built from
+[`bench/Dockerfile.node`](bench/Dockerfile.node).
+
+The table below is the first comparison (Go before 2c047d1, Rust before
+tuning). Full tables, environment and caveats:
+[`bench/RESULTS.md`](bench/RESULTS.md) (raw JSONL in `bench/results/`).
+Docker linuxkit VM, not an AKS node, so read the ratios, not the MB/s.
 
 | workload (median of 3) | Go | Rust | |
 |---|---:|---:|---:|
@@ -158,11 +165,19 @@ go test ./internal/cache -run 'TestReadRangeStrideSmallerThanChunks|TestAzureRea
   ported. The most plausible shape is Go keeps the control plane and the
   write path; Rust serves the FUSE reads and `/api/peer/read` off the shared
   cache dir — the on-disk layout is the interface, and it is already shared.
-* **Single-reader sequential.** Rust's page-cache prefetcher (4 x 4 MiB
-  workers) loses to Go's in-memory chunk cache for one sequential reader from
-  page cache in-process (0.5x), and only matches it through FUSE. A
-  safetensors load with one reader thread needs a deeper or adaptive
-  prefetch window before switching, and a re-measure on real NVMe.
+* **Single-reader sequential** was the gap in the first version; see
+  [`bench/TUNING.md`](bench/TUNING.md). The tuned reader beats fixed Go in
+  the lab VM, but the prefetch defaults (16 workers x 8 MiB, 512 MiB window)
+  were fitted to that VM's virtio disk and need confirming with
+  `bench/node-bench.sh` on a real NVMe node.
+* **Mapped views need the reaper.** Sequential windows are served as slices
+  of `mmap`ped cache files; mapped pages cannot be dropped from the page
+  cache, so `layout::reap_mapped` must run periodically (the FUSE frontend
+  does). A process using `read_view` without it pins what it streams.
+* **FUSE kernel readahead** is set by writing the mount's
+  `/sys/class/bdi/<dev>/read_ahead_kb` (4 MiB), which needs root. Without it
+  the single-reader FUSE gain drops to ~1.5x. The same one-line change would
+  give the Go mount ~2.7x (go-ra4m column); it is not a Rust-only win.
 * **Remote tiers are simple.** No hedging/striping across peer and cloud,
   no fetch leases, no latency EWMA ordering, no busy-retry across the whole
   holder set beyond one jittered pass, no checksum verification of remote
@@ -176,16 +191,16 @@ go test ./internal/cache -run 'TestReadRangeStrideSmallerThanChunks|TestAzureRea
   the Go client defaults to gRPC.
 * **FUSE details.** Inode numbers are process-local and never forgotten
   (`forget` is not implemented), directory listings come from the local dir
-  only (no coordinator view of peer-only files beyond a looked-up path),
-  `max_read`/`max_pages` are not tuned, no passthrough (`FOPEN_PASSTHROUGH`)
-  path, no FUSE request interruption.
+  only (no coordinator view of peer-only files beyond a looked-up path), no
+  passthrough (`FOPEN_PASSTHROUGH`) path, no FUSE request interruption.
+  fuser's receive loop is single-threaded; reads are handed to a worker pool.
 * **Staleness.** The layout reader revalidates a cached entry's backing file
   every 500 ms (inode + mtime); a delete-and-replace between checks can serve
   the old inode's bytes for up to that long. Go reopens per window and
   cannot.
 * **Not measured:** real NVMe, real network between nodes, real Azure, AKS,
-  GPU loaders. Only arm64 builds were run (the cluster nodes are amd64; the
-  code has no arch-specific parts).
+  GPU loaders. amd64 is built (`bench/Dockerfile.node`) and smoke-tested
+  under emulation only.
 
 ## Compatibility notes
 
