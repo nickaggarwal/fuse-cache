@@ -47,15 +47,18 @@ type GoFuseFileSystem struct {
 	logger       *log.Logger
 
 	enablePassthrough bool
-	readTraceEnabled  bool
-	readTracePath     string
-	readTraceStep     int64
-	readTimeout       time.Duration
-	maxWrite          int
-	writeAppendBytes  int
-	writebackCache    bool
-	readReqSeq        atomic.Uint64
-	readInflight      atomic.Int64
+	// directMount mounts via mount(2) rather than fusermount3
+	// (FUSE_GOFUSE_DIRECT_MOUNT).
+	directMount      bool
+	readTraceEnabled bool
+	readTracePath    string
+	readTraceStep    int64
+	readTimeout      time.Duration
+	maxWrite         int
+	writeAppendBytes int
+	writebackCache   bool
+	readReqSeq       atomic.Uint64
+	readInflight     atomic.Int64
 
 	mu         sync.Mutex
 	server     *gfuse.Server
@@ -90,6 +93,7 @@ func NewGoFuseFileSystem(cacheManager cache.CacheManager) *GoFuseFileSystem {
 		maxWrite:          maxWriteKB * 1024,
 		writeAppendBytes:  writeBufferMB * 1024 * 1024,
 		writebackCache:    boolFromEnv("FUSE_GOFUSE_WRITEBACK_CACHE", false),
+		directMount:       boolFromEnv("FUSE_GOFUSE_DIRECT_MOUNT", false),
 	}
 }
 
@@ -113,6 +117,12 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 			MaxReadAhead:         maxReadaheadBytes,
 			MaxBackground:        maxBackgroundReqs,
 			EnableWritebackCache: g.writebackCache,
+			// Mount with the mount(2) syscall instead of the fusermount3
+			// helper. A privileged pod may call it, while the helper is
+			// subject to the host's AppArmor profile: Ubuntu 26.04 confines
+			// fusermount3 to /mnt, /tmp and home paths and the mount failed
+			// with EACCES there. Falls back to the helper if the syscall fails.
+			DirectMount: g.directMount,
 		},
 		EntryTimeout: &entryTTL,
 		AttrTimeout:  &attrTTL,
@@ -133,9 +143,10 @@ func (g *GoFuseFileSystem) Mount(ctx context.Context, mountPoint string) error {
 	g.mu.Unlock()
 
 	g.logger.Printf(
-		"Mounted go-fuse filesystem at: %s (passthrough=%t writeback_cache=%t max_write_bytes=%d write_append_buffer_bytes=%d)",
+		"Mounted go-fuse filesystem at: %s (passthrough=%t direct_mount=%t writeback_cache=%t max_write_bytes=%d write_append_buffer_bytes=%d)",
 		mountPoint,
 		g.enablePassthrough,
+		g.directMount,
 		g.writebackCache,
 		g.maxWrite,
 		g.writeAppendBytes,
