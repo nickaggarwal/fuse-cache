@@ -1,4 +1,8 @@
-# fusedata — Rust read data path (prototype)
+# fusedata — Rust read data path (research)
+
+> **Research, not for merge.** Kept on the branch for the measurements in
+> `bench/`. The merge candidate is the store-front server in
+> [`rust/store`](../store/); see [`rust/README.md`](../README.md).
 
 A Rust rebuild of the fuse-client **read hot path**, built to be measured
 against the Go implementation on the same cache directory. It is a prototype:
