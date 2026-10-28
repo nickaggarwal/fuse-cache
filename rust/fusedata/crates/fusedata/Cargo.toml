@@ -1,0 +1,18 @@
+[package]
+name = "fusedata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "fusedata CLI: read-only FUSE mount, peer server, and benchmarks over a fuse-client cache dir"
+
+[dependencies]
+fusedata-core = { path = "../fusedata-core" }
+libc.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true

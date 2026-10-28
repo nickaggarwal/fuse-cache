@@ -1,0 +1,360 @@
+//! `fusedata`: prototype Rust read path for fuse-client.
+//!
+//! Subcommands mirror `tools/readbench` so the same workloads run against
+//! both implementations on the same cache directory.
+
+mod bench;
+#[cfg(target_os = "linux")]
+mod fuse_fs;
+
+use anyhow::{anyhow, bail, Context};
+use clap::{Args, Parser, Subcommand};
+use fusedata_core::azure::{AzureConfig, AzureReader};
+use fusedata_core::coord::CoordClient;
+use fusedata_core::layout::{CacheDir, Hint, Options};
+use fusedata_core::pattern;
+use fusedata_core::peer::{PeerClient, PeerClientConfig, PeerServer, PeerServerConfig};
+use fusedata_core::tiered::TieredReader;
+use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "fusedata", about = "Rust read data path for the fuse-client cache (prototype)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Args, Clone)]
+struct CacheArgs {
+    /// Cache directory written by the Go client.
+    #[arg(long)]
+    dir: String,
+    /// Node -chunk-size in MiB (used when metadata has no stride).
+    #[arg(long, default_value_t = 16)]
+    chunk_mb: i64,
+    /// Readahead hint distance in MiB for sequential streams (0 = off).
+    #[arg(long, default_value_t = 128)]
+    readahead_mb: u64,
+    /// Prefetch worker threads (0 = async hints only). 4 x 4 MiB won a
+    /// cold-cache sweep (bench/sweep-readahead.sh).
+    #[arg(long, default_value_t = 4)]
+    readahead_threads: usize,
+    /// Prefetch piece size in KiB.
+    #[arg(long, default_value_t = 4096)]
+    readahead_piece_kib: i64,
+    /// path:size:strideMiB shape hints (what the coordinator would say).
+    #[arg(long = "publish")]
+    publish: Vec<String>,
+}
+
+impl CacheArgs {
+    fn open(&self) -> anyhow::Result<Arc<CacheDir>> {
+        let c = CacheDir::new(
+            &self.dir,
+            Options {
+                configured_chunk_size: self.chunk_mb << 20,
+                readahead: self.readahead_mb << 20,
+                readahead_threads: self.readahead_threads,
+                readahead_piece: self.readahead_piece_kib << 10,
+                ..Default::default()
+            },
+        );
+        for p in &self.publish {
+            let parts: Vec<&str> = p.split(':').collect();
+            if parts.len() < 3 {
+                bail!("bad --publish {p} (want path:size:strideMiB)");
+            }
+            let size: i64 = parts[1].parse()?;
+            let stride: i64 = parts[2].parse()?;
+            c.set_hint(parts[0], Hint { size, chunked: stride > 0, chunk_size: stride << 20 });
+        }
+        Ok(Arc::new(c))
+    }
+}
+
+#[derive(Args, Clone)]
+struct WorkArgs {
+    #[arg(long, default_value_t = 128)]
+    window_kib: i64,
+    #[arg(long, default_value = "seq")]
+    pattern: String,
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
+    #[arg(long, default_value_t = 1024)]
+    total_mb: i64,
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Args, Clone)]
+struct RemoteArgs {
+    /// Coordinator HTTP address (enables the peer tier).
+    #[arg(long)]
+    coord: Option<String>,
+    #[arg(long, default_value = "fusedata-local")]
+    peer_id: String,
+    #[arg(long, env = "FUSE_API_KEY")]
+    api_key: Option<String>,
+    /// Azure account (enables the cloud tier); key from AZURE_STORAGE_KEY.
+    #[arg(long, env = "AZURE_STORAGE_ACCOUNT")]
+    azure_account: Option<String>,
+    #[arg(long, env = "AZURE_STORAGE_KEY", hide_env_values = true)]
+    azure_key: Option<String>,
+    #[arg(long, env = "AZURE_CONTAINER_NAME", default_value = "fuse-cache")]
+    azure_container: String,
+    /// Override the blob endpoint (e.g. Azurite http://host:10000/devstoreaccount1).
+    #[arg(long)]
+    azure_endpoint: Option<String>,
+    #[arg(long, default_value = "")]
+    cloud_key_prefix: String,
+    #[arg(long, default_value_t = 4)]
+    azure_block_mb: u64,
+    #[arg(long, default_value_t = 8)]
+    azure_concurrency: usize,
+    /// Do not write fetched chunks back to the cache dir.
+    #[arg(long)]
+    no_promote: bool,
+}
+
+impl RemoteArgs {
+    fn azure(&self) -> anyhow::Result<Option<Arc<AzureReader>>> {
+        let Some(acct) = &self.azure_account else { return Ok(None) };
+        let key = self.azure_key.clone().ok_or_else(|| anyhow!("AZURE_STORAGE_KEY required with --azure-account"))?;
+        let mut cfg = AzureConfig::public(acct, &key, &self.azure_container);
+        if let Some(ep) = &self.azure_endpoint {
+            cfg.endpoint = ep.trim_end_matches('/').to_string();
+        }
+        cfg.key_prefix = self.cloud_key_prefix.clone();
+        cfg.block_size = self.azure_block_mb << 20;
+        cfg.concurrency = self.azure_concurrency;
+        Ok(Some(Arc::new(AzureReader::new(cfg).map_err(|e| anyhow!("{e}"))?)))
+    }
+
+    fn tiered(&self, cache: Arc<CacheDir>) -> anyhow::Result<TieredReader> {
+        let mut t = TieredReader::new(cache).with_promotion(!self.no_promote);
+        if let Some(c) = &self.coord {
+            let client = PeerClient::new(PeerClientConfig { api_key: self.api_key.clone(), ..Default::default() });
+            t = t.with_peers(Arc::new(CoordClient::new(c, &self.peer_id)), Arc::new(client));
+        }
+        if let Some(az) = self.azure()? {
+            t = t.with_cloud(az);
+        }
+        Ok(t)
+    }
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Benchmark the library read path (layout reader) in-process.
+    Bench {
+        #[command(flatten)]
+        cache: CacheArgs,
+        #[arg(long, default_value = "/bench/model.bin")]
+        path: String,
+        #[command(flatten)]
+        work: WorkArgs,
+    },
+    /// Read a whole logical file through all tiers and verify content.
+    Verify {
+        #[command(flatten)]
+        cache: CacheArgs,
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(long, default_value = "/bench/model.bin")]
+        path: String,
+        #[arg(long, default_value_t = 1024)]
+        window_kib: usize,
+    },
+    /// Serve /api/peer/read over a cache dir (Go-compatible).
+    ServePeer {
+        #[command(flatten)]
+        cache: CacheArgs,
+        #[arg(long, default_value = "127.0.0.1:18082")]
+        listen: String,
+        #[arg(long, env = "FUSE_API_KEY")]
+        api_key: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        max_inflight: usize,
+    },
+    /// Benchmark the peer client: fetch chunk objects from one peer.
+    BenchPeer {
+        #[arg(long, default_value = "127.0.0.1:18081")]
+        addr: String,
+        #[arg(long, default_value = "/bench/model.bin")]
+        path: String,
+        #[arg(long)]
+        size: i64,
+        #[arg(long, default_value_t = 16)]
+        stride_mb: i64,
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+        #[arg(long, default_value_t = 2048)]
+        total_mb: i64,
+        #[arg(long)]
+        verify: bool,
+        #[arg(long, env = "FUSE_API_KEY")]
+        api_key: Option<String>,
+        #[arg(long, default_value = "?")]
+        server: String,
+    },
+    /// Benchmark Azure ranged reads of one chunk object or window.
+    BenchAzure {
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(long, default_value = "/bench/model.bin")]
+        path: String,
+        #[arg(long)]
+        size: i64,
+        #[arg(long, default_value_t = 16)]
+        stride_mb: i64,
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+        #[arg(long, default_value_t = 256)]
+        total_mb: i64,
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Mount a cache dir read-only over FUSE (Linux).
+    Mount {
+        #[command(flatten)]
+        cache: CacheArgs,
+        #[command(flatten)]
+        remote: RemoteArgs,
+        #[arg(long)]
+        mnt: String,
+        #[arg(long, default_value_t = 8)]
+        workers: usize,
+    },
+}
+
+fn emit(mut v: serde_json::Value, note: String) {
+    if !note.is_empty() {
+        v["note"] = serde_json::Value::String(note);
+    }
+    println!("{v}");
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Bench { cache, path, work } => {
+            let c = cache.open()?;
+            let shape = c.shape(&path).with_context(|| format!("stat {path}"))?;
+            let w = bench::Workload { size: shape.size, window: work.window_kib << 10, pattern: work.pattern, threads: work.threads, total_bytes: work.total_mb << 20, seed: 42 };
+            let verify = work.verify;
+            let r = bench::run(
+                &w,
+                "rust",
+                "library",
+                || vec![0u8; w.window as usize],
+                |buf, off, n| {
+                    let got = c.read_at(&path, off as u64, &mut buf[..n])?;
+                    if verify {
+                        if let Some(bad) = pattern::check(&buf[..got], off as u64) {
+                            bail!("content mismatch at {bad}");
+                        }
+                    }
+                    Ok(got)
+                },
+            )?;
+            emit(r, format!("layout={} readahead_hints={}", if shape.chunked { "chunked" } else { "whole" }, c.stats.readahead_hints.load(std::sync::atomic::Ordering::Relaxed)));
+        }
+        Cmd::Verify { cache, remote, path, window_kib } => {
+            let t = remote.tiered(cache.open()?)?;
+            t.learn_shape(&path);
+            let shape = t.cache.shape(&path)?;
+            let mut buf = vec![0u8; window_kib << 10];
+            let mut off = 0u64;
+            while (off as i64) < shape.size {
+                let n = t.read(&path, off, &mut buf)?;
+                if n == 0 {
+                    bail!("short read at {off} of {}", shape.size);
+                }
+                if let Some(bad) = pattern::check(&buf[..n], off) {
+                    bail!("content mismatch at {bad}");
+                }
+                off += n as u64;
+            }
+            let s = &t.stats;
+            use std::sync::atomic::Ordering::Relaxed;
+            println!(
+                "verify ok path={path} size={} local_bytes={} peer_fetches={} peer_bytes={} cloud_fetches={} cloud_bytes={} promotions={}",
+                shape.size,
+                s.local_bytes.load(Relaxed),
+                s.peer_fetches.load(Relaxed),
+                s.peer_bytes.load(Relaxed),
+                s.cloud_fetches.load(Relaxed),
+                s.cloud_bytes.load(Relaxed),
+                s.promotions.load(Relaxed)
+            );
+        }
+        Cmd::ServePeer { cache, listen, api_key, max_inflight } => {
+            let c = cache.open()?;
+            let srv = PeerServer::new(c, PeerServerConfig { api_key, max_inflight });
+            let l = std::net::TcpListener::bind(&listen)?;
+            eprintln!("rust peer server on {listen}");
+            srv.serve(l)?;
+        }
+        Cmd::BenchPeer { addr, path, size, stride_mb, threads, total_mb, verify, api_key, server } => {
+            let stride = stride_mb << 20;
+            let n_chunks = (size + stride - 1) / stride;
+            let client = PeerClient::new(PeerClientConfig { api_key, ..Default::default() });
+            let w = bench::Workload { size: n_chunks * stride, window: stride, pattern: "seq".into(), threads, total_bytes: total_mb << 20, seed: 42 };
+            let mut r = bench::run(
+                &w,
+                "rust",
+                "peer-client",
+                Vec::<u8>::new,
+                |buf, off, _| {
+                    let idx = off / stride;
+                    let n = client.fetch(&addr, &format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
+                    if verify {
+                        if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
+                            bail!("content mismatch at {bad}");
+                        }
+                    }
+                    Ok(n)
+                },
+            )?;
+            r["pattern"] = "chunk".into();
+            emit(r, format!("server={server} dials={}", client.stats.dials.load(std::sync::atomic::Ordering::Relaxed)));
+        }
+        Cmd::BenchAzure { remote, path, size, stride_mb, threads, total_mb, verify } => {
+            let az = remote.azure()?.ok_or_else(|| anyhow!("--azure-account required"))?;
+            let stride = stride_mb << 20;
+            let n_chunks = (size + stride - 1) / stride;
+            let w = bench::Workload { size: n_chunks * stride, window: stride, pattern: "seq".into(), threads, total_bytes: total_mb << 20, seed: 42 };
+            let mut r = bench::run(
+                &w,
+                "rust",
+                "azure",
+                Vec::<u8>::new,
+                |buf, off, _| {
+                    let idx = off / stride;
+                    let n = az.read_object(&format!("{path}_chunk_{idx}"), buf).map_err(|e| anyhow!("{e}"))?;
+                    if verify {
+                        if let Some(bad) = pattern::check(&buf[..n], (idx * stride) as u64) {
+                            bail!("content mismatch at {bad}");
+                        }
+                    }
+                    Ok(n)
+                },
+            )?;
+            r["pattern"] = "chunk".into();
+            emit(r, String::new());
+        }
+        Cmd::Mount { cache, remote, mnt, workers } => {
+            #[cfg(target_os = "linux")]
+            {
+                let t = Arc::new(remote.tiered(cache.open()?)?);
+                fuse_fs::mount(fuse_fs::Fs::new(t).with_workers(workers), &mnt)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (cache, remote, mnt, workers);
+                bail!("mount is Linux-only");
+            }
+        }
+    }
+    Ok(())
+}

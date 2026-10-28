@@ -1,0 +1,24 @@
+[package]
+name = "fusedata-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Read data path for the fuse-client NVMe cache: layout reader, peer transport, Azure ranged reader"
+
+[dependencies]
+libc.workspace = true
+httparse.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64.workspace = true
+hex.workspace = true
+httpdate.workspace = true
+percent-encoding.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

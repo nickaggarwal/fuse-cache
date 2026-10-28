@@ -1,0 +1,13 @@
+{
+  "account": "devstoreaccount1",
+  "authorization": "SharedKey devstoreaccount1:EMPa1OI6+wJF3HXFrNn8DnKkdYKNSVwKt+F+1+VOEAo=",
+  "blob": "/bench/m.bin_chunk_3",
+  "container": "fuse-cache",
+  "endpoint_path": "/devstoreaccount1",
+  "escaped_path": "/devstoreaccount1/fuse-cache/%2Fbench%2Fm.bin_chunk_3",
+  "key": "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+  "range": "",
+  "x_ms_date": "Wed, 28 Oct 2026 01:33:41 GMT",
+  "x_ms_range": "bytes=0-4194303",
+  "x_ms_version": "2020-10-02"
+}
