@@ -292,6 +292,13 @@ func TestSelectAndPrepare_NoEligibleDisk(t *testing.T) {
 	opts := DefaultOptions()
 	opts.HostRoot = root
 	opts.Benchmark = false
+	// Raw-disk discovery probes and formats real block devices
+	// (fsProbe/prepareRawDisk run blkid/mkfs on /dev/<name>), so on a machine
+	// with a spare NVMe (GitHub's runners have one) it finds a real disk and
+	// the test fails for a reason that has nothing to do with this fake host.
+	// This case is about the mount table having nothing eligible; raw disks
+	// have their own tests with the device lister stubbed.
+	opts.MountRawDisks = false
 	if _, err := SelectAndPrepare(opts); err == nil {
 		t.Fatal("expected error with no eligible filesystems")
 	}
