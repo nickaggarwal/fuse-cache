@@ -104,13 +104,13 @@ range cache turns windows into memory slices), FUSE warm 1 MiB sequential
 
 # 1. build
 GOOS=linux GOARCH=arm64 go build -o /tmp/rb/readbench-linux ./tools/readbench
-rust/fusedata/scripts/build-linux.sh            # -> rust/fusedata/target-linux/release/fusedata
-cp rust/fusedata/target-linux/release/fusedata /tmp/rb/fusedata
+rust/research/scripts/build-linux.sh            # -> rust/research/target-linux/release/fusedata
+cp rust/research/target-linux/release/fusedata /tmp/rb/fusedata
 #    (never cp over a binary a container is running: through the bind mount
 #     that bypasses ETXTBSY and the running process segfaults)
 
 # 2. lab container (needs /dev/fuse)
-docker build -t fusedata-lab -f rust/fusedata/bench/Dockerfile.lab rust/fusedata/bench
+docker build -t fusedata-lab -f rust/research/bench/Dockerfile.lab rust/research/bench
 docker volume create fusedata-cache
 docker run -d --name fusedata-lab --privileged --device /dev/fuse \
   -v "$PWD":/src:ro -v fusedata-cache:/cache -v /tmp/rb:/out fusedata-lab sleep infinity
@@ -128,19 +128,19 @@ docker exec -d fusedata-lab sh -c '/out/readbench-linux mount -dir /cache/c -mnt
 docker exec -d fusedata-lab sh -c '/out/fusedata mount --dir /cache/c --mnt /mnt/rs --workers 8 --publish /bench/model.bin:3221226249:16 --publish /bench/whole.bin:1073742157:16 >/out/rsmount.log 2>&1'
 
 # 5. correctness, then the matrix
-docker exec fusedata-lab sh /src/rust/fusedata/bench/probe-peer.sh      # Go vs Rust server, byte-identical responses
-docker exec fusedata-lab sh /src/rust/fusedata/bench/interop-peer.sh    # 2 clients x 2 servers, content verified
-docker exec -e REPS=1 -e VERIFY=-verify fusedata-lab sh /src/rust/fusedata/bench/run-fuse.sh
-docker exec fusedata-lab sh /src/rust/fusedata/bench/run-all.sh         # -> /tmp/rb/results/*.jsonl (~10 min)
-python3 -I rust/fusedata/bench/summarize.py /tmp/rb/results
-docker exec fusedata-lab sh /src/rust/fusedata/bench/sweep-readahead.sh # prefetcher knob sweep
+docker exec fusedata-lab sh /src/rust/research/bench/probe-peer.sh      # Go vs Rust server, byte-identical responses
+docker exec fusedata-lab sh /src/rust/research/bench/interop-peer.sh    # 2 clients x 2 servers, content verified
+docker exec -e REPS=1 -e VERIFY=-verify fusedata-lab sh /src/rust/research/bench/run-fuse.sh
+docker exec fusedata-lab sh /src/rust/research/bench/run-all.sh         # -> /tmp/rb/results/*.jsonl (~10 min)
+python3 -I rust/research/bench/summarize.py /tmp/rb/results
+docker exec fusedata-lab sh /src/rust/research/bench/sweep-readahead.sh # prefetcher knob sweep
 
 # 6. Azure (host side, Azurite)
 docker run -d --name fusedata-azurite -p 127.0.0.1:10000:10000 mcr.microsoft.com/azure-storage/azurite:3.35.0 \
   azurite-blob --blobHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck --loose
 go run ./tools/readbench azure-put -size 268439777
-rust/fusedata/scripts/cargo-host.sh build --release -p fusedata
-sh rust/fusedata/bench/run-azure.sh > /tmp/rb/results/azure.jsonl
+rust/research/scripts/cargo-host.sh build --release -p fusedata
+sh rust/research/bench/run-azure.sh > /tmp/rb/results/azure.jsonl
 
 # 7. profiles
 docker exec fusedata-lab sh -c 'cd /out && ./readbench-linux bench -dir /cache/c -size 3221226249 -window-kib 128 -pattern rand -total-mb 512 -cpuprofile go-rand128.cpu -memprofile go-rand128.mem'
@@ -152,7 +152,7 @@ uses it to write fixtures and run Go peers; without `go` on PATH the
 compatibility tests skip):
 
 ```bash
-rust/fusedata/scripts/cargo-host.sh test --workspace
+rust/research/scripts/cargo-host.sh test --workspace
 go test ./internal/cache -run 'TestReadRangeStrideSmallerThanChunks|TestAzureReadBench'
 ```
 

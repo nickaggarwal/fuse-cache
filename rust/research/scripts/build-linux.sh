@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the fusedata binary for Linux (arch of the Docker host) in a rust
-# container. The target dir lives under rust/fusedata/target-linux so the
+# container. The target dir lives under rust/research/target-linux so the
 # Linux and host builds do not clobber each other.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"

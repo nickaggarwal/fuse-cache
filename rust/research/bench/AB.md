@@ -102,7 +102,7 @@ Regenerate: `python3 -I bench/ab-tables.py results/ab/lab-results.json`.
 ## Run it on a cpu-e model node
 
 ```bash
-kubectl --context skyctl-cpu-e apply -f rust/fusedata/bench/node-bench-pod.yaml
+kubectl --context skyctl-cpu-e apply -f rust/research/bench/node-bench-pod.yaml
 kubectl --context skyctl-cpu-e -n default logs -f fusedata-nodebench      # ~30-45 min; prints the table
 kubectl --context skyctl-cpu-e -n default cp fusedata-nodebench:/results/results.json results.json
 kubectl --context skyctl-cpu-e -n default delete pod fusedata-nodebench

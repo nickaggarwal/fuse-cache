@@ -13,7 +13,7 @@
 //!   `*.stage-*`), which are never served.
 //!
 //! What it deliberately does differently from Go, per the profile in
-//! `rust/fusedata/README.md`:
+//! `rust/research/README.md`:
 //!
 //! * A window is served by `pread` of exactly the window's bytes into the
 //!   caller's buffer. Go's chunk path reads (and zero-fills) the whole 16 MiB

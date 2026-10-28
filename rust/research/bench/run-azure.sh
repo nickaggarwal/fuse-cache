@@ -6,10 +6,10 @@
 #     mcr.microsoft.com/azure-storage/azurite:3.35.0 \
 #     azurite-blob --blobHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck --loose
 #   go run ./tools/readbench azure-put -size 268439777
-#   sh rust/fusedata/bench/run-azure.sh
+#   sh rust/research/bench/run-azure.sh
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-RS=${RS:-$ROOT/rust/fusedata/target/release/fusedata}
+RS=${RS:-$ROOT/rust/research/target/release/fusedata}
 REPS=${REPS:-3}
 SIZE=${SIZE:-268439777}
 KEY='Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='

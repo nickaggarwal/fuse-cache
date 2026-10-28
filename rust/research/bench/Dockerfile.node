@@ -5,7 +5,7 @@
 #
 # Build from the repo root (both binaries are compiled in the image):
 #   docker buildx build --platform linux/amd64 \
-#     -f rust/fusedata/bench/Dockerfile.node -t <registry>/fusedata-nodebench:<tag> --load .
+#     -f rust/research/bench/Dockerfile.node -t <registry>/fusedata-nodebench:<tag> --load .
 #
 # Run privileged on the node, with the cache disk mounted in:
 #   docker run --rm --privileged --device /dev/fuse \
@@ -13,8 +13,8 @@
 
 FROM --platform=linux/amd64 rust:1.90-slim-bookworm AS rust
 WORKDIR /w
-COPY rust/fusedata/Cargo.toml rust/fusedata/Cargo.lock rust/fusedata/rust-toolchain.toml ./
-COPY rust/fusedata/crates ./crates
+COPY rust/research/Cargo.toml rust/research/Cargo.lock rust/research/rust-toolchain.toml ./
+COPY rust/research/crates ./crates
 RUN cargo build --release --locked -p fusedata && strip target/release/fusedata
 
 FROM --platform=linux/amd64 golang:1.26-bookworm AS go
@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo user_allow_other >> /etc/fuse.conf
 COPY --from=rust /w/target/release/fusedata /usr/local/bin/fusedata
 COPY --from=go /out/readbench /usr/local/bin/readbench
-COPY rust/fusedata/bench/node-bench.sh /usr/local/bin/node-bench.sh
+COPY rust/research/bench/node-bench.sh /usr/local/bin/node-bench.sh
 RUN chmod +x /usr/local/bin/node-bench.sh
 ENTRYPOINT []
 CMD ["node-bench.sh", "--help"]

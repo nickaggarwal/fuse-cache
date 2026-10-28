@@ -107,16 +107,16 @@ caches, and `run-tuned.sh` records the page-cache size after each drop
 
 ```bash
 # lab (see README.md "Reproduce" for the container + dataset)
-cp rust/fusedata/target-linux/release/fusedata /tmp/rb/fusedata-after   # new name: never overwrite a running binary
-docker exec fusedata-lab sh /src/rust/fusedata/bench/lab-reset.sh
-docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/fusedata/bench/mount-lab.sh
-docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/fusedata/bench/run-tuned.sh > /tmp/rb/tuned.jsonl
-python3 -I rust/fusedata/bench/focus-summary.py /tmp/rb/tuned.jsonl --md
+cp rust/research/target-linux/release/fusedata /tmp/rb/fusedata-after   # new name: never overwrite a running binary
+docker exec fusedata-lab sh /src/rust/research/bench/lab-reset.sh
+docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/research/bench/mount-lab.sh
+docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/research/bench/run-tuned.sh > /tmp/rb/tuned.jsonl
+python3 -I rust/research/bench/focus-summary.py /tmp/rb/tuned.jsonl --md
 # knob ablations
-docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/fusedata/bench/ablate-seq.sh
-docker exec fusedata-lab sh /src/rust/fusedata/bench/probe-fuse-ra.sh
+docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/research/bench/ablate-seq.sh
+docker exec fusedata-lab sh /src/rust/research/bench/probe-fuse-ra.sh
 # pinning / cold-cache sanity
-docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/fusedata/bench/check-pin.sh
+docker exec -e RS=/out/fusedata-after fusedata-lab sh /src/rust/research/bench/check-pin.sh
 ```
 
 ## Node benchmark (AKS model node)
@@ -126,7 +126,7 @@ branch, Go includes 2c047d1):
 
 ```bash
 docker buildx build --platform linux/amd64 \
-  -f rust/fusedata/bench/Dockerfile.node \
+  -f rust/research/bench/Dockerfile.node \
   -t <registry>/fusedata-nodebench:<tag> --push .
 ```
 

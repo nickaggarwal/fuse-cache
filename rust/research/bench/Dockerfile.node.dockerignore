@@ -7,9 +7,9 @@
 !internal/
 !proto/
 !tools/readbench/
-!rust/fusedata/Cargo.toml
-!rust/fusedata/Cargo.lock
-!rust/fusedata/rust-toolchain.toml
-!rust/fusedata/crates/
-!rust/fusedata/bench/node-bench.sh
-rust/fusedata/crates/fusedata-core/tests/
+!rust/research/Cargo.toml
+!rust/research/Cargo.lock
+!rust/research/rust-toolchain.toml
+!rust/research/crates/
+!rust/research/bench/node-bench.sh
+rust/research/crates/fusedata-core/tests/
