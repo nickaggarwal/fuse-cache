@@ -75,13 +75,210 @@ impl FileId {
     }
 }
 
+/// A read-only shared mapping of a whole cache file. Unmapped on drop.
+struct Map {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// The mapping is read-only and lives as long as the owning ChunkFile.
+unsafe impl Send for Map {}
+unsafe impl Sync for Map {}
+
+impl Map {
+    fn new(file: &File, len: i64) -> Option<Map> {
+        use std::os::fd::AsRawFd;
+        if len <= 0 {
+            return None;
+        }
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Map { ptr: p as *mut u8, len: len as usize })
+    }
+
+    fn slice(&self, from: usize, to: usize) -> &[u8] {
+        let to = to.min(self.len);
+        let from = from.min(to);
+        unsafe { std::slice::from_raw_parts(self.ptr.add(from), to - from) }
+    }
+}
+
+impl Drop for Map {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
 struct ChunkFile {
     file: File,
     len: i64,
+    map: OnceLock<Option<Map>>,
+    /// Highest offset a sequential reader has consumed through the mapping.
+    /// Mapped pages below it are released (see `release`), by the reader
+    /// after each window and by a prefetch worker whose populate finished
+    /// after the reader had already passed it.
+    consumed: AtomicU64,
+    /// Last time (ms, `clock_ms`) a reader or prefetch worker used the
+    /// mapping, for the idle reaper.
+    touched_ms: AtomicU64,
+    /// Set while the mapping may hold mapped pages; the file is then in
+    /// `MAPPED` and the reaper will unmap it once idle.
+    has_pages: std::sync::atomic::AtomicBool,
+}
+
+/// Every ChunkFile whose mapping may hold mapped pages. Pages mapped into a
+/// live process are neither evictable by `drop_caches` nor reclaimable
+/// cache, so anything that populates a mapping registers here and
+/// `reap_mapped` unmaps it once idle, whatever stream or entry it belonged
+/// to (prefetch can finish after its stream ended, entries can be dropped).
+static MAPPED: Mutex<Vec<Arc<ChunkFile>>> = Mutex::new(Vec::new());
+
+fn clock_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn register_mapped(cf: &Arc<ChunkFile>) {
+    cf.touched_ms.store(clock_ms(), Ordering::Relaxed);
+    if !cf.has_pages.swap(true, Ordering::AcqRel) {
+        MAPPED.lock().unwrap().push(cf.clone());
+    }
+}
+
+/// Unmap (pages stay in the page cache) every mapping idle for `idle`.
+/// The FUSE frontend calls this every second; library users should too.
+pub fn reap_mapped(idle: Duration) -> usize {
+    let now = clock_ms();
+    let mut v = MAPPED.lock().unwrap();
+    let before = v.len();
+    v.retain(|cf| {
+        if now.saturating_sub(cf.touched_ms.load(Ordering::Relaxed)) < idle.as_millis() as u64 {
+            return true;
+        }
+        cf.has_pages.store(false, Ordering::Release);
+        cf.release_all();
+        cf.consumed.store(0, Ordering::Relaxed);
+        // A populate racing this sets has_pages again and re-registers.
+        false
+    });
+    before - v.len()
+}
+
+impl ChunkFile {
+    fn new(file: File, len: i64) -> Self {
+        ChunkFile {
+            file,
+            len,
+            map: OnceLock::new(),
+            consumed: AtomicU64::new(0),
+            touched_ms: AtomicU64::new(0),
+            has_pages: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Populate `[off, off+len)` of the persistent mapping from a prefetch
+    /// worker, so the reader's later slice takes no faults. If the reader
+    /// overtook the worker meanwhile, unmap what it already consumed.
+    fn populate_ahead(self: &Arc<Self>, off: i64, len: i64) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(m) = self.map() else { return false };
+            register_mapped(self);
+            let a = (off & !4095) as usize;
+            let z = ((off + len) as usize).min(m.len);
+            if z <= a {
+                return true;
+            }
+            if self.consumed.load(Ordering::Relaxed) as usize >= z {
+                return true; // reader already past: nothing to do
+            }
+            let ok = unsafe { libc::madvise(m.ptr.add(a) as *mut libc::c_void, z - a, libc::MADV_POPULATE_READ) == 0 };
+            let c = self.consumed.load(Ordering::Relaxed) as i64;
+            if c > off {
+                self.release(off, c.min(off + len));
+            }
+            ok
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (off, len);
+            false
+        }
+    }
+
+    fn map(&self) -> Option<&Map> {
+        self.map.get_or_init(|| Map::new(&self.file, self.len)).as_ref()
+    }
+
+    /// Map `[from, to)` of the persistent mapping in one call
+    /// (`MADV_POPULATE_READ`) before the caller slices it. With the pages
+    /// already in the page cache this is a batched fault; touching them one
+    /// by one instead costs a fault per 64 KiB fault-around block, which
+    /// measured at about half the throughput.
+    fn populate_view(&self, from: i64, to: i64) {
+        #[cfg(target_os = "linux")]
+        if let Some(m) = self.map.get().and_then(|m| m.as_ref()) {
+            let a = (from & !4095) as usize;
+            let z = (to as usize).min(m.len);
+            if z > a {
+                unsafe {
+                    libc::madvise(m.ptr.add(a) as *mut libc::c_void, z - a, libc::MADV_POPULATE_READ);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (from, to);
+    }
+
+    /// Unmap everything (pages stay in the page cache).
+    fn release_all(&self) {
+        if let Some(m) = self.map.get().and_then(|m| m.as_ref()) {
+            unsafe {
+                libc::madvise(m.ptr as *mut libc::c_void, m.len, libc::MADV_DONTNEED);
+            }
+        }
+    }
+
+    /// Drop the page-table entries a view of `[from, to)` created, once the
+    /// caller has consumed it. Pages mapped into a live process are neither
+    /// evictable by `drop_caches` nor reclaimable cache: without this a
+    /// long-lived daemon pins every file it has streamed (measured: RSS grew
+    /// to the size of the file read, and later "cold" runs were silently
+    /// warm). The pages stay in the page cache. Another thread reading an
+    /// overlapping range through the mapping just refaults the cached page.
+    fn release(&self, from: i64, to: i64) {
+        let Some(m) = self.map.get().and_then(|m| m.as_ref()) else { return };
+        let a = ((from + 4095) & !4095) as usize; // inward: never touch a
+        let z = if to as usize >= m.len { m.len.next_multiple_of(4096) } else { (to & !4095) as usize }; // neighbour's page
+        if z > a {
+            unsafe {
+                libc::madvise(m.ptr.add(a) as *mut libc::c_void, z - a, libc::MADV_DONTNEED);
+            }
+        }
+    }
+}
+
+/// How prefetch workers bring a piece into the page cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefetchMode {
+    /// `WILLNEED` (large async I/Os) then `MADV_POPULATE_READ` on the file's
+    /// persistent mapping: waits until the piece is in the page cache and
+    /// pre-maps it, so the reader's slice (`ViewMode::Map`) takes no faults.
+    /// Mapped pages are released once the reader has consumed them
+    /// (`ChunkFile::consumed`).
+    Populate,
+    /// `pread` into a scratch buffer (large synchronous I/Os, one copy).
+    Pread,
+    /// `WILLNEED` only (async, no wait).
+    Hint,
 }
 
 enum Layout {
-    Whole { file: File, size: i64 },
+    Whole { cf: Arc<ChunkFile> },
     /// Chunk files are opened lazily and cached once found. A slot is never
     /// cached as missing, so a chunk promoted later is picked up.
     Chunked { stride: i64, total: i64, slots: Vec<OnceLock<Arc<ChunkFile>>> },
@@ -98,8 +295,34 @@ struct Entry {
     checked_ms: AtomicU64,
     /// End offset of the previous read, for sequential detection.
     last_end: AtomicU64,
-    /// Logical offset up to which WILLNEED has been issued.
+    /// Logical offset up to which prefetch has been issued.
     ra_until: AtomicU64,
+    /// Current adaptive prefetch window in bytes.
+    ra_window: AtomicU64,
+    /// Sequential-stream segment buffer (see `read_view`).
+    seg: Mutex<Segment>,
+}
+
+/// A copy of `[off, off+len)` of one cache file, refilled by one large
+/// `pread` as a sequential stream moves through it.
+#[derive(Default)]
+struct Segment {
+    file: usize,
+    off: i64,
+    len: usize,
+    buf: Vec<u8>,
+}
+
+/// How `read_view` serves a sequential window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Slice of a per-stream segment buffer refilled by one `pread` of
+    /// `segment` bytes (one copy per byte, one syscall per segment).
+    Segment,
+    /// Slice of a persistent mapping, populated then released per window.
+    Map,
+    /// `pread` of the window (one copy and one syscall per window).
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -116,13 +339,22 @@ pub struct Options {
     pub max_entries: usize,
     /// Prefetch workers that pull hinted ranges into the page cache, in
     /// `readahead_piece` units, so the device sees parallel streams (the lab
-    /// disk does 5.4 GB/s with one reader and 17.5 GB/s with eight). 0 only
-    /// issues async `WILLNEED` hints on the reading thread. 4 x 4 MiB won a
-    /// cold-cache sweep (bench/sweep-readahead.sh).
+    /// disk does 5.4 GB/s with one reader, 15 GB/s with 8, 19 GB/s with 16).
+    /// 0 only issues async `WILLNEED` hints on the reading thread. 16 x 8 MiB
+    /// with a 512 MiB max window won the single-reader sweep
+    /// (bench/ablate-seq.sh). Workers are idle threads when no stream runs.
     pub readahead_threads: usize,
     /// Prefetch work unit; a hint is split into pieces of this size so
     /// several workers share one chunk file.
     pub readahead_piece: i64,
+    /// Starting prefetch window of a newly confirmed sequential stream; it
+    /// doubles on every refill up to `readahead`.
+    pub readahead_min: u64,
+    pub prefetch_mode: PrefetchMode,
+    /// How sequential windows are served by `read_view`.
+    pub view: ViewMode,
+    /// Segment size for `ViewMode::Segment`.
+    pub segment: usize,
 }
 
 impl Default for Options {
@@ -130,11 +362,15 @@ impl Default for Options {
         Options {
             configured_chunk_size: 16 << 20,
             revalidate: Duration::from_millis(500),
-            readahead: 128 << 20,
+            readahead: 512 << 20,
             verify_sidecars: true,
             max_entries: 8192,
-            readahead_threads: 4,
-            readahead_piece: 4 << 20,
+            readahead_threads: 16,
+            readahead_piece: 8 << 20,
+            readahead_min: 32 << 20,
+            prefetch_mode: PrefetchMode::Populate,
+            view: ViewMode::Map,
+            segment: 4 << 20,
         }
     }
 }
@@ -149,6 +385,8 @@ pub struct LayoutStats {
     pub verifies: AtomicU64,
     pub verify_failures: AtomicU64,
     pub readahead_hints: AtomicU64,
+    /// Windows served as a slice of a mapping (no copy).
+    pub view_reads: AtomicU64,
 }
 
 pub struct CacheDir {
@@ -163,7 +401,7 @@ pub struct CacheDir {
 }
 
 /// Readahead hint pool: each job is one `WILLNEED` on one chunk file.
-fn spawn_prefetch(threads: usize) -> Option<std::sync::mpsc::SyncSender<(Arc<ChunkFile>, i64, i64)>> {
+fn spawn_prefetch(threads: usize, mode: PrefetchMode, persistent: bool) -> Option<std::sync::mpsc::SyncSender<(Arc<ChunkFile>, i64, i64)>> {
     if threads == 0 {
         return None;
     }
@@ -176,7 +414,7 @@ fn spawn_prefetch(threads: usize) -> Option<std::sync::mpsc::SyncSender<(Arc<Chu
             .spawn(move || loop {
                 let job = rx.lock().unwrap().recv();
                 match job {
-                    Ok((cf, off, len)) => populate(&cf.file, off, len),
+                    Ok((cf, off, len)) => prefetch_piece(&cf, off, len, mode, persistent),
                     Err(_) => return,
                 }
             })
@@ -270,6 +508,33 @@ fn populate(file: &File, off: i64, len: i64) {
             }
         }
     }
+    populate_pread(file, off, len);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate(file: &File, off: i64, len: i64) {
+    willneed(file, off, len)
+}
+
+/// `persistent`: populate the file's persistent mapping (only useful when
+/// the reader slices it, `ViewMode::Map`); otherwise a transient mapping that
+/// leaves nothing mapped.
+fn prefetch_piece(cf: &Arc<ChunkFile>, off: i64, len: i64, mode: PrefetchMode, persistent: bool) {
+    match mode {
+        PrefetchMode::Hint => willneed(&cf.file, off, len),
+        PrefetchMode::Pread => populate_pread(&cf.file, off, len),
+        PrefetchMode::Populate => {
+            // WILLNEED first: it submits the piece as large (max_sectors)
+            // I/Os; faulting alone reads in read_ahead_kb units.
+            willneed(&cf.file, off, len);
+            if !(persistent && cf.populate_ahead(off, len)) {
+                populate(&cf.file, off, len);
+            }
+        }
+    }
+}
+
+fn populate_pread(file: &File, off: i64, len: i64) {
     thread_local! {
         static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -281,12 +546,6 @@ fn populate(file: &File, off: i64, len: i64) {
         let _ = pread_full(file, &mut b[..len as usize], off as u64);
     });
 }
-
-#[cfg(not(target_os = "linux"))]
-fn populate(file: &File, off: i64, len: i64) {
-    willneed(file, off, len)
-}
-
 
 #[cfg(target_os = "linux")]
 fn fadvise_sequential(file: &File) {
@@ -321,7 +580,7 @@ impl CacheDir {
             entries: RwLock::new(HashMap::new()),
             hints: RwLock::new(HashMap::new()),
             verified: Mutex::new(HashMap::new()),
-            prefetch: spawn_prefetch(opts.readahead_threads),
+            prefetch: spawn_prefetch(opts.readahead_threads, opts.prefetch_mode, opts.view == ViewMode::Map),
             stats: LayoutStats::default(),
         }
     }
@@ -428,7 +687,16 @@ impl CacheDir {
 
     fn mk_entry(&self, layout: Layout, id: Option<FileId>) -> Entry {
         let now = self.now_ms();
-        Entry { layout, id, resolved_ms: now, checked_ms: AtomicU64::new(now), last_end: AtomicU64::new(u64::MAX), ra_until: AtomicU64::new(0) }
+        Entry {
+            layout,
+            id,
+            resolved_ms: now,
+            checked_ms: AtomicU64::new(now),
+            last_end: AtomicU64::new(u64::MAX),
+            ra_until: AtomicU64::new(0),
+            ra_window: AtomicU64::new(0),
+            seg: Mutex::new(Segment::default()),
+        }
     }
 
     fn resolve(&self, path: &str) -> io::Result<Entry> {
@@ -453,7 +721,7 @@ impl CacheDir {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("checksum mismatch for {path}")));
                     }
-                    return Ok(self.mk_entry(Layout::Whole { file: f, size }, Some(id)));
+                    return Ok(self.mk_entry(Layout::Whole { cf: Arc::new(ChunkFile::new(f, size)) }, Some(id)));
                 }
             }
         }
@@ -482,7 +750,7 @@ impl CacheDir {
             let n = chunk_count_for(total, stride).max(1) as usize;
             let slots: Vec<OnceLock<Arc<ChunkFile>>> = (0..n).map(|_| OnceLock::new()).collect();
             if let (Some(f), Some(md)) = (c0, &c0md) {
-                let _ = slots[0].set(Arc::new(ChunkFile { len: md.size() as i64, file: f }));
+                let _ = slots[0].set(Arc::new(ChunkFile::new(f, md.size() as i64)));
             }
             let id = c0md.as_ref().map(FileId::of);
             return Ok(self.mk_entry(Layout::Chunked { stride, total, slots }, id));
@@ -564,7 +832,7 @@ impl CacheDir {
     pub fn size(&self, path: &str) -> io::Result<i64> {
         let e = self.entry(&clean_path(path))?;
         Ok(match &e.layout {
-            Layout::Whole { size, .. } => *size,
+            Layout::Whole { cf } => cf.len,
             Layout::Chunked { total, .. } => *total,
             Layout::Remote { size } => *size,
         })
@@ -576,7 +844,7 @@ impl CacheDir {
         let p = clean_path(path);
         let e = self.entry(&p)?;
         Ok(match &e.layout {
-            Layout::Whole { size, .. } => Shape { size: *size, chunked: false, stride: 0, nchunks: 0, complete: true },
+            Layout::Whole { cf } => Shape { size: cf.len, chunked: false, stride: 0, nchunks: 0, complete: true },
             Layout::Chunked { stride, total, slots } => {
                 let complete = (0..slots.len()).all(|i| self.chunk_file(&p, slots, i as i64).is_some());
                 Shape { size: *total, chunked: true, stride: *stride, nchunks: slots.len() as i64, complete }
@@ -592,7 +860,7 @@ impl CacheDir {
         }
         let f = File::open(self.local_path(&chunk_path(path, idx))).ok()?;
         let len = f.metadata().ok()?.size() as i64;
-        let _ = slot.set(Arc::new(ChunkFile { file: f, len }));
+        let _ = slot.set(Arc::new(ChunkFile::new(f, len)));
         slot.get().cloned()
     }
 
@@ -615,13 +883,14 @@ impl CacheDir {
         let e = self.entry(&p)?;
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         let n = match &e.layout {
-            Layout::Whole { file, size } => {
-                if off as i64 >= *size {
+            Layout::Whole { cf } => {
+                let size = cf.len;
+                if off as i64 >= size {
                     return Ok(0);
                 }
-                let want = buf.len().min((*size - off as i64) as usize);
-                self.readahead(&e, off, want as u64, |o, l| willneed(file, o, l), *size);
-                pread_full(file, &mut buf[..want], off)?
+                let want = buf.len().min((size - off as i64) as usize);
+                self.readahead(&e, off, want as u64, |o, l| self.queue_piece(cf, o, l), size);
+                pread_full(&cf.file, &mut buf[..want], off)?
             }
             Layout::Remote { size } => {
                 if off as i64 >= *size {
@@ -660,41 +929,7 @@ impl CacheDir {
                     }
                 }
                 if !spans.is_empty() {
-                    let stride = *stride;
-                    self.readahead(
-                        &e,
-                        off,
-                        pos as u64,
-                        |o, l| {
-                            // Hint every chunk file the window [o, o+l) covers.
-                            let mut cur = o;
-                            while cur < o + l {
-                                let idx = cur / stride;
-                                let within = cur - idx * stride;
-                                let take = (stride - within).min(o + l - cur);
-                                if let Some(cf) = self.chunk_file(&p, slots, idx) {
-                                    if within == 0 {
-                                        fadvise_sequential(&cf.file);
-                                    }
-                                    match &self.prefetch {
-                                        // Full queue: drop the piece rather
-                                        // than block the reader.
-                                        Some(tx) => {
-                                            let mut o = within;
-                                            while o < within + take {
-                                                let l = self.opts.readahead_piece.max(4096).min(within + take - o);
-                                                let _ = tx.try_send((cf.clone(), o, l));
-                                                o += l;
-                                            }
-                                        }
-                                        None => willneed(&cf.file, within, take),
-                                    }
-                                }
-                                cur += take;
-                            }
-                        },
-                        *total,
-                    );
+                    self.readahead(&e, off, pos as u64, |o, l| self.prefetch_chunked(&p, *stride, slots, o, l), *total);
                 }
                 pos
             }
@@ -707,17 +942,35 @@ impl CacheDir {
     /// when this read starts where the previous one ended, and only for the
     /// part of the window not already hinted, so steady state costs one
     /// fadvise per `readahead/2` bytes consumed.
+    ///
+    /// The window starts at `readahead_min` when a stream starts and doubles
+    /// on every refill up to `readahead` (Go's range prefetch grows the same
+    /// way), so a short burst does not pull a full window and a long stream
+    /// gets a deep one. A non-sequential read resets it.
     fn readahead<H: FnMut(i64, i64)>(&self, e: &Entry, off: u64, len: u64, mut hint: H, total: i64) {
-        let ra = self.opts.readahead;
+        let max = self.opts.readahead;
         let end = off + len;
         let prev = e.last_end.swap(end, Ordering::Relaxed);
-        if ra == 0 || prev != off {
+        if max == 0 {
             return;
         }
+        // A read at offset 0 starts a stream (first read of a file), as in Go.
+        if prev != off && off != 0 {
+            e.ra_window.store(0, Ordering::Relaxed);
+            e.ra_until.store(0, Ordering::Relaxed);
+            return;
+        }
+        if off == 0 {
+            e.ra_window.store(0, Ordering::Relaxed);
+            e.ra_until.store(0, Ordering::Relaxed);
+        }
+        let mut ra = e.ra_window.load(Ordering::Relaxed);
         let until = e.ra_until.load(Ordering::Relaxed);
-        if until > end + ra / 2 {
+        if ra != 0 && until > end + ra / 2 {
             return;
         }
+        ra = if ra == 0 { self.opts.readahead_min.clamp(1, max) } else { (ra * 2).min(max) };
+        e.ra_window.store(ra, Ordering::Relaxed);
         let from = until.max(end);
         let to = (end + ra).min(total as u64);
         if to <= from {
@@ -727,6 +980,161 @@ impl CacheDir {
             self.stats.readahead_hints.fetch_add(1, Ordering::Relaxed);
             hint(from as i64, (to - from) as i64);
         }
+    }
+
+    fn queue_piece(&self, cf: &Arc<ChunkFile>, within: i64, take: i64) {
+        match &self.prefetch {
+            // Full queue: drop the piece rather than block the reader.
+            Some(tx) => {
+                let piece = self.opts.readahead_piece.max(4096);
+                let mut o = within;
+                while o < within + take {
+                    let l = piece.min(within + take - o);
+                    let _ = tx.try_send((cf.clone(), o, l));
+                    o += l;
+                }
+            }
+            None => willneed(&cf.file, within, take),
+        }
+    }
+
+    /// Prefetch every chunk file the logical window `[o, o+l)` covers.
+    fn prefetch_chunked(&self, p: &str, stride: i64, slots: &[OnceLock<Arc<ChunkFile>>], o: i64, l: i64) {
+        let mut cur = o;
+        while cur < o + l {
+            let idx = cur / stride;
+            let within = cur - idx * stride;
+            let take = (stride - within).min(o + l - cur);
+            if let Some(cf) = self.chunk_file(p, slots, idx) {
+                if within == 0 {
+                    fadvise_sequential(&cf.file);
+                }
+                self.queue_piece(&cf, within, take);
+            }
+            cur += take;
+        }
+    }
+
+
+    /// Serve `[off, off+len)` to `f`, without copying when possible.
+    ///
+    /// `ViewMode::Map` (default): a sequential window inside one local file
+    /// is handed to `f` as a slice of that file's persistent mapping. The
+    /// prefetch workers have usually populated those pages already
+    /// (`MADV_POPULATE_READ`), so the slice costs no copy and no faults;
+    /// through FUSE that saves one of the two copies `pread`-then-reply
+    /// costs. Mapped pages are released (`MADV_DONTNEED`) right after `f`
+    /// returns, and anything prefetch mapped but nobody consumed is unmapped
+    /// by [`reap_mapped`] once idle; a process using views must call it
+    /// periodically (the FUSE frontend does every 500 ms). Pages mapped into
+    /// a live process cannot be dropped from the page cache, so skipping
+    /// either would pin every streamed file in memory.
+    ///
+    /// Random windows (which would fault page by page), windows spanning
+    /// chunk files, and data that is not local go through [`read_at`] into
+    /// a per-thread buffer. `ViewMode::Segment` / `Copy` are kept for
+    /// comparison (bench/ablate-seq.sh): both measured slower.
+    ///
+    /// Caveat: truncating a mapped file in place would SIGBUS. The Go client
+    /// never truncates cache files: it renames new versions over and unlinks
+    /// on eviction, both of which keep the mapped inode intact.
+    pub fn read_view<R>(&self, path: &str, off: u64, len: usize, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
+        if self.opts.view != ViewMode::Copy && len > 0 {
+            let p = clean_path(path);
+            let e = self.entry(&p)?;
+            if off == 0 || e.last_end.load(Ordering::Relaxed) == off {
+                let target = match &e.layout {
+                    Layout::Whole { cf } => {
+                        if off as i64 >= cf.len {
+                            return Ok(f(&[]));
+                        }
+                        Some((cf.clone(), off as i64, (off as i64 + len as i64).min(cf.len)))
+                    }
+                    Layout::Chunked { stride, total, slots } => {
+                        let spans = plan_range(*total, *stride, off as i64, len as i64);
+                        match spans.as_slice() {
+                            [] => return Ok(f(&[])),
+                            [s] => self.chunk_file(&p, slots, s.index).map(|cf| {
+                                let (from, to) = clamp_chunk_slice(s.from, s.to, cf.len);
+                                (cf, from, to)
+                            }),
+                            _ => None,
+                        }
+                    }
+                    Layout::Remote { .. } => None,
+                };
+                if let (Some((cf, from, to)), ViewMode::Segment) = (&target, self.opts.view) {
+                    // Contended (another window of this file in flight):
+                    // fall through to the copy path rather than wait.
+                    if let Ok(mut seg) = e.seg.try_lock() {
+                        let (from, to) = (*from, *to);
+                        let id = Arc::as_ptr(cf) as usize;
+                        let hit = seg.file == id && from >= seg.off && to <= seg.off + seg.len as i64;
+                        if !hit {
+                            let segsz = self.opts.segment.max(len) as i64;
+                            let so = from - from % segsz.max(1);
+                            let sl = (segsz.min(cf.len - so)).max(to - so) as usize;
+                            if seg.buf.len() < sl {
+                                seg.buf.resize(sl, 0);
+                            }
+                            let got = pread_full(&cf.file, &mut seg.buf[..sl], so as u64)?;
+                            seg.file = id;
+                            seg.off = so;
+                            seg.len = got;
+                        }
+                        let a = (from - seg.off) as usize;
+                        let z = ((to - seg.off) as usize).min(seg.len);
+                        let n = z.saturating_sub(a) as u64;
+                        match &e.layout {
+                            Layout::Whole { cf } => self.readahead(&e, off, n, |o, l| self.queue_piece(cf, o, l), cf.len),
+                            Layout::Chunked { stride, total, slots } => {
+                                self.readahead(&e, off, n, |o, l| self.prefetch_chunked(&p, *stride, slots, o, l), *total)
+                            }
+                            Layout::Remote { .. } => {}
+                        }
+                        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                        self.stats.view_reads.fetch_add(1, Ordering::Relaxed);
+                        self.stats.bytes.fetch_add(n, Ordering::Relaxed);
+                        return Ok(f(&seg.buf[a..a.max(z)]));
+                    }
+                }
+                if let (Some((cf, from, to)), ViewMode::Map) = (target, self.opts.view) {
+                    if let Some(m) = cf.map() {
+                        let n = (to - from).max(0) as u64;
+                        match &e.layout {
+                            Layout::Whole { cf } => self.readahead(&e, off, n, |o, l| self.queue_piece(cf, o, l), cf.len),
+                            Layout::Chunked { stride, total, slots } => {
+                                self.readahead(&e, off, n, |o, l| self.prefetch_chunked(&p, *stride, slots, o, l), *total)
+                            }
+                            Layout::Remote { .. } => {}
+                        }
+                        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                        self.stats.view_reads.fetch_add(1, Ordering::Relaxed);
+                        self.stats.bytes.fetch_add(n, Ordering::Relaxed);
+                        // f consumes the slice before returning (FUSE writes
+                        // the reply synchronously), so the range can be
+                        // released right after.
+                        register_mapped(&cf);
+                        cf.populate_view(from, to);
+                        let r = f(m.slice(from as usize, to as usize));
+                        cf.consumed.fetch_max(to as u64, Ordering::Relaxed);
+                        cf.release(from, to);
+                        return Ok(r);
+                    }
+                }
+            }
+        }
+        thread_local! {
+            static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.len() < len {
+                b.resize(len, 0);
+            }
+            let n = self.read_at(path, off, &mut b[..len])?;
+            Ok(f(&b[..n]))
+        })
     }
 
     /// Resolve a peer `/api/peer/read` request path to `(file, offset,

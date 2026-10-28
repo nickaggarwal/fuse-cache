@@ -16,9 +16,10 @@ use fusedata_core::pattern;
 use fusedata_core::peer::{PeerClient, PeerClientConfig, PeerServer, PeerServerConfig};
 use fusedata_core::tiered::TieredReader;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "fusedata", about = "Rust read data path for the fuse-client cache (prototype)")]
+#[command(name = "fusedata", version, about = "Rust read data path for the fuse-client cache (prototype)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -32,16 +33,29 @@ struct CacheArgs {
     /// Node -chunk-size in MiB (used when metadata has no stride).
     #[arg(long, default_value_t = 16)]
     chunk_mb: i64,
-    /// Readahead hint distance in MiB for sequential streams (0 = off).
-    #[arg(long, default_value_t = 128)]
+    /// Max prefetch window in MiB for a sequential stream (0 = off).
+    #[arg(long, default_value_t = 512)]
     readahead_mb: u64,
-    /// Prefetch worker threads (0 = async hints only). 4 x 4 MiB won a
-    /// cold-cache sweep (bench/sweep-readahead.sh).
-    #[arg(long, default_value_t = 4)]
+    /// Prefetch worker threads (0 = async hints only). 16 x 8 MiB up to a
+    /// 512 MiB window won the single-reader sweep (bench/ablate-seq.sh): the
+    /// lab disk needs ~16 concurrent streams to reach its ceiling.
+    #[arg(long, default_value_t = 16)]
     readahead_threads: usize,
     /// Prefetch piece size in KiB.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     readahead_piece_kib: i64,
+    /// Starting prefetch window in MiB (doubles up to --readahead-mb).
+    #[arg(long, default_value_t = 32)]
+    readahead_min_mb: u64,
+    /// Prefetch worker mode: populate | pread | hint.
+    #[arg(long, default_value = "populate")]
+    prefetch_mode: String,
+    /// How sequential windows are served: segment | map | copy.
+    #[arg(long, default_value = "map")]
+    view: String,
+    /// Segment size in KiB for --view segment.
+    #[arg(long, default_value_t = 4096)]
+    segment_kib: usize,
     /// path:size:strideMiB shape hints (what the coordinator would say).
     #[arg(long = "publish")]
     publish: Vec<String>,
@@ -56,6 +70,20 @@ impl CacheArgs {
                 readahead: self.readahead_mb << 20,
                 readahead_threads: self.readahead_threads,
                 readahead_piece: self.readahead_piece_kib << 10,
+                readahead_min: self.readahead_min_mb << 20,
+                prefetch_mode: match self.prefetch_mode.as_str() {
+                    "populate" => fusedata_core::layout::PrefetchMode::Populate,
+                    "pread" => fusedata_core::layout::PrefetchMode::Pread,
+                    "hint" => fusedata_core::layout::PrefetchMode::Hint,
+                    m => bail!("unknown --prefetch-mode {m}"),
+                },
+                view: match self.view.as_str() {
+                    "segment" => fusedata_core::layout::ViewMode::Segment,
+                    "map" => fusedata_core::layout::ViewMode::Map,
+                    "copy" => fusedata_core::layout::ViewMode::Copy,
+                    v => bail!("unknown --view {v}"),
+                },
+                segment: self.segment_kib << 10,
                 ..Default::default()
             },
         );
@@ -84,6 +112,10 @@ struct WorkArgs {
     total_mb: i64,
     #[arg(long)]
     verify: bool,
+    /// Library bench: copy into a caller buffer (read_at) instead of the
+    /// zero-copy view API.
+    #[arg(long)]
+    copy: bool,
 }
 
 #[derive(Args, Clone)]
@@ -224,6 +256,10 @@ enum Cmd {
         mnt: String,
         #[arg(long, default_value_t = 8)]
         workers: usize,
+        /// Kernel readahead for the mount in KiB (0 = leave the 128 KiB
+        /// default).
+        #[arg(long, default_value_t = 4096)]
+        kernel_readahead_kb: u32,
     },
 }
 
@@ -242,22 +278,54 @@ fn main() -> anyhow::Result<()> {
             let shape = c.shape(&path).with_context(|| format!("stat {path}"))?;
             let w = bench::Workload { size: shape.size, window: work.window_kib << 10, pattern: work.pattern, threads: work.threads, total_bytes: work.total_mb << 20, seed: 42 };
             let verify = work.verify;
+            // Default: the API the FUSE frontend uses (read_view, zero-copy
+            // for sequential local windows, the caller consumes the slice in
+            // place). --copy: read_at into a caller buffer.
+            let copy = work.copy;
             let r = bench::run(
                 &w,
                 "rust",
                 "library",
                 || vec![0u8; w.window as usize],
                 |buf, off, n| {
-                    let got = c.read_at(&path, off as u64, &mut buf[..n])?;
-                    if verify {
-                        if let Some(bad) = pattern::check(&buf[..got], off as u64) {
-                            bail!("content mismatch at {bad}");
+                    if copy {
+                        let got = c.read_at(&path, off as u64, &mut buf[..n])?;
+                        if verify {
+                            if let Some(bad) = pattern::check(&buf[..got], off as u64) {
+                                bail!("content mismatch at {bad}");
+                            }
                         }
+                        return Ok(got);
                     }
-                    Ok(got)
+                    let res = c.read_view(&path, off as u64, n, |d| {
+                        if verify {
+                            if let Some(bad) = pattern::check(d, off as u64) {
+                                return Err(anyhow!("content mismatch at {bad}"));
+                            }
+                        } else {
+                            // Touch every page so a mapped view is really read.
+                            let mut x = 0u8;
+                            for i in (0..d.len()).step_by(4096) {
+                                x ^= unsafe { std::ptr::read_volatile(&d[i]) };
+                            }
+                            std::hint::black_box(x);
+                        }
+                        Ok(d.len())
+                    })?;
+                    res
                 },
             )?;
-            emit(r, format!("layout={} readahead_hints={}", if shape.chunked { "chunked" } else { "whole" }, c.stats.readahead_hints.load(std::sync::atomic::Ordering::Relaxed)));
+            use std::sync::atomic::Ordering::Relaxed;
+            fusedata_core::layout::reap_mapped(Duration::ZERO);
+            emit(
+                r,
+                format!(
+                    "layout={} readahead_hints={} view_reads={} copy={copy}",
+                    if shape.chunked { "chunked" } else { "whole" },
+                    c.stats.readahead_hints.load(Relaxed),
+                    c.stats.view_reads.load(Relaxed)
+                ),
+            );
         }
         Cmd::Verify { cache, remote, path, window_kib } => {
             let t = remote.tiered(cache.open()?)?;
@@ -343,15 +411,15 @@ fn main() -> anyhow::Result<()> {
             r["pattern"] = "chunk".into();
             emit(r, String::new());
         }
-        Cmd::Mount { cache, remote, mnt, workers } => {
+        Cmd::Mount { cache, remote, mnt, workers, kernel_readahead_kb } => {
             #[cfg(target_os = "linux")]
             {
                 let t = Arc::new(remote.tiered(cache.open()?)?);
-                fuse_fs::mount(fuse_fs::Fs::new(t).with_workers(workers), &mnt)?;
+                fuse_fs::mount(fuse_fs::Fs::new(t).with_workers(workers), &mnt, kernel_readahead_kb)?;
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (cache, remote, mnt, workers);
+                let _ = (cache, remote, mnt, workers, kernel_readahead_kb);
                 bail!("mount is Linux-only");
             }
         }

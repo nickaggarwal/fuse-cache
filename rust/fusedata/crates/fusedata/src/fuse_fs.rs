@@ -141,7 +141,17 @@ impl Fs {
 
 impl Filesystem for Fs {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        // Unmap mappings that went idle (see layout::reap_mapped).
+        std::thread::Builder::new()
+            .name("reaper".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                fusedata_core::layout::reap_mapped(Duration::from_secs(1));
+            })
+            .map_err(|_| libc::EIO)?;
         let _ = config.set_max_readahead(16 * 1024 * 1024);
+        // 1 MiB reads, as go-fuse negotiates (max_read=1048576 on its mount).
+        let _ = config.set_max_write(1024 * 1024);
         let _ = config.set_max_background(512);
         let _ = config.set_congestion_threshold(384);
         Ok(())
@@ -233,26 +243,76 @@ impl Filesystem for Fs {
 }
 
 fn serve_read(reader: &TieredReader, path: &str, off: u64, size: u32, reply: ReplyData) {
-    BUF.with(|b| {
-        let mut buf = b.borrow_mut();
-        if buf.len() < size as usize {
-            buf.resize(size as usize, 0);
+    // The reply is written to /dev/fuse straight from the mapping slice
+    // (zero-copy view) or from the per-thread buffer the slow path filled.
+    let mut reply = Some(reply);
+    let r = reader.read_view(path, off, size as usize, |data| reply.take().unwrap().data(data));
+    if let Err(e) = r {
+        eprintln!("[FUSE] read {path} off={off} size={size}: {e}");
+        if let Some(rp) = reply.take() {
+            rp.error(libc::EIO)
         }
-        match reader.read(path, off, &mut buf[..size as usize]) {
-            Ok(n) => reply.data(&buf[..n]),
-            Err(e) => {
-                eprintln!("[FUSE] read {path} off={off} size={size}: {e}");
-                reply.error(libc::EIO)
-            }
-        }
-    })
+    }
 }
 
-/// Mount and serve until unmounted.
-pub fn mount(fs: Fs, mnt: &str) -> anyhow::Result<()> {
+/// Set the mount's backing-device readahead (`/sys/class/bdi/<maj:min>/
+/// read_ahead_kb`). The kernel only sends FUSE READs as large as this
+/// window for a sequential reader, and new FUSE mounts default to 128 KiB,
+/// which caps a single-reader stream at ~2.5-3.5 GB/s through either
+/// daemon on the lab VM; 4 MiB measured 14 GB/s (bench/probe-fuse-ra.sh).
+/// Needs root (as the mount itself does in the DaemonSet).
+fn set_bdi_readahead(mnt: &str, kb: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(mnt)?.dev();
+    let (maj, min) = (libc::major(dev), libc::minor(dev));
+    std::fs::write(format!("/sys/class/bdi/{maj}:{min}/read_ahead_kb"), kb.to_string())
+}
+
+/// Mount and serve until unmounted. `readahead_kb` > 0 sets the mount's
+/// kernel readahead once the mount is up.
+pub fn mount(fs: Fs, mnt: &str, readahead_kb: u32) -> anyhow::Result<()> {
     use fuser::MountOption;
-    let opts = [MountOption::RO, MountOption::FSName("fusedata".into()), MountOption::Subtype("fusedata".into()), MountOption::DefaultPermissions];
+    let opts = [
+        MountOption::RO,
+        MountOption::FSName("fusedata".into()),
+        MountOption::Subtype("fusedata".into()),
+        MountOption::DefaultPermissions,
+        MountOption::CUSTOM("max_read=1048576".into()),
+    ];
     eprintln!("[FUSE] mounting at {mnt}");
+    if readahead_kb > 0 {
+        // The mount's BDI exists once the kernel finishes INIT, which needs
+        // the session loop below running; set it from a side thread.
+        let m = mnt.to_string();
+        std::thread::spawn(move || {
+            let root_dev = std::fs::metadata(std::path::Path::new(&m).parent().unwrap_or(std::path::Path::new("/"))).map(|md| {
+                use std::os::unix::fs::MetadataExt;
+                md.dev()
+            });
+            for _ in 0..250 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let dev = std::fs::metadata(&m).map(|md| {
+                    use std::os::unix::fs::MetadataExt;
+                    md.dev()
+                });
+                // Wait until the path is the FUSE mount, not the directory under it.
+                if dev.is_err() || dev.as_ref().ok() == root_dev.as_ref().ok() {
+                    continue;
+                }
+                match set_bdi_readahead(&m, readahead_kb) {
+                    Ok(()) => {
+                        eprintln!("[FUSE] kernel readahead set to {readahead_kb} KiB");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[FUSE] kernel readahead NOT set ({e}); needs root");
+                        return;
+                    }
+                }
+            }
+            eprintln!("[FUSE] kernel readahead NOT set (mount not seen)");
+        });
+    }
     fuser::mount2(fs, mnt, &opts)?;
     Ok(())
 }

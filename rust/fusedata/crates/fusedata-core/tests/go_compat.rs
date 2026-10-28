@@ -139,6 +139,60 @@ fn layout_reads_go_written_cache_dir() {
     assert_eq!(c.read_at(&format!("/../../models/a/../a/{}", f.path.rsplit('/').next().unwrap()), 0, &mut b).unwrap(), 16);
 }
 
+/// Mapped views (the FUSE read path) return the same bytes as read_at for
+/// sequential and random windows of every layout, and leave nothing mapped
+/// once reaped.
+#[test]
+fn read_view_matches_and_releases_mappings() {
+    let Some(rb) = readbench() else { return };
+    let fx = fixture(rb);
+    for view in [fusedata_core::layout::ViewMode::Map, fusedata_core::layout::ViewMode::Segment, fusedata_core::layout::ViewMode::Copy] {
+        let c = CacheDir::new(&fx.dir, Options { configured_chunk_size: MB, view, readahead_min: MB as u64, readahead: 4 * MB as u64, ..Default::default() });
+        for f in fx.files.iter().filter(|f| !f.corrupt) {
+            // Sequential stream, odd window crossing chunk boundaries.
+            for window in [4096usize, 128 * 1024 + 7, 1 << 20] {
+                let mut off = 0u64;
+                let mut all = Vec::with_capacity(f.size as usize);
+                while (off as i64) < f.size {
+                    let n = c.read_view(&f.path, off, window, |d| {
+                        all.extend_from_slice(d);
+                        d.len()
+                    })
+                    .unwrap();
+                    assert!(n > 0, "{} {view:?} zero read at {off}", f.path);
+                    off += n as u64;
+                }
+                assert_eq!(all.len() as i64, f.size);
+                assert_eq!(pattern::check(&all, 0), None, "{} {view:?} window {window}", f.path);
+            }
+            // Random windows.
+            let mut x = 12345u64;
+            for _ in 0..50 {
+                x = fusedata_core::pattern::splitmix64(x);
+                let off = x % f.size as u64;
+                c.read_view(&f.path, off, 70_000, |d| assert_eq!(pattern::check(d, off), None, "{} {view:?} rand {off}", f.path)).unwrap();
+            }
+        }
+    }
+    // Let prefetch workers finish, then everything must unmap.
+    std::thread::sleep(Duration::from_millis(300));
+    fusedata_core::layout::reap_mapped(Duration::ZERO);
+    #[cfg(target_os = "linux")]
+    {
+        let maps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut rss_in_cache = 0u64;
+        let mut in_cache = false;
+        for line in maps.lines() {
+            if line.contains('-') && line.split_whitespace().count() >= 5 {
+                in_cache = line.contains(fx.dir.to_str().unwrap());
+            } else if in_cache && line.starts_with("Rss:") {
+                rss_in_cache += line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap();
+            }
+        }
+        assert_eq!(rss_in_cache, 0, "cache files still mapped: {rss_in_cache} KiB");
+    }
+}
+
 #[test]
 fn layout_infers_shape_without_journal() {
     let Some(rb) = readbench() else { return };

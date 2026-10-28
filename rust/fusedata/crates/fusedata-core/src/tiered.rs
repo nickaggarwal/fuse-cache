@@ -98,6 +98,32 @@ impl TieredReader {
         }
     }
 
+    /// Hand `[off, off+len)` of `path` to `f`, zero-copy for local
+    /// sequential windows (see `CacheDir::read_view`), else through the
+    /// tiers into a per-thread buffer.
+    pub fn read_view<R>(&self, path: &str, off: u64, len: usize, f: impl FnOnce(&[u8]) -> R) -> io::Result<R> {
+        let mut f = Some(f);
+        match self.cache.read_view(path, off, len, |b| (f.take().unwrap())(b)) {
+            Ok(r) => {
+                self.stats.local_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                return Ok(r);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && (self.peers.is_some() || self.cloud.is_some()) => {}
+            Err(e) => return Err(e),
+        }
+        thread_local! {
+            static RBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        RBUF.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.len() < len {
+                b.resize(len, 0);
+            }
+            let n = self.read(path, off, &mut b[..len])?;
+            Ok((f.take().unwrap())(&b[..n]))
+        })
+    }
+
     /// Read `[off, off+buf.len())` of `path` through the tiers.
     pub fn read(&self, path: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         match self.cache.read_at(path, off, buf) {
