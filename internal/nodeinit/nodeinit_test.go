@@ -287,7 +287,11 @@ overlay /var/lib/docker/overlay2/abc overlay rw 0 0
 func TestSelectAndPrepare_NoEligibleDisk(t *testing.T) {
 	root := t.TempDir()
 	os.MkdirAll(filepath.Join(root, "proc"), 0o755)
-	os.WriteFile(filepath.Join(root, "proc/mounts"), []byte("tmpfs /run tmpfs rw 0 0\n"), 0o644)
+	// The table must list a real /dev disk, or readHostMounts falls back to
+	// the test machine's own /proc/1/mounts and finds its disks. This one
+	// is mounted at a directory that does not exist under the fake root, so
+	// it is never eligible.
+	os.WriteFile(filepath.Join(root, "proc/mounts"), []byte("tmpfs /run tmpfs rw 0 0\n/dev/sdz1 /missing ext4 rw 0 0\n"), 0o644)
 
 	opts := DefaultOptions()
 	opts.HostRoot = root
