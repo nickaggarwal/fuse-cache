@@ -43,6 +43,7 @@ func main() {
 		coordinatorAddr = flag.String("coordinator", "localhost:8080", "Coordinator HTTP address")
 		coordinatorGRPC = flag.String("coordinator-grpc", "localhost:9080", "Coordinator gRPC address")
 		peerPort        = flag.Int("port", 8081, "Port for peer HTTP API server")
+		advertisePort   = flag.Int("advertise-port", 0, "HTTP port registered with the coordinator, when it differs from -port: a front server (e.g. the Rust blob/peer server on a store node) listens on it and forwards everything else here. 0 = -port. FUSE_ADVERTISE_PORT env overrides")
 		grpcPort        = flag.Int("grpc-port", 9081, "Port for peer gRPC server")
 		peerID          = flag.String("peer-id", "", "Peer ID (auto-generated if not provided)")
 		chunkSizeMB     = flag.Int("chunk-size", 8, "Chunk size in MB")
@@ -629,7 +630,19 @@ func main() {
 			fromNode = v
 		}
 		labels := resolvePeerLabels(ctx, peerLabelsRaw, fromNode, logger)
-		go registerPeer(ctx, coordClient, *peerID, *peerPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
+		regPort := *peerPort
+		if *advertisePort > 0 {
+			regPort = *advertisePort
+		}
+		if v := os.Getenv("FUSE_ADVERTISE_PORT"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				regPort = n
+			}
+		}
+		if regPort != *peerPort {
+			logger.Printf("- advertising HTTP port %d (serving on %d behind a front server)", regPort, *peerPort)
+		}
+		go registerPeer(ctx, coordClient, *peerID, regPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
 	}
 
 	// Create API handler
