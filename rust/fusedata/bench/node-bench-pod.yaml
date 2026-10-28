@@ -1,7 +1,7 @@
 # One-shot node benchmark pod. Edit nodeName and image tag, then:
 #   kubectl apply -f node-bench-pod.yaml
 #   kubectl logs -f fusedata-nodebench
-#   kubectl cp fusedata-nodebench:/data/fusedata-nodebench-scratch/results.json results.json
+#   kubectl cp fusedata-nodebench:/results/results.json results.json
 #   kubectl delete pod fusedata-nodebench
 # It writes only under <cache disk>/fusedata-nodebench-* (a new directory;
 # node-bench.sh refuses a non-empty dir it did not create) and deletes its
@@ -21,7 +21,7 @@ spec:
   - {key: skyimage.io/lazy, operator: Equal, value: "true", effect: NoSchedule}
   containers:
   - name: bench
-    image: skyctlcpu8cac.azurecr.io/fusedata-nodebench:ab-54bfb4f
+    image: skyctlcpu8cac.azurecr.io/fusedata-nodebench:ab-dm1
     securityContext: {privileged: true}
     env:
     - {name: REPS, value: "3"}
@@ -36,6 +36,11 @@ spec:
     - |
       node-bench.sh /data/fusedata-nodebench-cache /data/fusedata-nodebench-scratch
       echo "NODE-BENCH EXIT $?"
+      # Keep results in the pod (copy them out with kubectl cp from /results)
+      # and leave nothing on the node's disk.
+      mkdir -p /results && cp /data/fusedata-nodebench-scratch/*.json* /data/fusedata-nodebench-scratch/*.log /results/ 2>/dev/null
+      rm -rf /data/fusedata-nodebench-cache /data/fusedata-nodebench-scratch
+      echo "NODE-BENCH RESULTS IN /results"
       sleep 3600
     resources:
       requests: {cpu: "4", memory: 8Gi}

@@ -147,7 +147,11 @@ if [[ " $LAYERS " == *" fuse "* ]]; then
       rust-pt) "$RS" mount --dir "$CACHE" --mnt "${MNT[$impl]}" --chunk-mb "$CHUNK_MB" --passthrough "${PUB_RS[@]}" >>"$SCRATCH/mount-$impl.log" 2>&1 & ;;
       go-pt)   FUSE_GOFUSE_ENABLE_PASSTHROUGH=1 FUSE_GOFUSE_DIRECT_MOUNT=1 \
                "$RB" mount -dir "$CACHE" -mnt "${MNT[$impl]}" -chunk-mb "$CHUNK_MB" "${PUB_GO[@]}" >>"$SCRATCH/mount-$impl.log" 2>&1 & ;;
-      *)       "$RB" mount -dir "$CACHE" -mnt "${MNT[$impl]}" -chunk-mb "$CHUNK_MB" "${PUB_GO[@]}" >>"$SCRATCH/mount-$impl.log" 2>&1 & ;;
+      # Direct mount(2) for every Go mount: on Ubuntu 26.04 hosts AppArmor
+      # confines the fusermount3 helper and it fails with EACCES. It changes
+      # how the mount is created, not how reads are served.
+      *)       FUSE_GOFUSE_DIRECT_MOUNT=1 \
+               "$RB" mount -dir "$CACHE" -mnt "${MNT[$impl]}" -chunk-mb "$CHUNK_MB" "${PUB_GO[@]}" >>"$SCRATCH/mount-$impl.log" 2>&1 & ;;
     esac
     PID[$impl]=$!; PIDS+=($!)
   done
