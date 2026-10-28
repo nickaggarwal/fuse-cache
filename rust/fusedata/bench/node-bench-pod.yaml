@@ -1,0 +1,50 @@
+# One-shot node benchmark pod. Edit nodeName and image tag, then:
+#   kubectl apply -f node-bench-pod.yaml
+#   kubectl logs -f fusedata-nodebench
+#   kubectl cp fusedata-nodebench:/data/fusedata-nodebench-scratch/results.json results.json
+#   kubectl delete pod fusedata-nodebench
+# It writes only under <cache disk>/fusedata-nodebench-* (a new directory;
+# node-bench.sh refuses a non-empty dir it did not create) and deletes its
+# dataset when it finishes. It runs no fuse-client/nydus component and does
+# not touch their DaemonSets. The pod sleeps after the run so results can be
+# copied out; delete it when done.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fusedata-nodebench
+  namespace: default
+  labels: {app: fusedata-nodebench}
+spec:
+  nodeName: aks-model-26363502-vmss000001
+  restartPolicy: Never
+  tolerations:
+  - {key: skyimage.io/lazy, operator: Equal, value: "true", effect: NoSchedule}
+  containers:
+  - name: bench
+    image: skyctlcpu8cac.azurecr.io/fusedata-nodebench:ab-54bfb4f
+    securityContext: {privileged: true}
+    env:
+    - {name: REPS, value: "3"}
+    - {name: FILES, value: "4"}
+    - {name: FILE_GB, value: "4"}
+    - {name: BLOB_GB, value: "4"}
+    - {name: BLOB_TOTAL_MB, value: "2048"}
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.podIP}}
+    command: ["bash", "-c"]
+    args:
+    - |
+      node-bench.sh /data/fusedata-nodebench-cache /data/fusedata-nodebench-scratch
+      echo "NODE-BENCH EXIT $?"
+      sleep 3600
+    resources:
+      requests: {cpu: "4", memory: 8Gi}
+      limits: {memory: 24Gi}
+    volumeMounts:
+    - {name: cache, mountPath: /data}
+    - {name: devfuse, mountPath: /dev/fuse}
+  volumes:
+  - name: cache
+    hostPath: {path: /skyfleet-fuse-cache, type: Directory}
+  - name: devfuse
+    hostPath: {path: /dev/fuse, type: CharDevice}
