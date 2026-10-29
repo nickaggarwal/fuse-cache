@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -644,7 +645,7 @@ func main() {
 		if regPort != *peerPort {
 			logger.Printf("- advertising HTTP port %d (serving on %d behind a front server)", regPort, *peerPort)
 		}
-		go registerPeer(ctx, coordClient, *peerID, regPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
+		go registerPeer(ctx, coordClient, *coordinatorAddr, *peerID, regPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
 	}
 
 	// Create API handler
@@ -911,7 +912,33 @@ func resolvePeerLabels(ctx context.Context, static, fromNode string, logger *log
 // identity field can stay wrong after a coordinator-side skew.
 const peerReregisterEveryHeartbeats = 10
 
-func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
+// coordinatorInstance returns the coordinator's instance ID from
+// GET /api/health, or "" when unreachable or too old to report one.
+func coordinatorInstance(ctx context.Context, addr string) string {
+	if addr == "" {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "http://"+addr+"/api/health", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var h struct {
+		Instance string `json:"instance"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
+		return ""
+	}
+	return h.Instance
+}
+
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coordHTTPAddr string, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()
 	availableSpace := capacity - used
 	usedSpace := used
@@ -982,6 +1009,10 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 	}
 	logger.Printf("Network probe enabled=%t bytes=%d every_heartbeats=%d timeout_ms=%d", netProbeEnabled, netProbeBytes, netProbeEveryHB, netProbeTimeout.Milliseconds())
 	heartbeatCount := 0
+	// The coordinator's instance ID (GET /api/health). When it changes, the
+	// coordinator restarted; an in-memory one lost every file location, so
+	// this node announces what it holds again (cache/republish.go).
+	lastInstance := coordinatorInstance(ctx, coordHTTPAddr)
 
 	for {
 		select {
@@ -990,6 +1021,15 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 		case <-ticker.C:
 			used, capacity := cm.Stats()
 			heartbeatCount++
+			if inst := coordinatorInstance(ctx, coordHTTPAddr); inst != "" && inst != lastInstance {
+				if lastInstance != "" {
+					if rp, ok := cm.(interface{ RepublishLocal(context.Context) int }); ok {
+						logger.Printf("Coordinator restarted (instance %s -> %s): republishing local objects", lastInstance, inst)
+						go rp.RepublishLocal(ctx)
+					}
+				}
+				lastInstance = inst
+			}
 
 			metrics := (*coordinator.PeerNetworkMetrics)(nil)
 			if netProbeEnabled && heartbeatCount%netProbeEveryHB == 0 {

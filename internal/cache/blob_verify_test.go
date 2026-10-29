@@ -18,7 +18,7 @@ import (
 func newVerifyCM(t *testing.T) (*DefaultCacheManager, string) {
 	t.Helper()
 	dir := t.TempDir()
-	cmI, err := NewCacheManager(&CacheConfig{NVMePath: dir, MaxNVMeSize: 256 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second, BlobScrubInterval: -1})
+	cmI, err := NewCacheManager(&CacheConfig{NVMePath: dir, MaxNVMeSize: 256 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second, CloudRetryCount: 1, CloudRetryBaseWait: time.Millisecond, BlobScrubInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestBlobScrubCatchesSameMtimeRot(t *testing.T) {
 // changed while the process was down is caught by the startup pass.
 func TestBlobVerifyAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &CacheConfig{NVMePath: dir, MaxNVMeSize: 256 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second, BlobScrubInterval: -1}
+	cfg := &CacheConfig{NVMePath: dir, MaxNVMeSize: 256 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second, CloudRetryCount: 1, CloudRetryBaseWait: time.Millisecond, BlobScrubInterval: -1}
 	cmI, err := NewCacheManager(cfg)
 	if err != nil {
 		t.Fatal(err)
