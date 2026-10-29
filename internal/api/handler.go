@@ -59,6 +59,8 @@ type Handler struct {
 	warmJobs warmJobs
 	// maxUploadBytes overrides defaultMaxUploadSize when > 0.
 	maxUploadBytes atomic.Int64
+	// peerReadAborted counts peer reads the requester hung up on mid-body.
+	peerReadAborted atomic.Int64
 	// mountHealthy reports whether the FUSE mount is currently being served.
 	// Unset means "not supervised" and health reports healthy, which keeps
 	// callers that mount nothing on the same handler. Atomic because the
@@ -1127,6 +1129,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_blob_range_remote_bytes_total", metrics["blob_range_remote_bytes"])
 	writeMetricLine(w, "fuse_blob_promoted_total", metrics["blob_promoted"])
 	writeMetricLine(w, "fuse_blob_verified_total", metrics["blob_verified"])
+	writeMetricLine(w, "fuse_peer_read_aborted_total", h.peerReadAborted.Load())
 	writeMetricLine(w, "fuse_blob_verify_bytes_total", metrics["blob_verify_bytes"])
 	writeMetricLine(w, "fuse_blob_quarantined_total", metrics["blob_quarantined"])
 	writeMetricLine(w, "fuse_blob_promote_skipped_total", metrics["blob_promote_skipped"])

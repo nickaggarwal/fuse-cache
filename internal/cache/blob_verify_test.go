@@ -2,10 +2,12 @@ package cache
 
 import (
 	"bytes"
+
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"fuse-client/internal/coordinator"
 	"os"
 	"path/filepath"
 	"strings"
@@ -314,5 +316,39 @@ func TestFindInViewPrefersSizedRow(t *testing.T) {
 	}
 	if e, ok := findInView([]*CacheEntry{zero}, "/oci/sha256/x"); !ok || e.Size != 0 {
 		t.Fatalf("a size-0 row alone must still prove the path exists: %+v %v", e, ok)
+	}
+}
+
+// A blob placed on disk outside a PUT (a restore, or a copy a cluster only
+// knows through size-0 holder rows) publishes a sized row once it verifies,
+// so the cluster can read it again; lookups then see the real size.
+func TestVerifiedBlobRepublishesSizedRow(t *testing.T) {
+	cm, dir := newVerifyCM(t)
+	ctx := context.Background()
+	coord := coordinator.NewCoordinatorService()
+	cm.config.Coordinator = coord
+	cm.config.LocalPeerID = "store-0"
+	data, d := blobOf(2<<20+3, 12)
+	fp := ociBlobPrefix + d
+	// Only a size-0 holder row is known, as on cpu-w3.
+	_ = coord.UpdateFileLocation(ctx, &coordinator.FileLocation{FilePath: fp, PeerID: "node-a", StorageTier: "nvme", StoragePath: fp, FileSize: 0, IsChunked: true, ChunkSize: 1 << 20})
+	full := filepath.Join(dir, strings.TrimPrefix(fp, "/"))
+	_ = os.MkdirAll(filepath.Dir(full), 0o755)
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v := cm.blobLocalVerdict(ctx, fp, full, true); v != blobGood {
+		t.Fatalf("verdict %v", v)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e, ok, _ := cm.lookupRemoteEntry(ctx, fp)
+		if ok && e.Size == int64(len(data)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no sized row after verification: %+v", e)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

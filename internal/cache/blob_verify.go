@@ -138,6 +138,7 @@ func (cm *DefaultCacheManager) blobLocalVerdict(ctx context.Context, filePath, f
 	}
 	if readMarker(full) == ver {
 		cm.blobVerify.end(full, ver, true)
+		cm.publishVerifiedBlob(ctx, filePath, ver.size)
 		return blobGood
 	}
 	if !wait {
@@ -179,6 +180,7 @@ func (cm *DefaultCacheManager) verifyLocalBlob(ctx context.Context, filePath, fu
 	if got == want {
 		cm.blobVerify.end(full, ver, true)
 		writeMarker(full, ver)
+		cm.publishVerifiedBlob(ctx, filePath, ver.size)
 		return blobGood
 	}
 	cm.blobVerify.end(full, ver, false)
@@ -234,6 +236,7 @@ func (cm *DefaultCacheManager) verifyChunkedBlob(ctx context.Context, filePath s
 	cm.metrics.BlobVerifyBytes.Add(size)
 	if got == want {
 		cm.blobVerify.end(key, ver, true)
+		cm.publishVerifiedChunkedBlob(ctx, filePath, size, chunkSize)
 		return blobGood
 	}
 	cm.blobVerify.end(key, ver, false)
@@ -417,6 +420,34 @@ func (cm *DefaultCacheManager) startBlobScrubber() {
 			}
 		}
 	})
+}
+
+// publishVerifiedBlob publishes this node as a holder of the whole blob
+// with its size. A blob placed on disk outside a PUT (a restore, a copy
+// from another node) is adopted by rehydration but never announced, and a
+// cluster whose only rows for a blob are size-0 holder rows cannot read it
+// at all; a verified copy is the authoritative source, so it says so.
+func (cm *DefaultCacheManager) publishVerifiedBlob(ctx context.Context, filePath string, size int64) {
+	if size <= 0 {
+		return
+	}
+	cm.mu.RLock()
+	e, ok := cm.entries.get(filePath)
+	cm.mu.RUnlock()
+	entry := &CacheEntry{FilePath: filePath, StoragePath: filePath, Size: size}
+	if ok && e != nil && e.Size == size {
+		cp := *e
+		entry = &cp
+	}
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
+}
+
+func (cm *DefaultCacheManager) publishVerifiedChunkedBlob(ctx context.Context, filePath string, size, chunkSize int64) {
+	if size <= 0 || chunkSize <= 0 {
+		return
+	}
+	entry := &CacheEntry{FilePath: filePath, StoragePath: filePath, Size: size, IsChunked: true, ChunkSize: chunkSize, NumChunks: chunkCountFor(size, chunkSize)}
+	cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
 }
 
 func markerPath(full string) string { return full + ".verified" }
