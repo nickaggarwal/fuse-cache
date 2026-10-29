@@ -74,14 +74,7 @@ impl Rig {
         while TcpStream::connect(("127.0.0.1", port)).is_ok() && t.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        self._procs.push(Proc(
-            Command::new(&self.rb)
-                .args(&self.go_args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        ));
+        self._procs.push(Proc(Command::new(&self.rb).args(&self.go_args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()));
         wait_port(port);
     }
 }
