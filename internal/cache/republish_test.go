@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,5 +91,38 @@ func TestRepublishRestoresChunkShape(t *testing.T) {
 	kept := cm.republishShape(&CacheEntry{FilePath: "/m/x.bin", Size: 9 << 20, IsChunked: true, ChunkSize: 4 << 20})
 	if kept.ChunkSize != 4<<20 {
 		t.Fatalf("published stride not kept: %+v", kept)
+	}
+}
+
+// A refresh that suddenly returns far fewer paths (coordinator restarted
+// empty) keeps the old rows during the grace period, so opens keep
+// resolving while holders republish; once the grace ends, the refresh wins.
+func TestMetadataViewSurvivesCoordinatorWipe(t *testing.T) {
+	cm, _ := newVerifyCM(t)
+	ctx := context.Background()
+	full := coordinator.NewCoordinatorService()
+	for i := 0; i < 40; i++ {
+		p := fmt.Sprintf("/models/m/f%02d", i)
+		_ = full.UpdateFileLocation(ctx, &coordinator.FileLocation{FilePath: p, PeerID: "store", StorageTier: "nvme", StoragePath: p, FileSize: 100})
+	}
+	cm.config.Coordinator = full
+	if v, err := cm.refreshMetadataView(ctx); err != nil || len(v) != 40 {
+		t.Fatalf("initial view %d %v", len(v), err)
+	}
+	cm.config.Coordinator = coordinator.NewCoordinatorService() // restarted empty
+	v, err := cm.refreshMetadataView(ctx)
+	if err != nil || len(v) != 40 {
+		t.Fatalf("view after wipe kept %d rows, want 40", len(v))
+	}
+	if _, ok := findInView(v, "/models/m/f07"); !ok {
+		t.Fatal("a known file vanished from the view after a coordinator wipe")
+	}
+	// After the grace period an empty answer is believed.
+	cm.mu.Lock()
+	cm.metadataShrinkAt = time.Now().Add(-2 * metadataShrinkGrace)
+	cm.mu.Unlock()
+	cm.metadataView = cm.metadataView[:10]
+	if v, _ := cm.refreshMetadataView(ctx); len(v) != 0 {
+		t.Fatalf("small view after grace kept %d rows", len(v))
 	}
 }

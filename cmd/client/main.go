@@ -912,6 +912,30 @@ func resolvePeerLabels(ctx context.Context, static, fromNode string, logger *log
 // identity field can stay wrong after a coordinator-side skew.
 const peerReregisterEveryHeartbeats = 10
 
+// watchCoordinatorInstance republishes this node's objects whenever the
+// coordinator's instance changes, including the first instance seen.
+func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheManager, logger *log.Logger) {
+	rp, ok := cm.(interface{ RepublishLocal(context.Context) int })
+	if !ok || addr == "" {
+		return
+	}
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	last := ""
+	for {
+		if inst := coordinatorInstance(ctx, addr); inst != "" && inst != last {
+			logger.Printf("Coordinator instance %q -> %q: republishing local objects", last, inst)
+			rp.RepublishLocal(ctx)
+			last = inst
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // coordinatorInstance returns the coordinator's instance ID from
 // GET /api/health, or "" when unreachable or too old to report one.
 func coordinatorInstance(ctx context.Context, addr string) string {
@@ -1016,7 +1040,11 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 	// started against a coordinator that already lost its rows (both rolled
 	// together), or one too old to report an instance, and rehydration
 	// adopts local files without announcing them.
-	lastInstance := ""
+	// Checked every 5 s on its own ticker, not on the 30 s heartbeat: until
+	// every holder republishes, an in-memory coordinator that just restarted
+	// knows none of the files on this node, and other nodes' opens of them
+	// fail with ENOENT (io-bench on cpu-w3 hit it 66 s after a restart).
+	go watchCoordinatorInstance(ctx, coordHTTPAddr, cm, logger)
 
 	for {
 		select {
@@ -1025,13 +1053,6 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 		case <-ticker.C:
 			used, capacity := cm.Stats()
 			heartbeatCount++
-			if inst := coordinatorInstance(ctx, coordHTTPAddr); inst != "" && inst != lastInstance {
-				if rp, ok := cm.(interface{ RepublishLocal(context.Context) int }); ok {
-					logger.Printf("Coordinator instance %q -> %q: republishing local objects", lastInstance, inst)
-					go rp.RepublishLocal(ctx)
-				}
-				lastInstance = inst
-			}
 
 			metrics := (*coordinator.PeerNetworkMetrics)(nil)
 			if netProbeEnabled && heartbeatCount%netProbeEveryHB == 0 {

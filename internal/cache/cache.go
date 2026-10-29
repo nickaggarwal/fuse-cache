@@ -388,15 +388,18 @@ type DefaultCacheManager struct {
 	// credit. That undercount lets the cache overfill. Held across both steps by
 	// putToNVMeWithEviction and deleteLocalNVMeFootprint; a fixed array so a
 	// zero-value manager built by a test helper is usable without construction.
-	nvmeKeyMu    [nvmeKeyStripes]sync.Mutex
-	mu           sync.RWMutex
-	rangeMu      sync.RWMutex
-	fetchMu      sync.Mutex
-	logger       *log.Logger
-	metrics      *CacheMetrics
-	metadataAt   time.Time
-	metadataView []*CacheEntry
-	rangeChunks  map[string]*chunkFileCache
+	nvmeKeyMu  [nvmeKeyStripes]sync.Mutex
+	mu         sync.RWMutex
+	rangeMu    sync.RWMutex
+	fetchMu    sync.Mutex
+	logger     *log.Logger
+	metrics    *CacheMetrics
+	metadataAt time.Time
+	// metadataShrinkAt marks a refresh that returned far fewer paths than
+	// the view held (coordinator state lost); see refreshMetadataView.
+	metadataShrinkAt time.Time
+	metadataView     []*CacheEntry
+	rangeChunks      map[string]*chunkFileCache
 	// rangeTotalBytes tracks the sum of all per-file cache bytes so the
 	// global budget check is O(1) per insert instead of an O(files) scan
 	// under rangeMu on every cached chunk.

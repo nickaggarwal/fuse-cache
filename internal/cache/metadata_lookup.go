@@ -247,11 +247,44 @@ func (cm *DefaultCacheManager) refreshMetadataView(ctx context.Context) ([]*Cach
 	}
 	remote := cm.entriesFromLocations(locations)
 	cm.mu.Lock()
+	// A refresh that returns far fewer paths than the view held is a
+	// coordinator that lost its state (an in-memory store restarting), not
+	// files that vanished: deletes retract rows one path at a time. Keep
+	// the old rows for paths the refresh does not mention for one grace
+	// period, so opens of files every node knew about keep resolving while
+	// holders republish. Without this, a coordinator restart made opens of
+	// tokenizer.json and vocab.json fail with ENOENT on a node whose own
+	// view had them a second earlier (io-bench, cpu-w3).
+	inGrace := !cm.metadataShrinkAt.IsZero() && time.Since(cm.metadataShrinkAt) <= metadataShrinkGrace
+	if !inGrace && len(cm.metadataView) > 32 && len(remote) < len(cm.metadataView)/2 {
+		cm.metadataShrinkAt = time.Now()
+		inGrace = true
+		cm.logger.Printf("Metadata refresh returned %d paths (view had %d): keeping old rows for %s while holders republish",
+			len(remote), len(cm.metadataView), metadataShrinkGrace)
+	}
+	if inGrace {
+		seen := make(map[string]bool, len(remote))
+		for _, e := range remote {
+			if e != nil {
+				seen[e.FilePath] = true
+			}
+		}
+		for _, e := range cm.metadataView {
+			if e != nil && !seen[e.FilePath] {
+				remote = append(remote, e)
+			}
+		}
+	}
 	cm.metadataView = remote
 	cm.metadataAt = time.Now()
 	cm.mu.Unlock()
 	return remote, nil
 }
+
+// metadataShrinkGrace is how long rows a coordinator suddenly forgot are
+// kept in the view: long enough for every holder to notice the new
+// instance (5 s poll) and republish.
+const metadataShrinkGrace = 60 * time.Second
 
 func findInView(view []*CacheEntry, filePath string) (*CacheEntry, bool) {
 	var best *CacheEntry
