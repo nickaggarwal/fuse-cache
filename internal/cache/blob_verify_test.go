@@ -298,3 +298,21 @@ func TestBlobVerifierZeroValueEnd(t *testing.T) {
 		t.Fatal("verdict not recorded")
 	}
 }
+
+// A path with a sized row and a size-0 holder row (a node that advertised
+// itself after landing one chunk) must resolve to the sized row, whatever
+// the order: a size-0 shape made every read of the blob fail ("empty
+// blob") once the store's sized row was retracted.
+func TestFindInViewPrefersSizedRow(t *testing.T) {
+	zero := &CacheEntry{FilePath: "/oci/sha256/x", Size: 0, IsChunked: true}
+	sized := &CacheEntry{FilePath: "/oci/sha256/x", Size: 698568384, IsChunked: true, ChunkSize: 16 << 20}
+	for _, view := range [][]*CacheEntry{{zero, sized}, {sized, zero}} {
+		e, ok := findInView(view, "/oci/sha256/x")
+		if !ok || e.Size != 698568384 {
+			t.Fatalf("got %+v", e)
+		}
+	}
+	if e, ok := findInView([]*CacheEntry{zero}, "/oci/sha256/x"); !ok || e.Size != 0 {
+		t.Fatalf("a size-0 row alone must still prove the path exists: %+v %v", e, ok)
+	}
+}

@@ -133,12 +133,26 @@ func (cm *DefaultCacheManager) lookupRemoteEntry(ctx context.Context, filePath s
 	if err != nil {
 		return nil, false, err
 	}
+	// A path can have several rows (one per holder and tier). Some carry no
+	// size: a node that landed one chunk advertises itself as a holder of the
+	// parent before it knows the parent's size. Taking the first row blindly
+	// made a blob look 0 bytes long once the sized rows were gone (a store
+	// quarantining its copy retracts only its own row), and every read of it
+	// failed ("empty blob"). Prefer a row that knows the size; a size-0 row
+	// still proves the path exists, so it is the last resort, not a miss.
+	var best *CacheEntry
 	for _, entry := range cm.entriesFromLocations(locations) {
-		if entry.FilePath == filePath {
-			return entry, true, nil
+		if entry.FilePath != filePath {
+			continue
+		}
+		if best == nil || (best.Size <= 0 && entry.Size > 0) {
+			best = entry
 		}
 	}
-	return nil, false, nil
+	if best == nil {
+		return nil, false, nil
+	}
+	return best, true, nil
 }
 
 // DirExists reports whether path names a directory, i.e. whether anything
@@ -240,12 +254,20 @@ func (cm *DefaultCacheManager) refreshMetadataView(ctx context.Context) ([]*Cach
 }
 
 func findInView(view []*CacheEntry, filePath string) (*CacheEntry, bool) {
+	var best *CacheEntry
 	for _, entry := range view {
 		if entry == nil || entry.FilePath != filePath {
 			continue
 		}
-		entryCopy := *entry
-		return &entryCopy, true
+		// Same rule as lookupRemoteEntry: a row that knows the size wins
+		// over a holder row advertised before the size was known.
+		if best == nil || (best.Size <= 0 && entry.Size > 0) {
+			best = entry
+		}
 	}
-	return nil, false
+	if best == nil {
+		return nil, false
+	}
+	entryCopy := *best
+	return &entryCopy, true
 }

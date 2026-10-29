@@ -198,13 +198,17 @@ const ociMissTTL = 5 * time.Second
 
 func (h *Handler) ociBlobEntry(ctx context.Context, filePath string) (*cache.CacheEntry, bool) {
 	if l, ok := h.cacheManager.(entryLookup); ok {
-		if e, found := l.LookupEntry(ctx, filePath, false); found && e != nil {
+		// A blob is never empty: a size-0 entry is a holder row advertised
+		// before the size was known, not the blob's shape. Treat it as
+		// unknown and ask the coordinator, else answer "not here" so nydusd
+		// falls back instead of failing the read.
+		if e, found := l.LookupEntry(ctx, filePath, false); found && e != nil && e.Size > 0 {
 			return e, true
 		}
 		if h.ociMisses.recent(filePath) {
 			return nil, false
 		}
-		if e, found := l.LookupEntry(ctx, filePath, true); found && e != nil {
+		if e, found := l.LookupEntry(ctx, filePath, true); found && e != nil && e.Size > 0 {
 			return e, true
 		}
 		h.ociMisses.note(filePath)
