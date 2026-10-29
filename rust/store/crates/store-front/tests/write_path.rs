@@ -217,3 +217,57 @@ fn reader_hangup_is_aborted_not_error() {
     assert_eq!(r.srv.metrics.count(Route::Blob, Outcome::Error), 0);
     assert_eq!(r.srv.metrics.count(Route::Blob, Outcome::Aborted), 5);
 }
+
+/// A same-size corrupted blob on the store is never served natively and
+/// never served by Go either: Go hashes it, moves it aside, and both answer
+/// "not here" so the requester tries the next holder or the registry.
+#[test]
+fn corrupted_blob_is_not_served() {
+    let Some(rb) = readbench() else { return };
+    let r = rig(rb, None, 64);
+    let body = pattern(3 * 1024 * 1024 + 9, 11);
+    let d = sha256_hex(&body);
+    assert_eq!(put(&r.front, &format!("/oci/sha256/{d}"), &body, None), 200);
+    // Served natively right after the PUT: the commit marked it verified.
+    let (code, _, b) = req(&r.front, "GET", &format!("/oci/blobs/{d}"), &[], b"");
+    assert_eq!((code, b == body), (200, true));
+    assert_eq!(r.srv.metrics.count(Route::Blob, Outcome::Local), 1);
+
+    // Corrupt it in place, same size, keeping the mtime so only a hash can tell.
+    let p = r.dir.join(format!("oci/sha256/{d}"));
+    let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+    let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(1 << 20)).unwrap();
+    f.write_all(&[0xA5; 4096]).unwrap();
+    f.set_modified(mtime).unwrap();
+    drop(f);
+    // Same mtime: the cached verdict still holds until Go re-checks. A
+    // rewrite with a new mtime is refused at once (below).
+    let future = std::time::SystemTime::now() + Duration::from_secs(2);
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(future).unwrap();
+    std::thread::sleep(Duration::from_millis(5)); // past the front's version cache
+
+    let local0 = r.srv.metrics.count(Route::Blob, Outcome::Local);
+    // Neither the blob route nor a peer read hands out the bad bytes.
+    for _ in 0..50 {
+        let (code, _, b) = req(&r.front, "GET", &format!("/oci/blobs/{d}"), &[("Range", "bytes=0-2097151")], b"");
+        assert!(code != 200 && code != 206 || b == body[..2097152], "bad bytes served: {code}");
+        let (code, _, b) = req(&r.front, "GET", &format!("/api/peer/read?path=/oci/sha256/{d}"), &[], b"");
+        assert!(code != 200 || b == body, "bad bytes served to a peer: {code}");
+        if !p.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(r.srv.metrics.count(Route::Blob, Outcome::Local), local0, "served natively after the rewrite");
+    assert!(!p.exists(), "Go did not move the corrupt copy aside");
+    let aside: Vec<_> = std::fs::read_dir(p.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".corrupt-")).collect();
+    assert_eq!(aside.len(), 1, "corrupt copy kept for inspection");
+    // The registry route now answers 503 so nydusd falls back.
+    let (code, _, _) = req(&r.front, "GET", &format!("/v2/x/blobs/sha256:{d}"), &[("Range", "bytes=0-99")], b"");
+    assert_eq!(code, 503);
+    // A fresh good PUT restores service.
+    assert_eq!(put(&r.front, &format!("/oci/sha256/{d}"), &body, None), 200);
+    let (code, _, b) = req(&r.front, "GET", &format!("/oci/blobs/{d}"), &[], b"");
+    assert_eq!((code, b == body), (200, true));
+}

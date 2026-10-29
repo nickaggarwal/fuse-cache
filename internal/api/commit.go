@@ -87,6 +87,11 @@ func (h *Handler) handleInternalCommit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to store file", http.StatusInternalServerError)
 		return
 	}
+	if ociBlobDigestFromPath(filePath) != "" {
+		if bv, ok := h.cacheManager.(blobVerifyMarker); ok {
+			bv.MarkBlobVerified(filePath)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	h.logger.Printf("Stored file: %s (%d bytes, via front)", filePath, req.Size)
 }

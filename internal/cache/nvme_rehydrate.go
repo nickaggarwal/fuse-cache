@@ -24,14 +24,16 @@ import (
 // when cloud confirms them, never before.
 
 // rehydrateSkipFile reports whether name is cache-internal state rather than
-// a cached object: checksum sidecars and the three staging prefixes.
+// a cached object: checksum sidecars, the three staging prefixes, and blob
+// copies quarantined by verification (blob_verify.go).
 func rehydrateSkipFile(name string) bool {
-	if strings.HasSuffix(name, ".sha256") {
+	if strings.HasSuffix(name, ".sha256") || strings.HasSuffix(name, ".verified") || strings.HasSuffix(name, ".verified.tmp") {
 		return true
 	}
 	return strings.HasPrefix(name, ".nvme-write-") ||
 		strings.HasPrefix(name, ".nvme-stream-") ||
-		strings.Contains(name, ".stage-")
+		strings.Contains(name, ".stage-") ||
+		strings.Contains(name, ".corrupt-")
 }
 
 // rehydrateNVMeAccounting scans the NVMe dir and registers every unknown

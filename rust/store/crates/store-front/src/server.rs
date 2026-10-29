@@ -85,8 +85,11 @@ pub struct Server {
     native: AtomicUsize,
     stopping: AtomicBool,
     strides: Mutex<HashMap<String, (Instant, Option<layout::Published>)>>,
-    blob_sizes: Mutex<HashMap<String, (Instant, u64)>>,
+    blob_sizes: Mutex<HashMap<String, (Instant, BlobVersion)>>,
 }
+
+/// A blob version Go verified: (size, mtime ns).
+type BlobVersion = (u64, i64);
 
 /// What the router decided for a request.
 #[derive(Debug, PartialEq, Eq)]
@@ -395,6 +398,13 @@ impl Server {
         let raw = http::query_get(q, "path").filter(|p| !p.is_empty())?;
         let sub = layout::parse_off_len(http::query_get(q, "off").as_deref(), http::query_get(q, "len").as_deref()).ok()?;
         let target = layout::peer_target(&self.cfg.cache_dir, &raw, |parent, size| self.published(parent, size)).ok()?;
+        // A whole OCI blob, or a chunk of one, is a source only at the
+        // version Go hashed against its digest; else Go answers (its own
+        // check, or a miss so the requester tries the next holder).
+        if let Some(hex) = layout::blob_hex_of(&target.path, &self.cfg.cache_dir) {
+            let (size, mtime) = self.blob_verified(&hex)?;
+            layout::blob_verified(&self.cfg.cache_dir, &hex, size, mtime)?;
+        }
         let (off, len) = match sub {
             None => (target.offset, target.length),
             Some((so, sl)) => layout::sub_range(target.offset, target.length, so, sl)?,
@@ -412,8 +422,8 @@ impl Server {
     /// A Range Go would refuse (416) is forwarded so the refusal is Go's.
     fn plan_blob(&self, req: &RequestHead, digest: &str) -> Option<Local> {
         let hex = layout::digest_hex(digest)?;
-        let size = self.blob_size(hex)?;
-        let (file, _) = layout::blob_exact(&self.cfg.cache_dir, hex, size)?;
+        let (size, mtime) = self.blob_verified(hex)?;
+        let (file, _) = layout::blob_verified(&self.cfg.cache_dir, hex, size, mtime)?;
         let mut extra = vec![("Accept-Ranges", "bytes".to_string()), ("Content-Type", "application/octet-stream".to_string())];
         if req.method == "HEAD" {
             return Some(Local { status: 200, file, off: 0, len: size, extra, head_only: true });
@@ -430,24 +440,38 @@ impl Server {
         Some(Local { status: 206, file, off: start, len: end - start + 1, extra, head_only: false })
     }
 
-    /// The blob's size as Go's index reports it (`HEAD /oci/blobs/<hex>` on
-    /// the backend), cached. `None` when Go does not hold it.
-    fn blob_size(&self, hex: &str) -> Option<u64> {
+    /// The version (size, mtime ns) of the whole local blob that Go has
+    /// hashed against its digest (`GET /api/internal/blob-verified/<hex>`),
+    /// cached. `None` when Go does not hold it whole or has not verified it
+    /// yet: the request then goes to Go, which serves it from chunks or the
+    /// next holder. A blob is never served natively on size alone.
+    fn blob_verified(&self, hex: &str) -> Option<(u64, i64)> {
         {
             let m = self.blob_sizes.lock().unwrap();
-            if let Some((t, n)) = m.get(hex) {
+            if let Some((t, v)) = m.get(hex) {
                 if t.elapsed() < self.cfg.stride_ttl {
-                    return Some(*n);
+                    return Some(*v);
                 }
             }
         }
-        let n = http::head_len(&self.cfg.backend, &format!("/oci/blobs/{hex}"), Duration::from_secs(5)).ok()??;
+        let (code, body) =
+            http::get(&self.cfg.backend, &format!("/api/internal/blob-verified/{hex}"), &self.backend_auth(), Duration::from_secs(5), 256).ok()?;
+        if code != 200 {
+            return None;
+        }
+        let text = String::from_utf8(body).ok()?;
+        let mut it = text.split_whitespace();
+        let v = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
         let mut m = self.blob_sizes.lock().unwrap();
         if m.len() > 65536 {
             m.clear();
         }
-        m.insert(hex.to_string(), (Instant::now(), n));
-        Some(n)
+        m.insert(hex.to_string(), (Instant::now(), v));
+        Some(v)
+    }
+
+    fn backend_auth(&self) -> Vec<(&str, &str)> {
+        self.cfg.api_key.as_deref().map(|k| vec![("X-API-Key", k)]).unwrap_or_default()
     }
 
     /// Published shape of `path` from the coordinator (cached), when its

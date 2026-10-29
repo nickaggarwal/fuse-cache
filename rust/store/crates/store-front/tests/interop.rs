@@ -19,7 +19,7 @@ use common::*;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn interop_put_read_health_metrics() {
@@ -164,8 +164,20 @@ fn digest_check_stays_go_and_short_files_are_not_served() {
     );
     let after = r.srv.metrics.count(store_front::metrics::Route::Blob, store_front::metrics::Outcome::Local);
     assert_eq!(before, after, "a short file was served natively");
+    // Go's answer, relayed: a 5xx (nydusd falls back), never the short bytes.
+    // The first request also starts Go's background hash, which moves the
+    // bad copy aside; after that both agree on "blob not found" (503).
+    assert!((500..600).contains(&fs), "short file answered {fs}: {}", String::from_utf8_lossy(&fb));
+    let t = Instant::now();
+    while p.exists() && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!p.exists(), "Go did not move the short copy aside");
+    std::thread::sleep(Duration::from_millis(5));
+    let (fs, _, fb) = req(&r.front, "GET", &format!("/v2/x/blobs/sha256:{good}"), &[("Range", "bytes=0-4999")], b"");
     let (gs, _, gb) = req(&r.go, "GET", &format!("/v2/x/blobs/sha256:{good}"), &[("Range", "bytes=0-4999")], b"");
-    assert_eq!((fs, fb), (gs, gb), "front relays Go's answer for the short file");
+    assert_eq!((fs, fb), (gs, gb), "front relays Go's answer for the quarantined blob");
+    assert_eq!(fs, 503);
 }
 
 #[test]

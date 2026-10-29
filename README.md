@@ -320,6 +320,17 @@ container reads a file in the image
 - **Digest-checked on the way in.** `PUT /api/files/oci/sha256/<hex>` hashes
   the body and refuses (400) a body that does not match. Nothing
   unverified reaches the store, the peers or nydusd.
+- **Verified before it is a source.** A whole blob on local disk is hashed
+  against its digest once (per size + mtime, remembered in a
+  `<blob>.verified` marker) before it is served to nydusd or a peer, and a
+  blob a node assembles from chunk files is hashed when its last chunk
+  lands. A mismatch is moved aside as `<blob>.corrupt-<time>`, dropped from
+  the index and retracted from the coordinator, so readers go to the next
+  holder or the registry. Serving never waits on a hash: an unverified blob
+  is skipped while it is checked in the background. A daily scrub
+  (`-blob-scrub-hours`, default 24) re-hashes everything to catch damage
+  that keeps the mtime. Metrics: `fuse_blob_verified_total`,
+  `fuse_blob_quarantined_total`.
 - **No read-ahead here.** nydusd prefetches from the image's own startup
   list; fuse-client serves exactly the ranges asked for (at most 64 MiB
   per GET) and lands the whole chunk on local disk later, after 15 s of

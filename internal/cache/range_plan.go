@@ -80,8 +80,13 @@ func (cm *DefaultCacheManager) PlanRange(ctx context.Context, entry *CacheEntry,
 	cm.noteBlobRead()
 	var localBytes, remoteBytes int64
 
-	// A whole local copy (store node, warm, or assembled file) serves any range.
-	if f, ok := cm.openLocalExact(entry.FilePath, entry.Size); ok {
+	// A whole local copy (store node, warm, or assembled file) serves any
+	// range, once it has hashed to its digest (blob_verify.go). Unverified,
+	// a check starts in the background and this read goes to the chunks or
+	// the next holder; a bad copy is moved aside.
+	if f, ok := cm.openLocalExact(entry.FilePath, entry.Size); ok && cm.blobLocalVerdict(ctx, entry.FilePath, f.Name(), false) != blobGood {
+		f.Close()
+	} else if ok {
 		files = append(files, f)
 		cm.metrics.BlobRangeLocalBytes.Add(end - offset)
 		cm.metrics.RecordReadWall(end-offset, time.Since(started), end-offset, 0, 0)
@@ -361,7 +366,35 @@ func (cm *DefaultCacheManager) fillBlobChunk(ctx context.Context, filePath, chun
 		return false
 	}
 	cm.metrics.BlobPromoted.Add(1)
+	cm.verifyBlobIfComplete(ctx, filePath)
 	return true
+}
+
+// verifyBlobIfComplete hashes a chunked blob once its last chunk lands
+// (blob_verify.go): a node that filled from a bad holder must not become a
+// holder of the bad bytes itself.
+func (cm *DefaultCacheManager) verifyBlobIfComplete(ctx context.Context, filePath string) {
+	if blobDigestFromPath(filePath) == "" {
+		return
+	}
+	entry, ok := cm.LookupEntry(ctx, filePath, false)
+	if !ok || entry == nil || !entry.IsChunked {
+		return
+	}
+	chunkSize := cm.effectiveChunkSize(entry)
+	if chunkSize <= 0 {
+		return
+	}
+	for i := int64(0); i*chunkSize < entry.Size; i++ {
+		want := chunkSize
+		if (i+1)*chunkSize > entry.Size {
+			want = entry.Size - i*chunkSize
+		}
+		if n, ok := cm.openLocalExactCheck(fmt.Sprintf("%s_chunk_%d", filePath, i)); !ok || n != want {
+			return // not complete yet
+		}
+	}
+	cm.verifyChunkedBlob(ctx, filePath, entry.Size, chunkSize)
 }
 
 // openLocalExactCheck reports whether chunkPath already has a local file.

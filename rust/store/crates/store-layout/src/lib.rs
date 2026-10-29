@@ -218,6 +218,25 @@ pub fn blob_exact(root: &Path, hex: &str, size: u64) -> Option<(File, PathBuf)> 
     (md.is_file() && md.size() == size && size > 0).then_some((f, p))
 }
 
+/// The digest of a whole OCI blob file under `root` (`<root>/oci/sha256/<hex>`,
+/// no chunk suffix), if `path` is one. Literal chunk files return `None`:
+/// they are not whole blobs and carry no digest of their own.
+pub fn blob_hex_of(path: &Path, root: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?.to_str()?;
+    let hex = rel.strip_prefix(&OCI_BLOB_PREFIX[1..])?;
+    (hex.len() == 64 && hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))).then(|| hex.to_string())
+}
+
+/// The whole blob at exactly the version Go verified against its digest
+/// (`size`, mtime in ns). Checked on the opened file, so a copy rewritten
+/// after Go's check (new mtime) is never served.
+pub fn blob_verified(root: &Path, hex: &str, size: u64, mtime_ns: i64) -> Option<(File, PathBuf)> {
+    let (f, p) = blob_exact(root, hex, size)?;
+    let md = f.metadata().ok()?;
+    let m = md.mtime() * 1_000_000_000 + md.mtime_nsec();
+    (m == mtime_ns).then_some((f, p))
+}
+
 /// node-init's discovered cache location (`node-init.json`), as the Go client
 /// reads it: the cache dir is `cache_dir` under the host-root prefix.
 #[derive(Debug, serde::Deserialize)]

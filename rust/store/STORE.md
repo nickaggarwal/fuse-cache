@@ -25,7 +25,7 @@ peers / nydusd ──────────────► store-front ──�
 | request | store-front |
 |---|---|
 | `GET /api/peer/read?path=P` | `P` is a local file: whole file (sendfile). `P` is `<parent>_chunk_N` and `<parent>` is a local whole file: that chunk's bytes at the stride the coordinator published, when the published size equals the file size. Optional `off`/`len` sub-range, as Go. Over `--max-inflight`: **503 + `Retry-After: 1`**, as Go. |
-| `GET/HEAD /v2/<repo>/blobs/<digest>`, `/oci/blobs/<digest>` | Blob held whole at `/oci/sha256/<hex>` with **exactly** the size Go's index reports (asked with a `HEAD` to Go, cached 30 s): HEAD, single `Range` (206, capped at 64 MiB), or whole blob (200). |
+| `GET/HEAD /v2/<repo>/blobs/<digest>`, `/oci/blobs/<digest>` | Blob held whole at `/oci/sha256/<hex>` at **exactly** the version (size and mtime) Go has hashed against the digest (`GET /api/internal/blob-verified/<hex>`, loopback, cached 30 s; checked again on the opened file): HEAD, single `Range` (206, capped at 64 MiB), or whole blob (200). Never on size alone. A peer read of a whole blob, or of a chunk of one, follows the same rule. |
 | `GET/HEAD /v2/` | 200 with `Docker-Distribution-API-Version: registry/2.0`. |
 | anything native that is not an exact local hit (miss, chunk stride not confirmed, short or different-size file, a request Go would refuse: 400, 404, 416) | forwarded unchanged, so the answer is Go's own (`/v2` miss 503, `/oci` miss 404, failed fetch 502, ...). |
 | `PUT /api/files/<path>` with a `Content-Length` up to `--max-upload-gb` and a clean path | **Native write**: the body streams to `<path>.stage-front-<pid>-<n>` beside the final file (one 1 MiB buffer, `fsync` before commit) and is hashed (SHA-256) on the way. A blob path whose hash does not match its digest: **400**, as Go. Then `POST /api/internal/commit` to Go (loopback only), which re-checks size, digest and path, renames the file into place, indexes it, publishes it and starts the cloud copy. Go's refusal is relayed; Go down: **502**. Every failure removes the staged file. Chunked bodies, `Expect: 100-continue`, larger uploads and paths that are not already clean go to Go unchanged. `--no-native-put` sends every PUT to Go. |
@@ -38,8 +38,9 @@ Every decision stays in Go: whether a staged write is accepted, the index,
 eviction and accounting, coordinator registration and publishing, the
 cloud copy, chunk fills, peer and cloud fallback.
 
-**Never a partial file.** A local file is served only when its size is
-known to be right: the Go index's size for blobs, the published size for
+**Never a partial or unverified file.** A local file is served only when
+it is known to be right: for blobs, the exact version Go verified against
+the digest, the published size for
 chunk-of-whole-file reads, and literal files as Go's `LocalFilePath` would
 serve them. Otherwise the request goes to Go.
 
