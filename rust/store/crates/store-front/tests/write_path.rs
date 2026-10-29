@@ -263,9 +263,12 @@ fn corrupted_blob_is_not_served() {
     assert!(!p.exists(), "Go did not move the corrupt copy aside");
     let aside: Vec<_> = std::fs::read_dir(p.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".corrupt-")).collect();
     assert_eq!(aside.len(), 1, "corrupt copy kept for inspection");
-    // The registry route now answers 503 so nydusd falls back.
+    // The registry route answers a 5xx so nydusd falls back: 503 once the
+    // quarantine has dropped the index entry, 502 if the read fails while
+    // the entry is still in place (a race CI runners hit). Either is right;
+    // a 2xx or 4xx is not.
     let (code, _, _) = req(&r.front, "GET", &format!("/v2/x/blobs/sha256:{d}"), &[("Range", "bytes=0-99")], b"");
-    assert_eq!(code, 503);
+    assert!(code == 502 || code == 503, "registry route answered {code}, want a 5xx for nydusd to fall back");
     // A fresh good PUT restores service.
     assert_eq!(put(&r.front, &format!("/oci/sha256/{d}"), &body, None), 200);
     let (code, _, b) = req(&r.front, "GET", &format!("/oci/blobs/{d}"), &[], b"");
