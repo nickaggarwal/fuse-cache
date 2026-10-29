@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -723,6 +724,11 @@ func main() {
 		Logger:          logger,
 	})
 	apiHandler.SetMountHealth(mountSupervisor.Healthy)
+	healthy := mountSupervisor.Healthy
+	mountHealth.Store(&healthy)
+	// Publish a health change at once, not on the next 30 s heartbeat: peers
+	// keep routing reads here until the coordinator says otherwise.
+	go watchMountHealth(ctx, coordClient, *peerID, mountSupervisor.Healthy, cacheManager, logger)
 	mountFailed := make(chan error, 1)
 	go func() {
 		if err := mountSupervisor.Run(ctx); err != nil {
@@ -936,6 +942,49 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 	}
 }
 
+// mountHealth reports whether this node's FUSE mount is serving. The
+// heartbeat publishes "draining" instead of "active" while it is not, and
+// every peer read path skips non-active holders, so other nodes stop
+// sending reads to a node whose mount is being recovered. nil = healthy.
+var mountHealth atomic.Pointer[func() bool]
+
+func peerStatus() string {
+	if f := mountHealth.Load(); f != nil && !(*f)() {
+		return "draining"
+	}
+	return "active"
+}
+
+// watchMountHealth pushes a status update as soon as the mount's health
+// changes, so peers stop (or resume) reading from this node within a second.
+func watchMountHealth(ctx context.Context, coordClient coordinator.Coordinator, peerID string, healthy func() bool, cm cache.CacheManager, logger *log.Logger) {
+	if coordClient == nil {
+		return
+	}
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	last := true
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := healthy()
+		if now == last {
+			continue
+		}
+		last = now
+		used, capacity := cm.Stats()
+		status := peerStatus()
+		if err := coordClient.UpdatePeerStatus(ctx, peerID, status, capacity-used, used); err != nil {
+			logger.Printf("Publishing peer status %q after a mount health change failed: %v", status, err)
+			continue
+		}
+		logger.Printf("Mount health changed: peer status now %q", status)
+	}
+}
+
 // coordinatorInstance returns the coordinator's instance ID from
 // GET /api/health, or "" when unreachable or too old to report one.
 func coordinatorInstance(ctx context.Context, addr string) string {
@@ -1063,9 +1112,9 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 
 			var err error
 			if updater, ok := coordClient.(coordinator.NetworkStatusUpdater); ok {
-				err = updater.UpdatePeerStatusWithNetwork(ctx, peerID, "active", capacity-used, used, metrics)
+				err = updater.UpdatePeerStatusWithNetwork(ctx, peerID, peerStatus(), capacity-used, used, metrics)
 			} else {
-				err = coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used)
+				err = coordClient.UpdatePeerStatus(ctx, peerID, peerStatus(), capacity-used, used)
 			}
 			// Re-register periodically, not only after a heartbeat failure.
 			// A heartbeat carries status and space; every identity field
@@ -1092,6 +1141,10 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 				peerInfo.UsedSpace = used
 				if regErr := coordClient.RegisterPeer(ctx, peerInfo); regErr != nil {
 					logger.Printf("Re-register failed for peer %s: %v", peerID, regErr)
+				} else if st := peerStatus(); st != "active" {
+					// Registration always records "active"; put the real
+					// status back so a recovering node is not read from.
+					_ = coordClient.UpdatePeerStatus(ctx, peerID, st, capacity-used, used)
 				}
 			}
 		}
