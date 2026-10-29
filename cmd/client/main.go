@@ -1011,8 +1011,12 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 	heartbeatCount := 0
 	// The coordinator's instance ID (GET /api/health). When it changes, the
 	// coordinator restarted; an in-memory one lost every file location, so
-	// this node announces what it holds again (cache/republish.go).
-	lastInstance := coordinatorInstance(ctx, coordHTTPAddr)
+	// this node announces what it holds again (cache/republish.go). The
+	// first instance seen counts as a change too: this process may have
+	// started against a coordinator that already lost its rows (both rolled
+	// together), or one too old to report an instance, and rehydration
+	// adopts local files without announcing them.
+	lastInstance := ""
 
 	for {
 		select {
@@ -1022,11 +1026,9 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coor
 			used, capacity := cm.Stats()
 			heartbeatCount++
 			if inst := coordinatorInstance(ctx, coordHTTPAddr); inst != "" && inst != lastInstance {
-				if lastInstance != "" {
-					if rp, ok := cm.(interface{ RepublishLocal(context.Context) int }); ok {
-						logger.Printf("Coordinator restarted (instance %s -> %s): republishing local objects", lastInstance, inst)
-						go rp.RepublishLocal(ctx)
-					}
+				if rp, ok := cm.(interface{ RepublishLocal(context.Context) int }); ok {
+					logger.Printf("Coordinator instance %q -> %q: republishing local objects", lastInstance, inst)
+					go rp.RepublishLocal(ctx)
 				}
 				lastInstance = inst
 			}
