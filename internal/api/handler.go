@@ -161,6 +161,19 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 // SetupRoutes sets up the HTTP routes
 func (h *Handler) SetupRoutes() *mux.Router {
 	router := mux.NewRouter()
+	// nydusd sends every backend request through this proxy, including the
+	// one ACR redirects to blob storage (an absolute path with "//" in it,
+	// .../e9a2...-7ijx1tv40u//docker/registry/v2/blobs/...). mux's path
+	// cleaning answered that with a 301 to a cleaned path, which nydusd read
+	// as a 0-byte body ("expected N bytes, got 0") instead of falling back,
+	// so an image the cluster did not hold could not be read from ACR at
+	// all. With cleaning off, unknown paths reach the 503 below.
+	router.SkipClean(true)
+	// A path this proxy does not serve answers 503: nydusd falls back to the
+	// origin on a 5xx, and a 404 (mux's default) fails the read.
+	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not served by this proxy", http.StatusServiceUnavailable)
+	})
 
 	// Apply auth middleware
 	router.Use(h.authMiddleware)

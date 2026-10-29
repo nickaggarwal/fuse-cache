@@ -296,3 +296,36 @@ func TestOCIBlobWholeGetAndAPIKey(t *testing.T) {
 		t.Fatalf("file API without key: %d, want 401", resp.StatusCode)
 	}
 }
+
+// nydusd routes the blob-storage request ACR redirects to through this
+// proxy too. Its path has "//" in it; the proxy must answer 503 (nydusd
+// falls back to the origin) rather than a 301 or 404 (nydusd fails the
+// read with a 0-byte body).
+func TestUnknownProxyPathAnswers503(t *testing.T) {
+	cm, err := cache.NewCacheManager(&cache.CacheConfig{NVMePath: t.TempDir(), MaxNVMeSize: 64 << 20, ChunkSize: 1 << 20, CloudTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cm.Shutdown()
+	srv := httptest.NewServer(NewHandler(cm, nil, "p", "").SetupRoutes())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, p := range []string{
+		"/e9a2eb58f9aa40549373b6709d0fdd3a-7ijx1tv40u//docker/registry/v2/blobs/sha256/b7/b728/data?se=x&sig=y",
+		"/no/such/route",
+	} {
+		resp, err := client.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s: status %d, want 503", p, resp.StatusCode)
+		}
+	}
+	// Known routes still work and still clean nothing they rely on.
+	resp, err := client.Get(srv.URL + "/v2/")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("/v2/ ping: %v %d", err, resp.StatusCode)
+	}
+}
