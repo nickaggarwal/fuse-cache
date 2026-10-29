@@ -74,3 +74,21 @@ func TestRepublishLocalAfterCoordinatorRestart(t *testing.T) {
 		t.Fatalf("chunk-only parent not advertised: %+v", l)
 	}
 }
+
+// A large whole file adopted by rehydration (no chunk shape) is republished
+// chunked at the node's stride; a small one stays unchunked.
+func TestRepublishRestoresChunkShape(t *testing.T) {
+	cm, _ := newVerifyCM(t)
+	big := cm.republishShape(&CacheEntry{FilePath: "/m/w.bin", Size: 3<<20 + 5, Tier: TierNVMe})
+	if !big.IsChunked || big.ChunkSize != 1<<20 || big.NumChunks != 4 {
+		t.Fatalf("big file shape %+v", big)
+	}
+	small := cm.republishShape(&CacheEntry{FilePath: "/m/c.json", Size: 600, Tier: TierNVMe})
+	if small.IsChunked {
+		t.Fatalf("small file marked chunked: %+v", small)
+	}
+	kept := cm.republishShape(&CacheEntry{FilePath: "/m/x.bin", Size: 9 << 20, IsChunked: true, ChunkSize: 4 << 20})
+	if kept.ChunkSize != 4<<20 {
+		t.Fatalf("published stride not kept: %+v", kept)
+	}
+}

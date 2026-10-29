@@ -67,7 +67,7 @@ func (cm *DefaultCacheManager) RepublishLocal(ctx context.Context) int {
 				continue // published by verification when it passes
 			}
 		}
-		cm.publishFileLocation(ctx, e, TierNVMe)
+		cm.publishFileLocation(ctx, cm.republishShape(e), TierNVMe)
 		n++
 		if n%republishBatch == 0 {
 			select {
@@ -79,4 +79,22 @@ func (cm *DefaultCacheManager) RepublishLocal(ctx context.Context) int {
 	}
 	cm.logger.Printf("Republished %d local objects to the coordinator", n)
 	return n
+}
+
+// republishShape restores the chunk shape a whole local file was written
+// with. Rehydration adopts files from disk without it (IsChunked=false), and
+// publishing that as-is told every node a 3.5 GB weights file was unchunked:
+// readers then fetched it whole through Get() for every 128 KiB FUSE window
+// (6-8 s per read live on cpu-w3) until the load failed with EIO. A file
+// larger than one chunk was written chunked (PutFromFile, putChunked), so it
+// is published chunked at the node's stride, the one it was written with.
+func (cm *DefaultCacheManager) republishShape(e *CacheEntry) *CacheEntry {
+	if e.IsChunked || cm.config.ChunkSize <= 0 || e.Size <= cm.config.ChunkSize {
+		return e
+	}
+	cp := *e
+	cp.IsChunked = true
+	cp.ChunkSize = cm.config.ChunkSize
+	cp.NumChunks = chunkCountFor(e.Size, cp.ChunkSize)
+	return &cp
 }
