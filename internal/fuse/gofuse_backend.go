@@ -404,6 +404,7 @@ func (n *goFuseNode) Rename(ctx context.Context, name string, newParent gfs.Inod
 	}
 	dstParent, ok := newParent.(*goFuseNode)
 	if !ok {
+		n_logEIO(n.gfs, "goFuseNode.Rename", n.path, nil)
 		return syscall.EIO
 	}
 	oldPath := filepath.Join(n.path, name)
@@ -501,6 +502,7 @@ func (h *goFusePassthroughHandle) Read(ctx context.Context, dest []byte, off int
 	}
 	n, err := file.ReadAt(dest, off)
 	if err != nil && err != io.EOF {
+		n_logEIO(nil, "goFusePassthroughHandle.Read", "passthrough", err)
 		return nil, syscall.EIO
 	}
 	return gfuse.ReadResultData(dest[:n]), 0
@@ -513,6 +515,7 @@ func (h *goFusePassthroughHandle) Release(ctx context.Context) syscall.Errno {
 		return 0
 	}
 	if err := h.file.Close(); err != nil {
+		n_logEIO(nil, "goFusePassthroughHandle.Release", "passthrough", err)
 		return syscall.EIO
 	}
 	h.file = nil
@@ -571,6 +574,7 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 		if n.isNew && n.dirty && n.writeFile != nil {
 			if err := n.flushWriteBufferLocked(); err != nil {
 				n.mu.Unlock()
+				n_logEIO(n.gfs, "goFuseNode.Read", n.path, err)
 				return nil, syscall.EIO
 			}
 			size := n.entry.Size
@@ -587,6 +591,7 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 			readN, err := n.writeFile.ReadAt(buf, off)
 			n.mu.Unlock()
 			if err != nil && err != io.EOF {
+				n_logEIO(n.gfs, "goFuseNode.Read", n.path, err)
 				return nil, syscall.EIO
 			}
 			return gfuse.ReadResultData(buf[:readN]), 0
@@ -718,12 +723,14 @@ func (n *goFuseNode) Write(ctx context.Context, f gfs.FileHandle, data []byte, o
 		return 0, syscall.EPERM
 	}
 	if err := n.ensureWriteFileLocked(); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Write", n.path, err)
 		return 0, syscall.EIO
 	}
 	if n.writeStartedAt.IsZero() {
 		n.writeStartedAt = time.Now()
 	}
 	if err := n.writeDataLocked(data, off); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Write", n.path, err)
 		return 0, syscall.EIO
 	}
 	n.writeBytes += int64(len(data))
@@ -755,12 +762,15 @@ func (n *goFuseNode) Setattr(ctx context.Context, f gfs.FileHandle, in *gfuse.Se
 			return syscall.EPERM
 		}
 		if err := n.ensureWriteFileLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		if err := n.flushWriteBufferLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		if err := n.writeFile.Truncate(int64(size)); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		n.entry.Size = int64(size)
@@ -789,17 +799,20 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 	if n.writeFile != nil {
 		stageFlushStarted := time.Now()
 		if err := n.flushWriteBufferLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 			return syscall.EIO
 		}
 		stageFlushDur = time.Since(stageFlushStarted)
 		if putter, ok := n.gfs.cacheManager.(stagedFilePutter); ok {
 			syncStarted := time.Now()
 			if err := n.writeFile.Sync(); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			syncDur = time.Since(syncStarted)
 			putStarted := time.Now()
 			if err := putter.PutFromFile(ctx, n.path, n.writePath, n.entry.Size, time.Now()); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -807,6 +820,7 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
 			putStarted := time.Now()
 			if err := putter.PutFromReader(ctx, n.path, reader, n.entry.Size, time.Now()); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -814,11 +828,13 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
 			data := make([]byte, int(n.entry.Size))
 			if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			n.entry.Data = data
 			putStarted := time.Now()
 			if err := n.gfs.cacheManager.Put(ctx, n.entry); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -826,6 +842,7 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 		n.entry.Data = nil
 		n.cleanupWriteFileLocked()
 	} else if err := n.gfs.cacheManager.Put(ctx, n.entry); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 		return syscall.EIO
 	}
 	n.dirty = false
@@ -1208,4 +1225,17 @@ func (g *GoFuseFileSystem) shouldTraceRead(path string, off int64) bool {
 		return true
 	}
 	return off%g.readTraceStep == 0
+}
+
+// n_logEIO records the cause of an EIO before it is returned to the kernel.
+// An application sees only "Input/output error"; without this line the
+// daemon side of the same failure was empty (cpu-w3 bursts). g may be nil
+// (passthrough handles carry no filesystem pointer); then the standard
+// logger is used.
+func n_logEIO(g *GoFuseFileSystem, op, path string, err error) {
+	if g != nil && g.logger != nil {
+		g.logger.Printf("EIO op=%s path=%s err=%v", op, path, err)
+		return
+	}
+	log.Printf("[GOFUSE] EIO op=%s path=%s err=%v", op, path, err)
 }
