@@ -245,6 +245,12 @@ type CacheConfig struct {
 	// never a peer for them; the store and other nodes serve them instead.
 	NoBlobFill bool
 
+	// BlobScrubInterval re-hashes every local OCI blob against its digest
+	// this often (blob_verify.go), catching copies that went bad without
+	// their mtime changing. 0 = the default (24h); negative disables the
+	// periodic scrub. Unverified blobs are always hashed once at startup.
+	BlobScrubInterval time.Duration
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
@@ -360,6 +366,9 @@ type DefaultCacheManager struct {
 	// checked, so serving a file through many small FUSE reads hashes it once
 	// rather than once per read.
 	nvmeVerify nvmeVerifier
+	// blobVerify remembers OCI blobs hashed against their digest
+	// (blob_verify.go).
+	blobVerify blobVerifier
 	// nvmeUsed is maintained as the exact sum of nvmeBytes. Never adjust it
 	// directly — go through accountNVMeLocked/unaccountNVMeLocked, which make
 	// every update idempotent in the key. Deriving the delta from the entry
@@ -379,15 +388,18 @@ type DefaultCacheManager struct {
 	// credit. That undercount lets the cache overfill. Held across both steps by
 	// putToNVMeWithEviction and deleteLocalNVMeFootprint; a fixed array so a
 	// zero-value manager built by a test helper is usable without construction.
-	nvmeKeyMu    [nvmeKeyStripes]sync.Mutex
-	mu           sync.RWMutex
-	rangeMu      sync.RWMutex
-	fetchMu      sync.Mutex
-	logger       *log.Logger
-	metrics      *CacheMetrics
-	metadataAt   time.Time
-	metadataView []*CacheEntry
-	rangeChunks  map[string]*chunkFileCache
+	nvmeKeyMu  [nvmeKeyStripes]sync.Mutex
+	mu         sync.RWMutex
+	rangeMu    sync.RWMutex
+	fetchMu    sync.Mutex
+	logger     *log.Logger
+	metrics    *CacheMetrics
+	metadataAt time.Time
+	// metadataShrinkAt marks a refresh that returned far fewer paths than
+	// the view held (coordinator state lost); see refreshMetadataView.
+	metadataShrinkAt time.Time
+	metadataView     []*CacheEntry
+	rangeChunks      map[string]*chunkFileCache
 	// rangeTotalBytes tracks the sum of all per-file cache bytes so the
 	// global budget check is O(1) per insert instead of an O(files) scan
 	// under rangeMu on every cached chunk.
@@ -702,6 +714,10 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// evictor so nothing pending is ever judged by a stale bit.
 	cm.initDurability()
 
+	// Hash any OCI blob not yet verified (a previous version wrote it, or it
+	// changed while the process was down), then re-scrub periodically.
+	cm.startBlobScrubber()
+
 	// Background watermark evictor: keeps NVMe inside the pressure band so
 	// foreground writes (almost) never pay the eviction scan, and reacts to
 	// real device fullness (shared host disk), not just our own accounting.
@@ -816,9 +832,16 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 	// Remote read strategy:
 	// - always peer first, then cloud fallback.
 	// Cloud reads take the cross-node single-flight lease (Phase 2).
+	// Whole-file reads (config, tokenizer, index files) take the same
+	// jittered busy retry as chunk reads: under a burst every holder can be
+	// at its serve gate for a moment, and a single busy answer here became
+	// an EIO on open (tokenizer.json, 8 pods starting on cpu-w3) although
+	// the bytes were on two holders.
+	var lastErr error
 	for _, tier := range cm.remoteReadOrder(filePath) {
 		tierStart := time.Now()
-		if entry, servedTier, err := cm.getFromRemoteTier(ctx, filePath, tier); err == nil {
+		entry, servedTier, err := cm.getFromRemoteTierWithBusyRetry(ctx, filePath, tier)
+		if err == nil {
 			cm.touchEntries(filePath)
 			cm.metrics.RecordHit(servedTier)
 			cm.metrics.RecordTierRead(servedTier, int64(len(entry.Data)), time.Since(tierStart))
@@ -826,9 +849,13 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 			cm.goBackground(func() { cm.promoteToNVMe(context.Background(), e) })
 			return entry, nil
 		}
+		lastErr = err
 		cm.metrics.RecordMiss(tier)
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("file not found in any tier: %w", lastErr)
+	}
 	return nil, errors.New("file not found in any tier")
 }
 
@@ -882,10 +909,14 @@ func (cm *DefaultCacheManager) GetLocal(ctx context.Context, filePath string) (*
 
 // LocalFilePath returns the local NVMe path for filePath if present.
 func (cm *DefaultCacheManager) LocalFilePath(ctx context.Context, filePath string) (string, bool) {
-	_ = ctx
 	fullPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/"))
 	info, err := os.Stat(fullPath)
 	if err != nil || info.IsDir() {
+		return "", false
+	}
+	// A whole OCI blob is a peer source only once it has hashed to its
+	// digest; until then the requester tries the next holder.
+	if cm.blobLocalVerdict(ctx, filePath, fullPath, false) != blobGood {
 		return "", false
 	}
 	return fullPath, true
@@ -897,7 +928,6 @@ func (cm *DefaultCacheManager) LocalFilePath(ctx context.Context, filePath strin
 // when the parent is not a whole chunked file present on local NVMe, or when a
 // literal chunk file exists (that case is served by LocalFilePath/streamLocalFile).
 func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath string) (string, int64, int64, bool) {
-	_ = ctx
 	parent, ok := parentFilePathFromChunkPath(chunkPath)
 	if !ok {
 		return "", 0, 0, false
@@ -952,6 +982,9 @@ func (cm *DefaultCacheManager) LocalChunkFile(ctx context.Context, chunkPath str
 
 	info, err := os.Stat(parentLocal)
 	if err != nil || info.IsDir() || info.Size() < offset+length {
+		return "", 0, 0, false
+	}
+	if cm.blobLocalVerdict(ctx, parent, parentLocal, false) != blobGood {
 		return "", 0, 0, false
 	}
 	return parentLocal, offset, length, true
@@ -1584,6 +1617,9 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	})
 	return nil
 }
+
+// NVMeDir is the local cache directory staged files and objects live in.
+func (cm *DefaultCacheManager) NVMeDir() string { return cm.config.NVMePath }
 
 // CreateWriteFile creates a staged local file on the NVMe volume so final
 // commit can use a local rename instead of a full reread/copy.
@@ -2647,6 +2683,14 @@ func (cm *DefaultCacheManager) getFromTierNoVerify(ctx context.Context, filePath
 func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath string, tier CacheTier, verifyNVMeChecksum bool) (*CacheEntry, error) {
 	storage := cm.getStorageForTier(tier)
 
+	// A whole local OCI blob is read only once it has hashed to its digest.
+	if tier == TierNVMe && blobDigestFromPath(filePath) != "" {
+		full := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/"))
+		if _, err := os.Stat(full); err == nil && cm.blobLocalVerdict(ctx, filePath, full, false) != blobGood {
+			return nil, os.ErrNotExist
+		}
+	}
+
 	data, err := storage.Read(ctx, filePath)
 	if err != nil {
 		if tier == TierNVMe {
@@ -2727,6 +2771,11 @@ func (cm *DefaultCacheManager) readChunkFromWholeLocalFile(ctx context.Context, 
 		return nil, os.ErrNotExist
 	}
 	fullPath := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(parentPath, "/"))
+	// A chunk sliced from a whole OCI blob is only as good as the blob:
+	// unverified or bad, it is a miss here and the read goes elsewhere.
+	if cm.blobLocalVerdict(ctx, parentPath, fullPath, false) != blobGood {
+		return nil, os.ErrNotExist
+	}
 	f, err := os.Open(fullPath)
 	if err != nil {
 		return nil, err
@@ -4263,10 +4312,15 @@ type CacheMetrics struct {
 	BlobRangeLocalBytes  atomic.Int64
 	BlobRangeRemoteBytes atomic.Int64
 	BlobPromoted         atomic.Int64
-	BlobPromoteSkipped   atomic.Int64
-	BlobFillQueued       atomic.Int64
-	PrefetchHits         atomic.Int64
-	PrefetchWasted       atomic.Int64
+	// BlobVerified/BlobVerifyBytes count OCI blobs hashed against their
+	// digest; BlobQuarantined counts copies that failed and were moved aside.
+	BlobVerified       atomic.Int64
+	BlobVerifyBytes    atomic.Int64
+	BlobQuarantined    atomic.Int64
+	BlobPromoteSkipped atomic.Int64
+	BlobFillQueued     atomic.Int64
+	PrefetchHits       atomic.Int64
+	PrefetchWasted     atomic.Int64
 	// Global range-cache budget accounting: whole-file cache evictions from
 	// the all-files byte budget, and idle-expiry sweeps.
 	RangeCacheFileEvictions atomic.Int64
@@ -4454,6 +4508,9 @@ func (m *CacheMetrics) Snapshot() map[string]interface{} {
 		"blob_range_local_bytes":       m.BlobRangeLocalBytes.Load(),
 		"blob_range_remote_bytes":      m.BlobRangeRemoteBytes.Load(),
 		"blob_promoted":                m.BlobPromoted.Load(),
+		"blob_verified":                m.BlobVerified.Load(),
+		"blob_verify_bytes":            m.BlobVerifyBytes.Load(),
+		"blob_quarantined":             m.BlobQuarantined.Load(),
 		"blob_promote_skipped":         m.BlobPromoteSkipped.Load(),
 		"blob_fill_queued":             m.BlobFillQueued.Load(),
 		"prefetch_hits":                m.PrefetchHits.Load(),

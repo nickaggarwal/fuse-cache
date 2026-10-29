@@ -2,9 +2,14 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -202,6 +207,16 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	// but the last is full width). Capture it here so the assembled whole
 	// file can be re-sliced for peer serves on the same boundaries.
 	var chunkSize int64
+	// An OCI blob is hashed while it is assembled (no second read): the
+	// whole file is only committed if it matches its digest, so a bad chunk
+	// from any holder never becomes a whole local copy (blob_verify.go).
+	wantDigest := blobDigestFromPath(filePath)
+	var hasher hash.Hash
+	var dst io.Writer = w
+	if wantDigest != "" {
+		hasher = sha256.New()
+		dst = io.MultiWriter(w, hasher)
+	}
 	for i := int64(0); i < numChunks; i++ {
 		localPath, ok := cm.LocalFilePath(ctx, chunkPathFor(filePath, i))
 		if !ok {
@@ -214,7 +229,7 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 			return err
 		}
 		before := w.BytesWritten()
-		_, cerr := io.Copy(w, f)
+		_, cerr := io.Copy(dst, f)
 		f.Close()
 		if cerr != nil {
 			w.Abort()
@@ -227,6 +242,22 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	if w.BytesWritten() != size {
 		w.Abort()
 		return fmt.Errorf("assembled %d bytes, want %d", w.BytesWritten(), size)
+	}
+	if hasher != nil {
+		if got := hex.EncodeToString(hasher.Sum(nil)); got != wantDigest {
+			w.Abort()
+			cm.metrics.BlobVerified.Add(1)
+			cm.metrics.BlobQuarantined.Add(1)
+			for i := int64(0); i < numChunks; i++ {
+				cm.moveAside(filepath.Join(cm.config.NVMePath, strings.TrimPrefix(chunkPathFor(filePath, i), "/")))
+			}
+			cm.forgetBlobChunks(filePath, numChunks)
+			cm.retractLocalBlobRows(ctx, filePath)
+			cm.logger.Printf("[VERIFY] blob %s assembled from chunks hashes to %s: chunks quarantined", wantDigest[:12], got[:12])
+			return fmt.Errorf("blob %s: assembled content does not match its digest", wantDigest[:12])
+		}
+		cm.metrics.BlobVerified.Add(1)
+		cm.metrics.BlobVerifyBytes.Add(size)
 	}
 	// Publishing the bytes, crediting them, and installing the row is one
 	// mutation of this key — the lock is taken *before* Commit for the same
@@ -266,6 +297,9 @@ func (cm *DefaultCacheManager) runChunkCompletionOpts(ctx context.Context, fileP
 	cm.accountNVMeLocked(filePath, size)
 	cm.mu.Unlock()
 	parentUnlock()
+	if hasher != nil {
+		cm.MarkBlobVerified(filePath) // just hashed: servable without a second pass
+	}
 
 	for i := int64(0); i < numChunks; i++ {
 		cp := chunkPathFor(filePath, i)

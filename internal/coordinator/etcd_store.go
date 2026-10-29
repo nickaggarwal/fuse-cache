@@ -190,7 +190,7 @@ func (s *EtcdStore) ListFileLocations(ctx context.Context, prefix string) ([]*Fi
 		if len(locs) == 0 {
 			continue
 		}
-		lc := *locs[0]
+		lc := *representativeLocation(locs)
 		out = append(out, &lc)
 	}
 	return out, nil

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -91,6 +93,7 @@ func main() {
 		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", false, "Serve windows of a chunked file straight from its whole local copy (exact bytes, no read amplification) instead of the per-chunk path. Off by default: it has no read-ahead, so on fast local NVMe it is slower than the prefetching chunk path (A100 node, page cache dropped: 21.1 s vs 8.7 s for 15 GB). FUSE_RANGE_WHOLE_FILE_READS env overrides")
 		noChunkWindowReads   = flag.Bool("no-chunk-window-reads", false, "Read a whole chunk for every random window that misses the range cache, instead of only the window's bytes from the local chunk file. Off by default; sequential streams use the per-chunk path either way")
 		noBlobFill           = flag.Bool("no-blob-fill", false, "Do not keep fetched OCI blob chunks on this node (the blob endpoint still serves them). For model nodes where nydusd's own cache already holds the image; FUSE_NO_BLOB_FILL=1 sets it")
+		blobScrubHours       = flag.Int("blob-scrub-hours", 24, "Re-hash every local OCI blob against its digest this often; bad copies are moved aside and stop being served. 0 disables the periodic scrub (unverified blobs are still checked once at startup)")
 		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
 		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
 		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
@@ -252,6 +255,7 @@ func main() {
 		DisableWholeFileRangeReads: !*rangeWholeFileReads,
 		DisableChunkWindowReads:    *noChunkWindowReads,
 		NoBlobFill:                 *noBlobFill || os.Getenv("FUSE_NO_BLOB_FILL") == "1",
+		BlobScrubInterval:          blobScrubInterval(*blobScrubHours),
 		RangeChunkCacheSize:        *rangeChunkCache,
 		RangeChunkCacheMaxBytes:    int64(*rangeChunkCacheMaxMB) * 1024 * 1024,
 		RangePrefetchMaxBytes:      int64(*rangePrefetchMaxMB) * 1024 * 1024,
@@ -642,7 +646,7 @@ func main() {
 		if regPort != *peerPort {
 			logger.Printf("- advertising HTTP port %d (serving on %d behind a front server)", regPort, *peerPort)
 		}
-		go registerPeer(ctx, coordClient, *peerID, regPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
+		go registerPeer(ctx, coordClient, *coordinatorAddr, *peerID, regPort, *grpcPort, *nvmePath, labels, cacheManager, logger)
 	}
 
 	// Create API handler
@@ -720,6 +724,11 @@ func main() {
 		Logger:          logger,
 	})
 	apiHandler.SetMountHealth(mountSupervisor.Healthy)
+	healthy := mountSupervisor.Healthy
+	mountHealth.Store(&healthy)
+	// Publish a health change at once, not on the next 30 s heartbeat: peers
+	// keep routing reads here until the coordinator says otherwise.
+	go watchMountHealth(ctx, coordClient, *peerID, mountSupervisor.Healthy, cacheManager, logger)
 	mountFailed := make(chan error, 1)
 	go func() {
 		if err := mountSupervisor.Run(ctx); err != nil {
@@ -909,7 +918,100 @@ func resolvePeerLabels(ctx context.Context, static, fromNode string, logger *log
 // identity field can stay wrong after a coordinator-side skew.
 const peerReregisterEveryHeartbeats = 10
 
-func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
+// watchCoordinatorInstance republishes this node's objects whenever the
+// coordinator's instance changes, including the first instance seen.
+func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheManager, logger *log.Logger) {
+	rp, ok := cm.(interface{ RepublishLocal(context.Context) int })
+	if !ok || addr == "" {
+		return
+	}
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	last := ""
+	for {
+		if inst := coordinatorInstance(ctx, addr); inst != "" && inst != last {
+			logger.Printf("Coordinator instance %q -> %q: republishing local objects", last, inst)
+			rp.RepublishLocal(ctx)
+			last = inst
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// mountHealth reports whether this node's FUSE mount is serving. The
+// heartbeat publishes "draining" instead of "active" while it is not, and
+// every peer read path skips non-active holders, so other nodes stop
+// sending reads to a node whose mount is being recovered. nil = healthy.
+var mountHealth atomic.Pointer[func() bool]
+
+func peerStatus() string {
+	if f := mountHealth.Load(); f != nil && !(*f)() {
+		return "draining"
+	}
+	return "active"
+}
+
+// watchMountHealth pushes a status update as soon as the mount's health
+// changes, so peers stop (or resume) reading from this node within a second.
+func watchMountHealth(ctx context.Context, coordClient coordinator.Coordinator, peerID string, healthy func() bool, cm cache.CacheManager, logger *log.Logger) {
+	if coordClient == nil {
+		return
+	}
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	last := true
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		now := healthy()
+		if now == last {
+			continue
+		}
+		last = now
+		used, capacity := cm.Stats()
+		status := peerStatus()
+		if err := coordClient.UpdatePeerStatus(ctx, peerID, status, capacity-used, used); err != nil {
+			logger.Printf("Publishing peer status %q after a mount health change failed: %v", status, err)
+			continue
+		}
+		logger.Printf("Mount health changed: peer status now %q", status)
+	}
+}
+
+// coordinatorInstance returns the coordinator's instance ID from
+// GET /api/health, or "" when unreachable or too old to report one.
+func coordinatorInstance(ctx context.Context, addr string) string {
+	if addr == "" {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "http://"+addr+"/api/health", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var h struct {
+		Instance string `json:"instance"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
+		return ""
+	}
+	return h.Instance
+}
+
+func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coordHTTPAddr string, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()
 	availableSpace := capacity - used
 	usedSpace := used
@@ -980,6 +1082,18 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 	}
 	logger.Printf("Network probe enabled=%t bytes=%d every_heartbeats=%d timeout_ms=%d", netProbeEnabled, netProbeBytes, netProbeEveryHB, netProbeTimeout.Milliseconds())
 	heartbeatCount := 0
+	// The coordinator's instance ID (GET /api/health). When it changes, the
+	// coordinator restarted; an in-memory one lost every file location, so
+	// this node announces what it holds again (cache/republish.go). The
+	// first instance seen counts as a change too: this process may have
+	// started against a coordinator that already lost its rows (both rolled
+	// together), or one too old to report an instance, and rehydration
+	// adopts local files without announcing them.
+	// Checked every 5 s on its own ticker, not on the 30 s heartbeat: until
+	// every holder republishes, an in-memory coordinator that just restarted
+	// knows none of the files on this node, and other nodes' opens of them
+	// fail with ENOENT (io-bench on cpu-w3 hit it 66 s after a restart).
+	go watchCoordinatorInstance(ctx, coordHTTPAddr, cm, logger)
 
 	for {
 		select {
@@ -998,9 +1112,9 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 
 			var err error
 			if updater, ok := coordClient.(coordinator.NetworkStatusUpdater); ok {
-				err = updater.UpdatePeerStatusWithNetwork(ctx, peerID, "active", capacity-used, used, metrics)
+				err = updater.UpdatePeerStatusWithNetwork(ctx, peerID, peerStatus(), capacity-used, used, metrics)
 			} else {
-				err = coordClient.UpdatePeerStatus(ctx, peerID, "active", capacity-used, used)
+				err = coordClient.UpdatePeerStatus(ctx, peerID, peerStatus(), capacity-used, used)
 			}
 			// Re-register periodically, not only after a heartbeat failure.
 			// A heartbeat carries status and space; every identity field
@@ -1027,6 +1141,10 @@ func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, peer
 				peerInfo.UsedSpace = used
 				if regErr := coordClient.RegisterPeer(ctx, peerInfo); regErr != nil {
 					logger.Printf("Re-register failed for peer %s: %v", peerID, regErr)
+				} else if st := peerStatus(); st != "active" {
+					// Registration always records "active"; put the real
+					// status back so a recovering node is not read from.
+					_ = coordClient.UpdatePeerStatus(ctx, peerID, st, capacity-used, used)
 				}
 			}
 		}
@@ -1209,4 +1327,13 @@ func normalizeFuseBackend(value string) string {
 	default:
 		return v
 	}
+}
+
+// blobScrubInterval maps -blob-scrub-hours to CacheConfig.BlobScrubInterval
+// (0 there means the default, negative disables).
+func blobScrubInterval(hours int) time.Duration {
+	if hours <= 0 {
+		return -1
+	}
+	return time.Duration(hours) * time.Hour
 }

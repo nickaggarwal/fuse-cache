@@ -139,6 +139,21 @@ func (cm *DefaultCacheManager) advertiseHolder(ctx context.Context, filePath str
 		size = parentEntry.Size
 		isChunked = isChunked || parentEntry.IsChunked
 	}
+	if size <= 0 {
+		// A node that landed one chunk has no local parent entry, but it
+		// read that chunk through a remote entry that knows the size. A
+		// size-0 row tells every reader the file is empty once the sized
+		// rows go away (eviction, quarantine), so carry the known size.
+		cm.mu.RLock()
+		view := cm.metadataView
+		cm.mu.RUnlock()
+		if e, ok := findInView(view, filePath); ok && e.Size > 0 {
+			size = e.Size
+			if parentEntry == nil {
+				parentEntry = e
+			}
+		}
+	}
 	location := &coordinator.FileLocation{
 		FilePath:     filePath,
 		PeerID:       cm.config.LocalPeerID,

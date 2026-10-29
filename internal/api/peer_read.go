@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"syscall"
 
 	"fuse-client/internal/cache"
 )
@@ -130,6 +132,13 @@ func (h *Handler) serveFileRange(w http.ResponseWriter, localPath string, offset
 	// path, so this is zero-copy on the plain in-cluster connection.
 	if _, err := io.CopyN(w, f, length); err != nil {
 		// Header/Content-Length already written; nothing to do but stop.
+		// A requester that raced several holders hangs up on the losers: a
+		// broken pipe or reset is that, not a serve failure, and logging
+		// each one buried real errors (39 lines per cold start on cpu-w3).
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+			h.peerReadAborted.Add(1)
+			return
+		}
 		h.logger.Printf("peer read stream error path=%s off=%d len=%d: %v", localPath, offset, length, err)
 	}
 }

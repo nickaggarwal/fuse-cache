@@ -453,3 +453,20 @@ func mustHostPort(t *testing.T, raw string) string {
 	}
 	return strings.TrimSpace(u.Host)
 }
+
+// A per-path listing returns the row that knows the file's size, not a
+// size-0 holder row that happens to be first.
+func TestListFileLocationsPrefersSizedRow(t *testing.T) {
+	ctx := context.Background()
+	cs := NewCoordinatorService()
+	p := "/oci/sha256/" + strings.Repeat("a", 64)
+	_ = cs.UpdateFileLocation(ctx, &FileLocation{FilePath: p, PeerID: "node-a", StorageTier: "nvme", FileSize: 0, IsChunked: true})
+	_ = cs.UpdateFileLocation(ctx, &FileLocation{FilePath: p, PeerID: "store", StorageTier: "nvme", FileSize: 698568384, IsChunked: true, ChunkSize: 16 << 20})
+	locs, err := cs.ListFileLocations(ctx, "/oci/")
+	if err != nil || len(locs) != 1 {
+		t.Fatalf("list: %v %d", err, len(locs))
+	}
+	if locs[0].FileSize != 698568384 {
+		t.Fatalf("listed size %d, want the sized row", locs[0].FileSize)
+	}
+}

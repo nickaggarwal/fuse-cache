@@ -296,6 +296,66 @@ Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
   (EKS + S3 Express directory bucket + VPC endpoints) and Azure (AKS +
   premium blob), Helm chart with per-cloud overlays.
 
+## Container Images via nydus
+
+fuse-cache is the image cache as well as the weights cache: nydusd on
+each node reads image blobs from the node's fuse-client instead of from
+a registry mirror. One cache, one store, one warm signal for both.
+
+```
+container reads a file in the image
+  → nydusd (FUSE, RAFS v6, its own blob cache on local disk)
+      miss → registry backend http://127.0.0.1:18081  (the node's fuse-client)
+               1. local disk copy        → sendfile
+               2. store, then a peer     → ranged read
+               3. blob storage           (the store's write-through)
+            5xx → nydusd falls back to the source registry
+```
+
+- **Blobs by digest.** A blob is cached at `/oci/sha256/<hex>` and served
+  on the registry routes nydusd already speaks: `GET|HEAD
+  /v2/<repo>/blobs/<digest>`, `/oci/blobs/<digest>`, and the `/v2/` ping.
+  The repository name is ignored, so a layer two images share is stored
+  once.
+- **Digest-checked on the way in.** `PUT /api/files/oci/sha256/<hex>` hashes
+  the body and refuses (400) a body that does not match. Nothing
+  unverified reaches the store, the peers or nydusd.
+- **Verified before it is a source.** A whole blob on local disk is hashed
+  against its digest once (per size + mtime, remembered in a
+  `<blob>.verified` marker) before it is served to nydusd or a peer, and a
+  blob a node assembles from chunk files is hashed when its last chunk
+  lands. A mismatch is moved aside as `<blob>.corrupt-<time>`, dropped from
+  the index and retracted from the coordinator, so readers go to the next
+  holder or the registry. Serving never waits on a hash: an unverified blob
+  is skipped while it is checked in the background. A daily scrub
+  (`-blob-scrub-hours`, default 24) re-hashes everything to catch damage
+  that keeps the mtime. Metrics: `fuse_blob_verified_total`,
+  `fuse_blob_quarantined_total`.
+- **No read-ahead here.** nydusd prefetches from the image's own startup
+  list; fuse-client serves exactly the ranges asked for (at most 64 MiB
+  per GET) and lands the whole chunk on local disk later, after 15 s of
+  quiet, so the fill never competes with the start. `-no-blob-fill` turns
+  the fill off.
+- **Misses fall back cleanly.** A blob the cluster does not hold answers
+  503, with a 5 s negative cache, and nydusd reads it from the registry.
+- **Filling the store.** A blob gets to the store through a PUT ahead of
+  the launch (sky-control's skywarm does this from the source registry).
+  Model nodes fill from the store and from each other as they read.
+
+On store nodes the Rust **store-front** ([`rust/store`](rust/store/STORE.md))
+owns the public port. It serves blob, peer-read and PUT bytes directly
+(sendfile out; streamed, hashed and staged in) and leaves every decision
+to the Go client: what is in the index, what to evict, what gets
+published to the coordinator, and fallback.
+
+Node settings (sky-control skyfleet `fuseImages: true`):
+
+| Piece | Setting |
+|---|---|
+| nydusd | registry backend `http://127.0.0.1:18081`, ping `/v2/`, fallback on |
+| fuse-client on model nodes | API on hostPort 18081; go-fuse backend; `FUSE_GOFUSE_DIRECT_MOUNT=1` on Ubuntu 26.04 (AppArmor confines `fusermount3`); passthrough on kernel 6.9+ |
+| store | `-max-upload-gb` larger than the largest blob; with store-front, Go runs on `-port=8091 -advertise-port=8081` |
+
 ## Cross-Cluster (Global Control Plane)
 
 **Status: complete (stages 0-5). Usable across a real network as of stage 4

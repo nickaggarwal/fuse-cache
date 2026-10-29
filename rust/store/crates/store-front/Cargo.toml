@@ -1,0 +1,33 @@
+[package]
+name = "store-front"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Store-node front server: serves peer reads and OCI blob ranges from the cache dir, proxies the rest to the Go client"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "store-front"
+path = "src/main.rs"
+
+[[bin]]
+name = "burst"
+path = "src/bin/burst.rs"
+
+[dependencies]
+store-layout = { path = "../store-layout" }
+libc.workspace = true
+httparse.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+percent-encoding.workspace = true
+httpdate.workspace = true
+clap.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

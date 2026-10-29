@@ -59,6 +59,8 @@ type Handler struct {
 	warmJobs warmJobs
 	// maxUploadBytes overrides defaultMaxUploadSize when > 0.
 	maxUploadBytes atomic.Int64
+	// peerReadAborted counts peer reads the requester hung up on mid-body.
+	peerReadAborted atomic.Int64
 	// mountHealthy reports whether the FUSE mount is currently being served.
 	// Unset means "not supervised" and health reports healthy, which keeps
 	// callers that mount nothing on the same handler. Atomic because the
@@ -159,6 +161,19 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 // SetupRoutes sets up the HTTP routes
 func (h *Handler) SetupRoutes() *mux.Router {
 	router := mux.NewRouter()
+	// nydusd sends every backend request through this proxy, including the
+	// one ACR redirects to blob storage (an absolute path with "//" in it,
+	// .../e9a2...-7ijx1tv40u//docker/registry/v2/blobs/...). mux's path
+	// cleaning answered that with a 301 to a cleaned path, which nydusd read
+	// as a 0-byte body ("expected N bytes, got 0") instead of falling back,
+	// so an image the cluster did not hold could not be read from ACR at
+	// all. With cleaning off, unknown paths reach the 503 below.
+	router.SkipClean(true)
+	// A path this proxy does not serve answers 503: nydusd falls back to the
+	// origin on a 5xx, and a 404 (mux's default) fails the read.
+	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not served by this proxy", http.StatusServiceUnavailable)
+	})
 
 	// Apply auth middleware
 	router.Use(h.authMiddleware)
@@ -169,6 +184,9 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	// endpoint is unreachable.
 	router.HandleFunc("/api/files/{path:.*}/size", h.handleFileSize).Methods("GET")
 	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
+	// A front server in the same pod adopting a PUT it staged (commit.go).
+	router.HandleFunc("/api/internal/commit", h.handleInternalCommit).Methods("POST")
+	router.HandleFunc("/api/internal/blob-verified/{digest}", h.handleInternalBlobVerified).Methods("GET")
 
 	// OCI blobs by digest, for nydusd's http-proxy backend (oci_blob.go).
 	router.HandleFunc("/oci/blobs/{digest}", h.handleOCIBlob).Methods("GET", "HEAD")
@@ -389,8 +407,49 @@ func (h *Handler) handleFilePutStreaming(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	if wantDigest != "" {
+		if bv, ok := h.cacheManager.(blobVerifyMarker); ok {
+			bv.MarkBlobVerified(filePath)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	h.logger.Printf("Stored file: %s (%d bytes)", filePath, size)
+}
+
+// blobVerifyMarker records that a just-written blob hashed to its digest
+// (cache/blob_verify.go), so it is servable without a second hash.
+type blobVerifyMarker interface {
+	MarkBlobVerified(filePath string)
+}
+
+// blobVersionReporter is what store-front asks before serving a blob
+// natively: the exact local version Go has verified.
+type blobVersionReporter interface {
+	VerifiedBlobVersion(ctx context.Context, filePath string) (size, mtimeNs int64, ok bool)
+}
+
+// handleInternalBlobVerified answers GET /api/internal/blob-verified/<hex>
+// for store-front (loopback only): 200 "<size> <mtime_ns>" when the whole
+// local blob has hashed to its digest, 404 otherwise. Never blocks on a
+// hash; an unverified blob starts a background check.
+func (h *Handler) handleInternalBlobVerified(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r.RemoteAddr) {
+		http.Error(w, "loopback only", http.StatusForbidden)
+		return
+	}
+	m := ociDigestHex.FindStringSubmatch(mux.Vars(r)["digest"])
+	bv, ok := h.cacheManager.(blobVersionReporter)
+	if m == nil || !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	size, mtime, ok := bv.VerifiedBlobVersion(r.Context(), OCIBlobPrefix+m[2])
+	if !ok {
+		http.Error(w, "not verified", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "%d %d\n", size, mtime)
 }
 
 // handleFileDelete handles DELETE requests for files
@@ -1082,6 +1141,10 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	writeMetricLine(w, "fuse_blob_range_local_bytes_total", metrics["blob_range_local_bytes"])
 	writeMetricLine(w, "fuse_blob_range_remote_bytes_total", metrics["blob_range_remote_bytes"])
 	writeMetricLine(w, "fuse_blob_promoted_total", metrics["blob_promoted"])
+	writeMetricLine(w, "fuse_blob_verified_total", metrics["blob_verified"])
+	writeMetricLine(w, "fuse_peer_read_aborted_total", h.peerReadAborted.Load())
+	writeMetricLine(w, "fuse_blob_verify_bytes_total", metrics["blob_verify_bytes"])
+	writeMetricLine(w, "fuse_blob_quarantined_total", metrics["blob_quarantined"])
 	writeMetricLine(w, "fuse_blob_promote_skipped_total", metrics["blob_promote_skipped"])
 	writeMetricLine(w, "fuse_blob_fill_queued_total", metrics["blob_fill_queued"])
 	writeMetricLine(w, "fuse_range_prefetch_hits_total", metrics["prefetch_hits"])

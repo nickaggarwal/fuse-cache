@@ -135,7 +135,7 @@ func (s *InMemoryStore) ListFileLocations(_ context.Context, prefix string) ([]*
 		if len(locs) == 0 {
 			continue
 		}
-		lc := *locs[0]
+		lc := *representativeLocation(locs)
 		out = append(out, &lc)
 	}
 	return out, nil
@@ -250,3 +250,18 @@ func (s *InMemoryStore) Restore(_ context.Context, state State) error {
 }
 
 func (s *InMemoryStore) Close() error { return nil }
+
+// representativeLocation is the one row a per-path listing returns for a
+// path with several rows (one per holder and tier). The first row used to
+// win, and it can be a holder row a node advertised after landing one chunk,
+// before it knew the file's size: every node's metadata view then said the
+// file was 0 bytes long, and a 0-byte OCI blob cannot be read at all. Prefer
+// a row that knows the size; among those, keep the original order.
+func representativeLocation(locs []*FileLocation) *FileLocation {
+	for _, l := range locs {
+		if l != nil && l.FileSize > 0 {
+			return l
+		}
+	}
+	return locs[0]
+}

@@ -219,6 +219,12 @@ type goFuseNode struct {
 	readCacheMu   sync.RWMutex
 	readCacheOff  int64
 	readCacheData []byte
+
+	// The kernel (6.9+) refuses to hold one inode open in passthrough and
+	// cached io mode at once: the conflicting open() fails with EIO before
+	// the daemon sees anything (fs/fuse/iomode.c). Every open of an inode
+	// therefore takes the mode of the opens already held (iomode.go).
+	io ioModeTracker
 }
 
 type localFilePathResolver interface {
@@ -295,6 +301,7 @@ func (n *goFuseNode) Readdir(ctx context.Context) (gfs.DirStream, syscall.Errno)
 	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
 		children, err := ml.ReadDir(ctx, n.path)
 		if err != nil {
+			n.gfs.logger.Printf("Readdir error path=%s: %v", n.path, err)
 			return nil, syscall.EIO
 		}
 		dirents := make([]gfuse.DirEntry, 0, len(children))
@@ -314,6 +321,7 @@ func (n *goFuseNode) Readdir(ctx context.Context) (gfs.DirStream, syscall.Errno)
 
 	entries, err := n.gfs.cacheManager.List(ctx)
 	if err != nil {
+		n.gfs.logger.Printf("Readdir list error path=%s: %v", n.path, err)
 		return nil, syscall.EIO
 	}
 
@@ -402,6 +410,7 @@ func (n *goFuseNode) Rename(ctx context.Context, name string, newParent gfs.Inod
 	}
 	dstParent, ok := newParent.(*goFuseNode)
 	if !ok {
+		n_logEIO(n.gfs, "goFuseNode.Rename", n.path, nil)
 		return syscall.EIO
 	}
 	oldPath := filepath.Join(n.path, name)
@@ -440,14 +449,31 @@ func (n *goFuseNode) Open(ctx context.Context, flags uint32) (gfs.FileHandle, ui
 		return nil, 0, syscall.EISDIR
 	}
 
-	if n.gfs.enablePassthrough && (flags&uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY) {
-		if f, ok := n.passthroughFile(ctx); ok {
-			fusemetrics.RecordPassthroughOpen(true)
-			return &goFusePassthroughHandle{file: f}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
+	readOnly := (flags & uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY)
+	want := n.gfs.enablePassthrough && readOnly
+	var ptFile *os.File
+	mode := n.io.open(want, func() bool {
+		f, ok := n.passthroughFile(ctx)
+		ptFile = f
+		return ok
+	})
+	if mode == ioModePassthrough {
+		if ptFile == nil {
+			// Joining opens already in passthrough: the kernel reuses the
+			// inode's backing file, so a fresh fd is only a best effort.
+			if f, ok := n.passthroughFile(ctx); ok {
+				ptFile = f
+			}
 		}
+		fusemetrics.RecordPassthroughOpen(true)
+		return &goFusePassthroughHandle{file: ptFile}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
+	}
+	if ptFile != nil {
+		ptFile.Close() // opened by the probe, but cached opens are held
+	}
+	if want {
 		fusemetrics.RecordPassthroughOpen(false)
 	}
-
 	return n, gfuse.FOPEN_KEEP_CACHE, 0
 }
 
@@ -499,6 +525,7 @@ func (h *goFusePassthroughHandle) Read(ctx context.Context, dest []byte, off int
 	}
 	n, err := file.ReadAt(dest, off)
 	if err != nil && err != io.EOF {
+		n_logEIO(nil, "goFusePassthroughHandle.Read", "passthrough", err)
 		return nil, syscall.EIO
 	}
 	return gfuse.ReadResultData(dest[:n]), 0
@@ -511,6 +538,7 @@ func (h *goFusePassthroughHandle) Release(ctx context.Context) syscall.Errno {
 		return 0
 	}
 	if err := h.file.Close(); err != nil {
+		n_logEIO(nil, "goFusePassthroughHandle.Release", "passthrough", err)
 		return syscall.EIO
 	}
 	h.file = nil
@@ -569,6 +597,7 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 		if n.isNew && n.dirty && n.writeFile != nil {
 			if err := n.flushWriteBufferLocked(); err != nil {
 				n.mu.Unlock()
+				n_logEIO(n.gfs, "goFuseNode.Read", n.path, err)
 				return nil, syscall.EIO
 			}
 			size := n.entry.Size
@@ -585,6 +614,7 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 			readN, err := n.writeFile.ReadAt(buf, off)
 			n.mu.Unlock()
 			if err != nil && err != io.EOF {
+				n_logEIO(n.gfs, "goFuseNode.Read", n.path, err)
 				return nil, syscall.EIO
 			}
 			return gfuse.ReadResultData(buf[:readN]), 0
@@ -638,6 +668,10 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 
 	entry, err := n.gfs.cacheManager.Get(ctx, n.path)
 	if err != nil {
+		// Logged: an EIO the application sees with no daemon-side line
+		// cannot be traced (a tokenizer.json open failed this way under an
+		// 8-pod burst on cpu-w3 with nothing in the client log).
+		n.gfs.logger.Printf("Read error path=%s off=%d size=%d: %v", n.path, off, len(dest), err)
 		return nil, syscall.EIO
 	}
 	if off >= int64(len(entry.Data)) {
@@ -712,12 +746,14 @@ func (n *goFuseNode) Write(ctx context.Context, f gfs.FileHandle, data []byte, o
 		return 0, syscall.EPERM
 	}
 	if err := n.ensureWriteFileLocked(); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Write", n.path, err)
 		return 0, syscall.EIO
 	}
 	if n.writeStartedAt.IsZero() {
 		n.writeStartedAt = time.Now()
 	}
 	if err := n.writeDataLocked(data, off); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Write", n.path, err)
 		return 0, syscall.EIO
 	}
 	n.writeBytes += int64(len(data))
@@ -749,12 +785,15 @@ func (n *goFuseNode) Setattr(ctx context.Context, f gfs.FileHandle, in *gfuse.Se
 			return syscall.EPERM
 		}
 		if err := n.ensureWriteFileLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		if err := n.flushWriteBufferLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		if err := n.writeFile.Truncate(int64(size)); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
 		n.entry.Size = int64(size)
@@ -783,17 +822,20 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 	if n.writeFile != nil {
 		stageFlushStarted := time.Now()
 		if err := n.flushWriteBufferLocked(); err != nil {
+			n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 			return syscall.EIO
 		}
 		stageFlushDur = time.Since(stageFlushStarted)
 		if putter, ok := n.gfs.cacheManager.(stagedFilePutter); ok {
 			syncStarted := time.Now()
 			if err := n.writeFile.Sync(); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			syncDur = time.Since(syncStarted)
 			putStarted := time.Now()
 			if err := putter.PutFromFile(ctx, n.path, n.writePath, n.entry.Size, time.Now()); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -801,6 +843,7 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
 			putStarted := time.Now()
 			if err := putter.PutFromReader(ctx, n.path, reader, n.entry.Size, time.Now()); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -808,11 +851,13 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 			reader := io.NewSectionReader(n.writeFile, 0, n.entry.Size)
 			data := make([]byte, int(n.entry.Size))
 			if _, err := io.ReadFull(reader, data); err != nil && err != io.EOF {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			n.entry.Data = data
 			putStarted := time.Now()
 			if err := n.gfs.cacheManager.Put(ctx, n.entry); err != nil {
+				n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 				return syscall.EIO
 			}
 			putDur = time.Since(putStarted)
@@ -820,6 +865,7 @@ func (n *goFuseNode) Flush(ctx context.Context, f gfs.FileHandle) syscall.Errno 
 		n.entry.Data = nil
 		n.cleanupWriteFileLocked()
 	} else if err := n.gfs.cacheManager.Put(ctx, n.entry); err != nil {
+		n_logEIO(n.gfs, "goFuseNode.Flush", n.path, err)
 		return syscall.EIO
 	}
 	n.dirty = false
@@ -845,6 +891,13 @@ func (n *goFuseNode) Fsync(ctx context.Context, f gfs.FileHandle, flags uint32) 
 }
 
 func (n *goFuseNode) Release(ctx context.Context, f gfs.FileHandle) syscall.Errno {
+	n.io.release()
+	// go-fuse calls the node's Release, never the handle's (NodeReleaser
+	// wins in rawBridge.Release), so a passthrough handle's fd was only
+	// ever closed by the GC finalizer.
+	if h, ok := f.(*goFusePassthroughHandle); ok {
+		h.Release(ctx)
+	}
 	n.clearReadCache()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1202,4 +1255,17 @@ func (g *GoFuseFileSystem) shouldTraceRead(path string, off int64) bool {
 		return true
 	}
 	return off%g.readTraceStep == 0
+}
+
+// n_logEIO records the cause of an EIO before it is returned to the kernel.
+// An application sees only "Input/output error"; without this line the
+// daemon side of the same failure was empty (cpu-w3 bursts). g may be nil
+// (passthrough handles carry no filesystem pointer); then the standard
+// logger is used.
+func n_logEIO(g *GoFuseFileSystem, op, path string, err error) {
+	if g != nil && g.logger != nil {
+		g.logger.Printf("EIO op=%s path=%s err=%v", op, path, err)
+		return
+	}
+	log.Printf("[GOFUSE] EIO op=%s path=%s err=%v", op, path, err)
 }

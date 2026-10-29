@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/hex"
+	"crypto/rand"
 	"context"
 	"encoding/json"
 	"flag"
@@ -68,6 +70,7 @@ func main() {
 	defer cancel()
 
 	// Build the coordinator service, optionally backed by etcd.
+	coordinatorDurable = strings.TrimSpace(*etcdEndpoints) != ""
 	store, err := buildStore(ctx, *etcdEndpoints, *etcdPrefix, int64(*etcdLeaseTTL), *etcdDialTimeout, logger)
 	if err != nil {
 		logger.Fatalf("Failed to build coordinator store: %v", err)
@@ -980,6 +983,12 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			"status":    "healthy",
 			"timestamp": time.Now().Unix(),
 			"service":   "coordinator",
+			// Changes on every coordinator start. Clients republish what
+			// they hold when it changes: an in-memory coordinator (no
+			// -etcd-endpoints) restarts empty, and nothing else ever puts
+			// back the rows of files nodes already hold.
+			"instance": coordinatorInstance,
+			"durable":  coordinatorDurable,
 		}
 		writeJSONResponse(w, health)
 	})
@@ -995,3 +1004,16 @@ func writeJSONResponse(w http.ResponseWriter, v interface{}) {
 		log.Printf("Failed to write response: %v", err)
 	}
 }
+
+// coordinatorInstance identifies this coordinator process (see /api/health).
+var coordinatorInstance = func() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}()
+
+// coordinatorDurable reports whether file locations survive a restart
+// (etcd) or not (in-memory store). Set in main.
+var coordinatorDurable bool
