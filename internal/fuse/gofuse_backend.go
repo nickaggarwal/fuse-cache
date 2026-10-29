@@ -219,6 +219,12 @@ type goFuseNode struct {
 	readCacheMu   sync.RWMutex
 	readCacheOff  int64
 	readCacheData []byte
+
+	// The kernel (6.9+) refuses to hold one inode open in passthrough and
+	// cached io mode at once: the conflicting open() fails with EIO before
+	// the daemon sees anything (fs/fuse/iomode.c). Every open of an inode
+	// therefore takes the mode of the opens already held (iomode.go).
+	io ioModeTracker
 }
 
 type localFilePathResolver interface {
@@ -443,14 +449,31 @@ func (n *goFuseNode) Open(ctx context.Context, flags uint32) (gfs.FileHandle, ui
 		return nil, 0, syscall.EISDIR
 	}
 
-	if n.gfs.enablePassthrough && (flags&uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY) {
-		if f, ok := n.passthroughFile(ctx); ok {
-			fusemetrics.RecordPassthroughOpen(true)
-			return &goFusePassthroughHandle{file: f}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
+	readOnly := (flags & uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY)
+	want := n.gfs.enablePassthrough && readOnly
+	var ptFile *os.File
+	mode := n.io.open(want, func() bool {
+		f, ok := n.passthroughFile(ctx)
+		ptFile = f
+		return ok
+	})
+	if mode == ioModePassthrough {
+		if ptFile == nil {
+			// Joining opens already in passthrough: the kernel reuses the
+			// inode's backing file, so a fresh fd is only a best effort.
+			if f, ok := n.passthroughFile(ctx); ok {
+				ptFile = f
+			}
 		}
+		fusemetrics.RecordPassthroughOpen(true)
+		return &goFusePassthroughHandle{file: ptFile}, gfuse.FOPEN_KEEP_CACHE | gfuse.FOPEN_PASSTHROUGH, 0
+	}
+	if ptFile != nil {
+		ptFile.Close() // opened by the probe, but cached opens are held
+	}
+	if want {
 		fusemetrics.RecordPassthroughOpen(false)
 	}
-
 	return n, gfuse.FOPEN_KEEP_CACHE, 0
 }
 
@@ -868,6 +891,13 @@ func (n *goFuseNode) Fsync(ctx context.Context, f gfs.FileHandle, flags uint32) 
 }
 
 func (n *goFuseNode) Release(ctx context.Context, f gfs.FileHandle) syscall.Errno {
+	n.io.release()
+	// go-fuse calls the node's Release, never the handle's (NodeReleaser
+	// wins in rawBridge.Release), so a passthrough handle's fd was only
+	// ever closed by the GC finalizer.
+	if h, ok := f.(*goFusePassthroughHandle); ok {
+		h.Release(ctx)
+	}
 	n.clearReadCache()
 	n.mu.Lock()
 	defer n.mu.Unlock()
