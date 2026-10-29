@@ -1,0 +1,70 @@
+name: rust
+
+# The Rust store-front (rust/store): format, lint, test, and dependency
+# policy, on the toolchain pinned in rust/store/rust-toolchain.toml.
+#
+# The interop tests build tools/readbench with Go and run store-front in
+# front of the real Go API handlers, so Go is set up too.
+
+on:
+  push:
+    branches: [main]
+    paths: ["rust/**", "tools/readbench/**", "internal/api/**", "internal/cache/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["rust/**", "tools/readbench/**", "internal/api/**", "internal/cache/**", ".github/workflows/rust.yml"]
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust/store
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust/store/rust-toolchain.toml (channel + components)
+      # on the first cargo call in that directory.
+      - name: Toolchain
+        run: rustup show active-toolchain
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/store/target
+          key: rust-store-${{ runner.os }}-${{ hashFiles('rust/store/Cargo.lock', 'rust/store/rust-toolchain.toml') }}
+          restore-keys: rust-store-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/store/Cargo.toml
+          command: check advisories bans licenses sources
