@@ -352,3 +352,58 @@ func TestVerifiedBlobRepublishesSizedRow(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Chunk completion of an OCI blob hashes while it assembles: a good set
+// becomes a verified whole blob (servable at once), a set with a bad chunk
+// is never committed and its chunks are quarantined.
+func TestChunkCompletionVerifiesBlob(t *testing.T) {
+	for _, bad := range []bool{false, true} {
+		cm, dir := newVerifyCM(t)
+		ctx := context.Background()
+		data, d := blobOf(3<<20+77, map[bool]byte{false: 13, true: 14}[bad])
+		fp := ociBlobPrefix + d
+		cs := int64(1 << 20)
+		n := (int64(len(data)) + cs - 1) / cs
+		cm.mu.Lock()
+		cm.entries.put(&CacheEntry{FilePath: fp, Size: int64(len(data)), IsChunked: true, NumChunks: n, ChunkSize: cs})
+		cm.mu.Unlock()
+		for i := int64(0); i < n; i++ {
+			chunk := append([]byte(nil), data[i*cs:min((i+1)*cs, int64(len(data)))]...)
+			if bad && i == 2 {
+				chunk[5] ^= 0x55
+			}
+			cp := fmt.Sprintf("%s_chunk_%d", fp, i)
+			if err := cm.nvmeStorage.Write(ctx, cp, chunk); err != nil {
+				t.Fatal(err)
+			}
+			cm.mu.Lock()
+			cm.entries.put(&CacheEntry{FilePath: cp, Size: int64(len(chunk)), Tier: TierNVMe})
+			cm.mu.Unlock()
+		}
+		err := cm.runChunkCompletion(ctx, fp, n, int64(len(data)))
+		full := filepath.Join(dir, strings.TrimPrefix(fp, "/"))
+		if !bad {
+			if err != nil {
+				t.Fatalf("good set: %v", err)
+			}
+			if _, ok := cm.LocalFilePath(ctx, fp); !ok {
+				t.Fatal("assembled good blob not servable at once")
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("bad set assembled without error")
+		}
+		if _, err := os.Stat(full); !os.IsNotExist(err) {
+			t.Fatal("bad set committed as a whole blob")
+		}
+		if m, _ := filepath.Glob(filepath.Join(dir, "oci", "sha256", d+"_chunk_*")); len(m) != int(n) {
+			t.Fatalf("expected %d chunk files kept aside, found %v", n, m)
+		}
+		for _, p := range func() []string { m, _ := filepath.Glob(filepath.Join(dir, "oci", "sha256", d+"_chunk_*")); return m }() {
+			if !strings.Contains(p, ".corrupt-") {
+				t.Fatalf("chunk %s still servable", p)
+			}
+		}
+	}
+}
