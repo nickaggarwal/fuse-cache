@@ -829,9 +829,16 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 	// Remote read strategy:
 	// - always peer first, then cloud fallback.
 	// Cloud reads take the cross-node single-flight lease (Phase 2).
+	// Whole-file reads (config, tokenizer, index files) take the same
+	// jittered busy retry as chunk reads: under a burst every holder can be
+	// at its serve gate for a moment, and a single busy answer here became
+	// an EIO on open (tokenizer.json, 8 pods starting on cpu-w3) although
+	// the bytes were on two holders.
+	var lastErr error
 	for _, tier := range cm.remoteReadOrder(filePath) {
 		tierStart := time.Now()
-		if entry, servedTier, err := cm.getFromRemoteTier(ctx, filePath, tier); err == nil {
+		entry, servedTier, err := cm.getFromRemoteTierWithBusyRetry(ctx, filePath, tier)
+		if err == nil {
 			cm.touchEntries(filePath)
 			cm.metrics.RecordHit(servedTier)
 			cm.metrics.RecordTierRead(servedTier, int64(len(entry.Data)), time.Since(tierStart))
@@ -839,9 +846,13 @@ func (cm *DefaultCacheManager) Get(ctx context.Context, filePath string) (*Cache
 			cm.goBackground(func() { cm.promoteToNVMe(context.Background(), e) })
 			return entry, nil
 		}
+		lastErr = err
 		cm.metrics.RecordMiss(tier)
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("file not found in any tier: %w", lastErr)
+	}
 	return nil, errors.New("file not found in any tier")
 }
 

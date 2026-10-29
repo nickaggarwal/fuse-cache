@@ -295,6 +295,7 @@ func (n *goFuseNode) Readdir(ctx context.Context) (gfs.DirStream, syscall.Errno)
 	if ml, ok := n.gfs.cacheManager.(metadataLookup); ok {
 		children, err := ml.ReadDir(ctx, n.path)
 		if err != nil {
+			n.gfs.logger.Printf("Readdir error path=%s: %v", n.path, err)
 			return nil, syscall.EIO
 		}
 		dirents := make([]gfuse.DirEntry, 0, len(children))
@@ -314,6 +315,7 @@ func (n *goFuseNode) Readdir(ctx context.Context) (gfs.DirStream, syscall.Errno)
 
 	entries, err := n.gfs.cacheManager.List(ctx)
 	if err != nil {
+		n.gfs.logger.Printf("Readdir list error path=%s: %v", n.path, err)
 		return nil, syscall.EIO
 	}
 
@@ -638,6 +640,10 @@ func (n *goFuseNode) Read(ctx context.Context, f gfs.FileHandle, dest []byte, of
 
 	entry, err := n.gfs.cacheManager.Get(ctx, n.path)
 	if err != nil {
+		// Logged: an EIO the application sees with no daemon-side line
+		// cannot be traced (a tokenizer.json open failed this way under an
+		// 8-pod burst on cpu-w3 with nothing in the client log).
+		n.gfs.logger.Printf("Read error path=%s off=%d size=%d: %v", n.path, off, len(dest), err)
 		return nil, syscall.EIO
 	}
 	if off >= int64(len(entry.Data)) {
