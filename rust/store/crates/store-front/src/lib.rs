@@ -6,3 +6,4 @@ pub mod http;
 pub mod log;
 pub mod metrics;
 pub mod server;
+pub mod write;

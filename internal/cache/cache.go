@@ -1585,6 +1585,9 @@ func (cm *DefaultCacheManager) PutFromReader(ctx context.Context, filePath strin
 	return nil
 }
 
+// NVMeDir is the local cache directory staged files and objects live in.
+func (cm *DefaultCacheManager) NVMeDir() string { return cm.config.NVMePath }
+
 // CreateWriteFile creates a staged local file on the NVMe volume so final
 // commit can use a local rename instead of a full reread/copy.
 func (cm *DefaultCacheManager) CreateWriteFile(ctx context.Context, filePath string) (*os.File, string, error) {

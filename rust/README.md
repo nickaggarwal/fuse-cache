@@ -4,23 +4,25 @@ The fuse-client is a Go program. Rust appears in one place:
 
 | path | what | status |
 |---|---|---|
-| [`rust/store`](store/) | **store-front**: a Rust HTTP server that runs as a second container in the store pod, owns the public port, serves `/api/peer/read` and the OCI blob routes from the cache dir with `sendfile`, and forwards everything else to the Go client. Also **burst**, a load generator for store nodes. | built, tested and pushed by CI (`rust.yml`, `images.yml`) |
+| [`rust/store`](store/) | **store-front**: a Rust HTTP server that runs as a second container in the store pod, owns the public port, serves `/api/peer/read` and the OCI blob routes from the cache dir with `sendfile`, stages and hashes PUT bodies for Go to commit, and forwards everything else to the Go client. Also **burst**, a load generator for store nodes. | built, tested and pushed by CI (`rust.yml`, `images.yml`) |
 
 ## Who owns what
 
-**Go owns the system.** Everything that changes state or talks to other
-components stays in the Go client: writes and their digest checks, the
-cache index, eviction and accounting, coordinator registration and
-location publishing, chunk fills and promotion, peer and cloud fallback,
-warm intents, CSI, node-init, metrics on `/metrics`.
+**Go owns every decision.** Everything that changes state or talks to
+other components stays in the Go client: the cache index, eviction and
+accounting, whether a write is accepted, coordinator registration and
+location publishing, the cloud copy, chunk fills and promotion, peer and
+cloud fallback, warm intents, CSI, node-init, metrics on `/metrics`.
 
-**store-front owns only the read fast path on store nodes**, and only for
-bytes that are already on local disk at a size it can confirm. It holds no
-state of its own beyond short caches (published chunk strides, blob sizes
-from Go's index). If it cannot answer a request exactly as Go would, it
-forwards the request to Go unchanged, so behaviour is Go's by construction
-and the differential test (`rust/store/crates/store-front/tests/interop.rs`)
-checks it request by request.
+**store-front moves bytes on store nodes.** Reads: bytes already on local
+disk at a size it can confirm, sent with `sendfile`. Writes: a PUT body
+streamed to a staged file and hashed, then handed to Go
+(`POST /api/internal/commit`), which re-checks it and adopts it or refuses
+it. It holds no state of its own beyond short caches (published chunk
+strides, blob sizes from Go's index). If it cannot handle a request exactly
+as Go would, it forwards it unchanged; the differential tests
+(`rust/store/crates/store-front/tests/`) check reads and writes request by
+request.
 
 Removing store-front means deleting the front container and the client's
 `-port=8091 -advertise-port=8081` args; nothing in Go depends on it.

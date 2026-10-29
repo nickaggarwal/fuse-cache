@@ -12,10 +12,12 @@ pub enum Route {
     RegistryPing,
     Proxy,
     Own,
+    /// Native PUT (`PUT /api/files/<path>`), staged here and committed by Go.
+    Put,
 }
 
 impl Route {
-    const ALL: [Route; 5] = [Route::PeerRead, Route::Blob, Route::RegistryPing, Route::Proxy, Route::Own];
+    const ALL: [Route; 6] = [Route::PeerRead, Route::Blob, Route::RegistryPing, Route::Proxy, Route::Own, Route::Put];
     fn name(self) -> &'static str {
         match self {
             Route::PeerRead => "peer_read",
@@ -23,6 +25,7 @@ impl Route {
             Route::RegistryPing => "registry_ping",
             Route::Proxy => "proxy",
             Route::Own => "front",
+            Route::Put => "put",
         }
     }
 }
@@ -40,10 +43,13 @@ pub enum Outcome {
     Rejected,
     /// I/O or backend failure (502, broken connection).
     Error,
+    /// The client went away mid-response (a requester that cancelled a
+    /// hedged or raced read) or mid-upload: not a server fault.
+    Aborted,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 5] = [Outcome::Local, Outcome::Forwarded, Outcome::Busy, Outcome::Rejected, Outcome::Error];
+    const ALL: [Outcome; 6] = [Outcome::Local, Outcome::Forwarded, Outcome::Busy, Outcome::Rejected, Outcome::Error, Outcome::Aborted];
     fn name(self) -> &'static str {
         match self {
             Outcome::Local => "local",
@@ -51,6 +57,7 @@ impl Outcome {
             Outcome::Busy => "busy",
             Outcome::Rejected => "rejected",
             Outcome::Error => "error",
+            Outcome::Aborted => "aborted",
         }
     }
 }
@@ -65,9 +72,9 @@ struct Histogram {
 }
 
 pub struct Metrics {
-    requests: [[AtomicU64; 5]; 5],
-    bytes: [[AtomicU64; 5]; 5],
-    latency: [Histogram; 5],
+    requests: [[AtomicU64; 6]; 6],
+    bytes: [[AtomicU64; 6]; 6],
+    latency: [Histogram; 6],
     pub inflight: AtomicI64,
     pub native_inflight: AtomicI64,
     pub connections: AtomicI64,
@@ -118,7 +125,7 @@ impl Metrics {
                 let _ = writeln!(o, "fuse_front_requests_total{{route=\"{}\",outcome=\"{}\"}} {}", r.name(), oc.name(), self.count(r, oc));
             }
         }
-        o.push_str("# HELP fuse_front_response_bytes_total Response body bytes sent, by route and outcome.\n# TYPE fuse_front_response_bytes_total counter\n");
+        o.push_str("# HELP fuse_front_response_bytes_total Body bytes moved (sent for reads, received for PUTs), by route and outcome.\n# TYPE fuse_front_response_bytes_total counter\n");
         for r in Route::ALL {
             for oc in Outcome::ALL {
                 let _ = writeln!(

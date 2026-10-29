@@ -342,9 +342,10 @@ pub fn send_more(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     s.write_all(data)
 }
 
-/// `[off, off+len)` of `f` to the socket, zero-copy on Linux.
+/// `[off, off+len)` of `f` to the socket, zero-copy on Linux. On error,
+/// also the bytes already sent.
 #[cfg(target_os = "linux")]
-pub fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
+pub fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> Result<(), (io::Error, u64)> {
     use std::os::fd::AsRawFd;
     let mut o = off as libc::off_t;
     let end = (off + len) as libc::off_t;
@@ -356,27 +357,27 @@ pub fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Resu
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(e);
+            return Err((e, (o as u64) - off));
         }
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank during sendfile"));
+            return Err((io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank during sendfile"), (o as u64) - off));
         }
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> io::Result<()> {
+pub fn sendfile_all(s: &mut TcpStream, f: &File, off: u64, len: u64) -> Result<(), (io::Error, u64)> {
     use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; COPY_BUF];
     let (mut o, end) = (off, off + len);
     while o < end {
         let want = ((end - o) as usize).min(buf.len());
-        let n = f.read_at(&mut buf[..want], o)?;
+        let n = f.read_at(&mut buf[..want], o).map_err(|e| (e, o - off))?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank"));
+            return Err((io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank"), o - off));
         }
-        s.write_all(&buf[..n])?;
+        s.write_all(&buf[..n]).map_err(|e| (e, o - off))?;
         o += n as u64;
     }
     Ok(())

@@ -44,6 +44,13 @@ struct Args {
     /// -peer-serve-max-inflight).
     #[arg(long, default_value_t = 64)]
     max_inflight: usize,
+    /// Go's -max-upload-gb: native PUTs up to this size; larger ones are
+    /// forwarded so Go answers 413.
+    #[arg(long, default_value_t = 2)]
+    max_upload_gb: u64,
+    /// Forward every PUT to Go instead of staging it here.
+    #[arg(long)]
+    no_native_put: bool,
     /// Seconds to finish in-flight requests after SIGTERM/SIGINT.
     #[arg(long, default_value_t = 30)]
     drain_sec: u64,
@@ -96,6 +103,8 @@ fn main() -> anyhow_lite::Result<()> {
     cfg.coordinator = a.coordinator.clone();
     cfg.api_key = a.api_key.clone().filter(|k| !k.is_empty());
     cfg.max_inflight = a.max_inflight;
+    cfg.max_upload = a.max_upload_gb << 30;
+    cfg.native_put = !a.no_native_put;
     let srv = Server::new(cfg);
 
     unsafe {

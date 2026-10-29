@@ -1,15 +1,18 @@
 # store-front
 
-A Rust server that owns a **store node's** public HTTP port, serves the two
-hot read paths straight from the shared cache directory, and forwards
-everything else to the Go fuse-client running beside it.
+A Rust server that owns a **store node's** public HTTP port. It moves the
+bytes (the two hot read paths out of the shared cache directory, and PUT
+bodies into it) and leaves every decision to the Go fuse-client running
+beside it.
 
 ```
              :8081 (registered with the coordinator)
 peers / nydusd ──────────────► store-front ──── native: /api/peer/read,
                                     │                  /v2/<repo>/blobs/<d>,
-                                    │                  /oci/blobs/<d>, /v2/
-                                    │  everything else, and every native
+                                    │                  /oci/blobs/<d>, /v2/,
+                                    │                  PUT /api/files/* (stage + hash)
+                                    │  commit of each staged PUT, everything
+                                    │  else, and every native
                                     │  request that is not an exact local hit
                                     ▼
                        Go client 127.0.0.1:8091 ── writes, coordinator,
@@ -25,13 +28,15 @@ peers / nydusd ──────────────► store-front ──�
 | `GET/HEAD /v2/<repo>/blobs/<digest>`, `/oci/blobs/<digest>` | Blob held whole at `/oci/sha256/<hex>` with **exactly** the size Go's index reports (asked with a `HEAD` to Go, cached 30 s): HEAD, single `Range` (206, capped at 64 MiB), or whole blob (200). |
 | `GET/HEAD /v2/` | 200 with `Docker-Distribution-API-Version: registry/2.0`. |
 | anything native that is not an exact local hit (miss, chunk stride not confirmed, short or different-size file, a request Go would refuse: 400, 404, 416) | forwarded unchanged, so the answer is Go's own (`/v2` miss 503, `/oci` miss 404, failed fetch 502, ...). |
-| everything else (`PUT/GET/HEAD/DELETE /api/files/*`, `/api/cache/*`, `/api/health`, `/metrics`, `/api/peers*`, ...) | forwarded unchanged: request head byte for byte (every header, `X-API-Key` included), bodies streamed both ways as framed, `Expect: 100-continue` end to end, one 256 KiB copy buffer per connection. A multi-GB PUT streams; it is never buffered. |
+| `PUT /api/files/<path>` with a `Content-Length` up to `--max-upload-gb` and a clean path | **Native write**: the body streams to `<path>.stage-front-<pid>-<n>` beside the final file (one 1 MiB buffer, `fsync` before commit) and is hashed (SHA-256) on the way. A blob path whose hash does not match its digest: **400**, as Go. Then `POST /api/internal/commit` to Go (loopback only), which re-checks size, digest and path, renames the file into place, indexes it, publishes it and starts the cloud copy. Go's refusal is relayed; Go down: **502**. Every failure removes the staged file. Chunked bodies, `Expect: 100-continue`, larger uploads and paths that are not already clean go to Go unchanged. `--no-native-put` sends every PUT to Go. |
+| everything else (`GET/HEAD/DELETE /api/files/*`, `/api/cache/*`, `/api/health`, `/metrics`, `/api/peers*`, ...) | forwarded unchanged: request head byte for byte (every header, `X-API-Key` included), bodies streamed both ways as framed, `Expect: 100-continue` end to end, one 256 KiB copy buffer per connection. A multi-GB PUT streams; it is never buffered. |
 | `/rust/healthz` | liveness: 200 while the process serves. |
 | `/rust/readyz` | readiness: 200 when Go's `/api/health` is 200 and the cache dir is readable, else 503 with the reason. |
 | `/rust/metrics` | Prometheus, `fuse_front_*` (below). |
 
-Writes, digest checks on blob PUTs, coordinator registration, chunk fills,
-peer and cloud fallback, eviction and everything else stay in Go.
+Every decision stays in Go: whether a staged write is accepted, the index,
+eviction and accounting, coordinator registration and publishing, the
+cloud copy, chunk fills, peer and cloud fallback.
 
 **Never a partial file.** A local file is served only when its size is
 known to be right: the Go index's size for blobs, the published size for
@@ -117,7 +122,7 @@ terminationGracePeriodSeconds: 45                  # > --drain-sec
 
 | series | |
 |---|---|
-| `fuse_front_requests_total{route,outcome}` | route: `peer_read`, `blob`, `registry_ping`, `proxy`, `front`; outcome: `local`, `forwarded`, `busy`, `rejected`, `error` |
+| `fuse_front_requests_total{route,outcome}` | route: `peer_read`, `blob`, `registry_ping`, `put`, `proxy`, `front`; outcome: `local`, `forwarded`, `busy`, `rejected`, `error`, `aborted` (the client hung up mid-response or mid-upload: a requester that raced several holders and cancelled this one; not a server fault) |
 | `fuse_front_response_bytes_total{route,outcome}` | response body bytes |
 | `fuse_front_request_duration_seconds{route}` | histogram, head-in to last byte out |
 | `fuse_front_inflight_requests`, `fuse_front_native_inflight`, `fuse_front_open_connections` | gauges |

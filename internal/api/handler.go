@@ -169,6 +169,8 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	// endpoint is unreachable.
 	router.HandleFunc("/api/files/{path:.*}/size", h.handleFileSize).Methods("GET")
 	router.HandleFunc("/api/files/{path:.*}", h.handleFile).Methods("GET", "PUT", "DELETE", "HEAD")
+	// A front server in the same pod adopting a PUT it staged (commit.go).
+	router.HandleFunc("/api/internal/commit", h.handleInternalCommit).Methods("POST")
 
 	// OCI blobs by digest, for nydusd's http-proxy backend (oci_blob.go).
 	router.HandleFunc("/oci/blobs/{digest}", h.handleOCIBlob).Methods("GET", "HEAD")

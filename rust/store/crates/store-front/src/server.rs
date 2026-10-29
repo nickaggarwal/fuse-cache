@@ -6,7 +6,10 @@
 //! * `GET /api/peer/read?path=<p>[&off=&len=]` — Go's `handlePeerRead`;
 //! * `GET|HEAD /v2/<repo>/blobs/<digest>`, `GET|HEAD /oci/blobs/<digest>` —
 //!   Go's `serveOCIBlob`, for a blob held whole at `/oci/sha256/<hex>`;
-//! * `GET|HEAD /v2/` — Go's registry ping.
+//! * `GET|HEAD /v2/` — Go's registry ping;
+//! * `PUT /api/files/<path>` — streamed to a staged file beside the final
+//!   path and hashed here; Go adopts it (`POST /api/internal/commit`), so Go
+//!   still owns the index, coordinator rows and cloud copy (`write.rs`).
 //!
 //! Anything native that cannot be answered from an exact local file is
 //! forwarded unchanged to Go (which knows its index, peers and cloud), as is
@@ -27,6 +30,7 @@
 use crate::flog;
 use crate::http::{self, Conn, RequestHead};
 use crate::metrics::{Metrics, Outcome, Route};
+use crate::write;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -51,6 +55,11 @@ pub struct Config {
     pub backend_timeout: Duration,
     /// How long published-stride and blob-size lookups are cached.
     pub stride_ttl: Duration,
+    /// Handle `PUT /api/files/<path>` natively (stage + Go commit). Off:
+    /// every PUT is forwarded to Go.
+    pub native_put: bool,
+    /// Go's `-max-upload-gb`, in bytes: larger PUTs go to Go for its 413.
+    pub max_upload: u64,
 }
 
 impl Config {
@@ -64,6 +73,8 @@ impl Config {
             idle_timeout: Duration::from_secs(120),
             backend_timeout: Duration::from_secs(300),
             stride_ttl: Duration::from_secs(30),
+            native_put: true,
+            max_upload: 2 << 30,
         }
     }
 }
@@ -86,6 +97,7 @@ pub enum Plan {
     Healthz,
     Readyz,
     Metrics,
+    Put { path: String },
     Proxy,
 }
 
@@ -99,6 +111,13 @@ pub fn route(method: &str, path: &str) -> Plan {
         "/api/peer/read" if method == "GET" => return Plan::PeerRead,
         "/v2/" if get_head => return Plan::RegistryPing,
         _ => {}
+    }
+    if method == "PUT" {
+        if let Some(p) = path.strip_prefix("/api/files/") {
+            // `/api/files/<p>/size` is GET-only in Go; a PUT to it is a file
+            // named "size" under <p>, as Go's router resolves it.
+            return Plan::Put { path: p.to_string() };
+        }
     }
     if get_head {
         if let Some(d) = path.strip_prefix("/oci/blobs/") {
@@ -297,6 +316,7 @@ impl Server {
                 let digest = digest.clone();
                 self.native(c, head, req, backend, Route::Blob, t0, move |me| me.plan_blob(req, &digest))
             }
+            Plan::Put { ref path } => self.put(c, head, req, backend, path, t0),
             Plan::Proxy => {
                 let (keep, n, ok) = self.forward(c, head, req, backend)?;
                 self.metrics.record(Route::Proxy, if ok { Outcome::Forwarded } else { Outcome::Error }, n, t0.elapsed());
@@ -349,8 +369,14 @@ impl Server {
                 }
                 http::send_more(&mut c.stream, h.as_bytes())?;
                 let r = http::sendfile_all(&mut c.stream, &file, off, len);
-                self.metrics.record(route, if r.is_ok() { Outcome::Local } else { Outcome::Error }, len, t0.elapsed());
-                r?;
+                match &r {
+                    Ok(()) => self.metrics.record(route, Outcome::Local, len, t0.elapsed()),
+                    // A requester that raced several holders and cancelled
+                    // this one: its hang-up is not a serve failure.
+                    Err((e, sent)) if client_gone(e) => self.metrics.record(route, Outcome::Aborted, *sent, t0.elapsed()),
+                    Err((_, sent)) => self.metrics.record(route, Outcome::Error, *sent, t0.elapsed()),
+                }
+                r.map_err(|(e, _)| e)?;
                 Ok(true)
             }
             None => {
@@ -453,6 +479,56 @@ impl Server {
             Ok((200, _)) => (true, "ok".into()),
             Ok((code, _)) => (false, format!("backend /api/health returned {code}")),
             Err(e) => (false, format!("backend unreachable: {e}")),
+        }
+    }
+
+    /// `PUT /api/files/<path>`: native when exactly framed and under the
+    /// cap, else Go's.
+    fn put(&self, c: &mut Conn, head: &[u8], req: &RequestHead, backend: &mut Option<Conn>, raw: &str, t0: Instant) -> io::Result<bool> {
+        let len = if self.cfg.native_put { write::native_put(req, self.cfg.max_upload) } else { None };
+        let staged = len.and_then(|_| write::staged_for(&self.cfg.cache_dir, raw));
+        let (Some(len), Some(st)) = (len, staged) else {
+            let (keep, n, ok) = self.forward(c, head, req, backend)?;
+            self.metrics.record(Route::Put, if ok { Outcome::Forwarded } else { Outcome::Error }, n, t0.elapsed());
+            return Ok(keep);
+        };
+        match write::put(c, &st, len, &self.cfg.backend, self.cfg.api_key.as_deref(), self.cfg.backend_timeout) {
+            Ok(n) => {
+                // Go's own success answer: 200, empty body.
+                let h = format!("HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Length: 0\r\n\r\n", http::http_date());
+                c.stream.write_all(h.as_bytes())?;
+                self.metrics.record(Route::Put, Outcome::Local, n, t0.elapsed());
+                flog!("stored {} ({n} bytes)", st.file_path);
+                Ok(true)
+            }
+            Err(write::PutError::Client(e)) => {
+                // Body never fully arrived: no answer, connection done.
+                self.metrics.record(Route::Put, Outcome::Aborted, 0, t0.elapsed());
+                flog!("PUT {}: client body: {e}", st.file_path);
+                Ok(false)
+            }
+            Err(write::PutError::DigestMismatch(got)) => {
+                flog!("rejected OCI blob {}: content hashes to {got}", st.file_path);
+                http::write_error(&mut c.stream, 400, "content does not match the blob digest", &[], false)?;
+                self.metrics.record(Route::Put, Outcome::Rejected, 0, t0.elapsed());
+                Ok(true)
+            }
+            Err(write::PutError::Stage(e)) => {
+                flog!("PUT {}: staging: {e}", st.file_path);
+                http::write_error(&mut c.stream, 500, "Failed to create staging file", &[], true)?;
+                self.metrics.record(Route::Put, Outcome::Error, 0, t0.elapsed());
+                Ok(false)
+            }
+            Err(write::PutError::Commit(code, msg)) => {
+                flog!("PUT {}: commit {code}: {msg}", st.file_path);
+                if code == 502 {
+                    self.metrics.backend_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                let msg = if msg.is_empty() { "Failed to store file".to_string() } else { msg };
+                http::write_error(&mut c.stream, code, &msg, &[], false)?;
+                self.metrics.record(Route::Put, if code >= 500 { Outcome::Error } else { Outcome::Rejected }, 0, t0.elapsed());
+                Ok(true)
+            }
         }
     }
 
@@ -602,6 +678,10 @@ impl Server {
     }
 }
 
+fn client_gone(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+}
+
 /// `GET /api/files/location?path=` on the coordinator; the chunked row's
 /// shape (Go `publishedChunkSize` uses the same rows).
 fn fetch_published(coord: &str, path: &str) -> Option<layout::Published> {
@@ -643,7 +723,10 @@ mod tests {
         for p in ["/api/health", "/metrics", "/api/files/a/b", "/api/cache/stats", "/api/peers", "/"] {
             assert_eq!(route("GET", p), Plan::Proxy, "{p}");
         }
-        assert_eq!(route("PUT", "/api/files/oci/sha256/x"), Plan::Proxy);
+        assert_eq!(route("PUT", "/api/files/oci/sha256/x"), Plan::Put { path: "oci/sha256/x".into() });
+        assert_eq!(route("PUT", "/api/files/models/m/r1/w.bin"), Plan::Put { path: "models/m/r1/w.bin".into() });
+        assert_eq!(route("POST", "/api/files/a"), Plan::Proxy);
+        assert_eq!(route("DELETE", "/api/files/a"), Plan::Proxy);
     }
 
     #[test]
