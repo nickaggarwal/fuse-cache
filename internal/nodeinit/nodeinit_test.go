@@ -171,6 +171,27 @@ func TestCacheBudget(t *testing.T) {
 	}
 }
 
+// BudgetForDir: 80% of the directory's free space (the client's default
+// cache budget when node-init did not run), creating the directory first;
+// not ok when the filesystem cannot be read.
+func TestBudgetForDir(t *testing.T) {
+	orig := statfsFunc
+	defer func() { statfsFunc = orig }()
+	dir := filepath.Join(t.TempDir(), "cache", "nvme")
+	statfsFunc = func(p string) (int64, int64, error) { return 1000 << 30, 960 << 30, nil }
+	got, ok := BudgetForDir(dir)
+	if !ok || got != int64(float64(960<<30)*0.8) {
+		t.Fatalf("BudgetForDir = %d, %v; want 80%% of 960 GiB", got, ok)
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("cache dir not created: %v", err)
+	}
+	statfsFunc = func(p string) (int64, int64, error) { return 0, 0, os.ErrPermission }
+	if _, ok := BudgetForDir(dir); ok {
+		t.Fatal("BudgetForDir ok when statfs fails")
+	}
+}
+
 func TestConfigRoundTripAndValidation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "node-init.json")
