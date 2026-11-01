@@ -37,7 +37,7 @@ import (
 func main() {
 	var (
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
-		fuseBackendName = flag.String("fuse-backend", "bazil", "FUSE backend: bazil or gofuse")
+		fuseBackendName = flag.String("fuse-backend", "gofuse", "FUSE backend: gofuse (default; kernel passthrough with FUSE_GOFUSE_ENABLE_PASSTHROUGH) or bazil")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
 		nodeInitConfig  = flag.String("node-init-config", "", "Path to a node-init config file; when set and readable, its discovered cache dir and byte budget override -nvme/-nvme-max-gb")
 		nodeInitWaitSec = flag.Int("node-init-wait-sec", 30, "How long to wait for the node-init config file to appear before falling back to -nvme")
@@ -81,7 +81,7 @@ func main() {
 		cloudKeyPrefix = flag.String("cloud-key-prefix", "", "Prefix every cloud object key with this cluster scope (empty = flat, legacy layout)")
 
 		// NVMe capacity
-		nvmeMaxGB            = flag.Int("nvme-max-gb", 10, "Maximum NVMe cache size in GB")
+		nvmeMaxGB            = flag.Int("nvme-max-gb", 0, "Maximum NVMe cache size in GB; 0 (default) sizes it from the -nvme filesystem like node-init (80% of free space), falling back to 10 GB when the filesystem cannot be read")
 		peerMaxGB            = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
 		peerReadMBps         = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
 		parallelReads        = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
@@ -184,7 +184,8 @@ func main() {
 	if v := os.Getenv("COORDINATOR_GRPC_ADDR"); v != "" {
 		*coordinatorGRPC = v
 	}
-	if v := os.Getenv("FUSE_BACKEND"); v != "" && *fuseBackendName == "bazil" {
+	// FUSE_BACKEND applies unless -fuse-backend was given explicitly.
+	if v := os.Getenv("FUSE_BACKEND"); v != "" && !flagSet("fuse-backend") {
 		*fuseBackendName = v
 	}
 
@@ -199,6 +200,19 @@ func main() {
 	// the best local disk, adopt its cache dir and byte budget so the same
 	// DaemonSet works on any cluster/cloud without per-node path tuning.
 	nvmeMaxBytes := int64(*nvmeMaxGB) * 1024 * 1024 * 1024
+	if *nvmeMaxGB <= 0 {
+		// No explicit budget: size it from the cache filesystem, as node-init
+		// does for a disk it discovers. A fixed 10 GB default was smaller than
+		// one 7B model (15 GB), so shards were evicted and re-fetched and never
+		// became whole local copies (no passthrough).
+		if b, ok := nodeinit.BudgetForDir(*nvmePath); ok {
+			nvmeMaxBytes = b
+			logger.Printf("NVMe budget: %.1f GiB (80%% of free space on %s)", float64(b)/(1<<30), *nvmePath)
+		} else {
+			nvmeMaxBytes = defaultNVMeMaxBytes
+			logger.Printf("NVMe budget: %.1f GiB (default; could not measure %s)", float64(nvmeMaxBytes)/(1<<30), *nvmePath)
+		}
+	}
 	if *nodeInitConfig != "" {
 		if niCfg := waitForNodeInitConfig(*nodeInitConfig, time.Duration(*nodeInitWaitSec)*time.Second, logger); niCfg != nil {
 			resolved := filepath.Join(*nodeInitRoot, niCfg.CacheDir)
@@ -1320,13 +1334,28 @@ func intervalState(d time.Duration) string {
 func normalizeFuseBackend(value string) string {
 	v := strings.ToLower(strings.TrimSpace(value))
 	switch v {
-	case "", "bazil":
+	case "bazil":
 		return "bazil"
-	case "gofuse", "go-fuse", "go_fuse":
+	case "", "gofuse", "go-fuse", "go_fuse":
 		return "gofuse"
 	default:
 		return v
 	}
+}
+
+// defaultNVMeMaxBytes is the cache budget when -nvme-max-gb is 0 and the
+// cache filesystem cannot be measured.
+const defaultNVMeMaxBytes = 10 << 30
+
+// flagSet reports whether a flag was given on the command line.
+func flagSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 // blobScrubInterval maps -blob-scrub-hours to CacheConfig.BlobScrubInterval

@@ -264,3 +264,19 @@ func ReadConfig(path string) (*Config, error) {
 	}
 	return &cfg, nil
 }
+
+// BudgetForDir is the cache budget for a directory node-init did not
+// discover: the same fraction of the filesystem's free space that discovery
+// gives a winning disk (DefaultOptions().CacheFraction). The directory is
+// created if missing so its filesystem can be measured. ok is false when the
+// filesystem cannot be read (non-Linux, or statfs failed).
+func BudgetForDir(dir string) (budget int64, ok bool) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, false
+	}
+	_, free, err := statfsFunc(dir)
+	if err != nil || free <= 0 {
+		return 0, false
+	}
+	return cacheBudget(free, DefaultOptions()), true
+}

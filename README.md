@@ -618,13 +618,13 @@ gRPC ports and peering that the examples below omit.
 |---|---|---|
 | `-mount` | `/tmp/fuse-client` | FUSE mount point |
 | `-nvme` | `/tmp/nvme-cache` | NVMe cache directory |
-| `-fuse-backend` | `bazil` | `bazil` or `gofuse`; the chart deploys `gofuse` |
+| `-fuse-backend` | `gofuse` | `gofuse` (kernel passthrough with `FUSE_GOFUSE_ENABLE_PASSTHROUGH=1`, Linux 6.9+) or `bazil` |
 | `-coordinator-grpc` | `localhost:9080` | Default transport |
 | `-coordinator` | `localhost:8080` | HTTP fallback |
 | `-port` / `-grpc-port` | `8081` / `9081` | Peer API |
 | `-peer-id` | auto | |
 | `-cloud-provider` | `s3` | `s3`, `azure`, or `gcp` |
-| `-nvme-max-gb` | `10` | Cache capacity |
+| `-nvme-max-gb` | `0` | Cache capacity; `0` sizes it from the `-nvme` filesystem (80% of free space, as node-init does), or 10 GB if it cannot be read. node-init's budget and `FUSE_NVME_MAX_GB` override it |
 | `-chunk-size` | `8` | MB |
 | `-peer-labels` | | `pool=gpu,zone=a`, for warm targeting |
 | `-enable-agent-server` | `true` | CSI agent gRPC server |
