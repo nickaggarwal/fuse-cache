@@ -433,7 +433,10 @@ type DefaultCacheManager struct {
 	chunkCompletion chunkCompletionState
 	// evictSignal wakes the watermark evictor between its periodic sweeps.
 	// Depth 1, non-blocking send: a pending wake already covers a burst.
-	evictSignal    chan struct{}
+	evictSignal chan struct{}
+	// evictRetract queues evicted paths whose "nvme" location row this node
+	// still advertises (evict_retract.go).
+	evictRetract   evictRetractor
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	// bgWg tracks one-shot background work (cloud persist, promote-after-read,
@@ -722,6 +725,10 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// foreground writes (almost) never pay the eviction scan, and reacts to
 	// real device fullness (shared host disk), not just our own accounting.
 	cm.startWatermarkEvictor()
+
+	// Retract this node's location rows for files eviction removed, so
+	// "holder" in coordinator metadata means "holds now".
+	cm.startEvictRetractor()
 
 	// Background GC for hybridHints — prevents unbounded growth.
 	gcInterval := config.MetadataRefreshTTL * 10
@@ -2168,6 +2175,7 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				continue
 			}
 			cm.metrics.RecordEviction()
+			cm.queueEvictRetraction(ref.key)
 			cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 		}
 	}
@@ -4332,8 +4340,13 @@ type CacheMetrics struct {
 	ChunkCompletionSkipped   atomic.Int64
 	// Eviction durability guard + watermark evictor.
 	EvictionSkippedUnpersisted atomic.Int64
-	WatermarkEvictorRuns       atomic.Int64
-	WatermarkEvictedBytes      atomic.Int64
+	// Location-row retraction after eviction (evict_retract.go).
+	EvictRetracted              atomic.Int64
+	EvictRetractFailed          atomic.Int64
+	EvictRetractSkippedRelanded atomic.Int64
+	EvictRetractDropped         atomic.Int64
+	WatermarkEvictorRuns        atomic.Int64
+	WatermarkEvictedBytes       atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics

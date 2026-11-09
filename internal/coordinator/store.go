@@ -34,6 +34,9 @@ type Store interface {
 	// a single node evicting its copy while the file lives on elsewhere.
 	// Deleting rows that do not exist is not an error.
 	DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error
+	// DeletePeerTierLocation drops filePath's rows owned by peerID in one
+	// storage tier only (eviction retracts "nvme" and keeps "cloud").
+	DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error
 
 	Snapshot(ctx context.Context) (State, error)
 	Restore(ctx context.Context, state State) error
@@ -173,6 +176,27 @@ func (s *InMemoryStore) PutFileLocation(_ context.Context, loc *FileLocation) er
 	}
 	lc := *loc
 	s.fileLocations[loc.FilePath] = append(locs, &lc)
+	return nil
+}
+
+func (s *InMemoryStore) DeletePeerTierLocation(_ context.Context, filePath, peerID, tier string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	locs, ok := s.fileLocations[filePath]
+	if !ok {
+		return nil
+	}
+	kept := locs[:0]
+	for _, loc := range locs {
+		if loc.PeerID != peerID || loc.StorageTier != tier {
+			kept = append(kept, loc)
+		}
+	}
+	if len(kept) == 0 {
+		delete(s.fileLocations, filePath)
+		return nil
+	}
+	s.fileLocations[filePath] = kept
 	return nil
 }
 

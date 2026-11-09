@@ -996,6 +996,10 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	cmx := dcm.GetCacheMetrics()
 	fmt.Fprintf(w, "fuse_range_cache_file_evictions_total %d\n", cmx.RangeCacheFileEvictions.Load())
 	fmt.Fprintf(w, "fuse_range_cache_idle_expiries_total %d\n", cmx.RangeCacheIdleExpiries.Load())
+	fmt.Fprintf(w, "fuse_evict_retracted_total %d\n", cmx.EvictRetracted.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_failed_total %d\n", cmx.EvictRetractFailed.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_skipped_relanded_total %d\n", cmx.EvictRetractSkippedRelanded.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_dropped_total %d\n", cmx.EvictRetractDropped.Load())
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)

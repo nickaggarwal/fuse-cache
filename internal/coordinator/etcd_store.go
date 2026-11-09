@@ -309,6 +309,21 @@ func (s *EtcdStore) DeleteFileLocation(ctx context.Context, filePath, peerID str
 		return nil
 	}
 
+	return s.dropLocations(ctx, key, func(loc *FileLocation) bool { return loc.PeerID == peerID })
+}
+
+// DeletePeerTierLocation drops filePath's rows owned by peerID in one storage
+// tier, keeping its rows in other tiers (an evicted NVMe copy must not
+// retract the same peer's cloud-durability row).
+func (s *EtcdStore) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
+	return s.dropLocations(ctx, s.fileKey(filePath), func(loc *FileLocation) bool {
+		return loc.PeerID == peerID && loc.StorageTier == tier
+	})
+}
+
+// dropLocations removes the rows matching drop from one file key with a
+// compare-and-swap on its mod revision, deleting the key when no row is left.
+func (s *EtcdStore) dropLocations(ctx context.Context, key string, drop func(*FileLocation) bool) error {
 	for attempt := 0; attempt < maxFileLocationCASRetries; attempt++ {
 		resp, err := s.client.Get(ctx, key)
 		if err != nil {
@@ -326,7 +341,7 @@ func (s *EtcdStore) DeleteFileLocation(ctx context.Context, filePath, peerID str
 		}
 		kept := make([]*FileLocation, 0, len(locs))
 		for _, loc := range locs {
-			if loc.PeerID != peerID {
+			if !drop(loc) {
 				kept = append(kept, loc)
 			}
 		}

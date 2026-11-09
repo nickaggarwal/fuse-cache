@@ -709,6 +709,15 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 				return
 			}
 
+			if tier := r.URL.Query().Get("storage_tier"); tier != "" && !wholePath {
+				if err := coordinatorService.DeletePeerTierLocation(r.Context(), filePath, peerID, tier); err != nil {
+					http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"success": true}`))
+				return
+			}
 			if err := coordinatorService.DeleteFileLocation(r.Context(), filePath, peerID, wholePath); err != nil {
 				http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
 				return
