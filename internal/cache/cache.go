@@ -436,7 +436,10 @@ type DefaultCacheManager struct {
 	evictSignal chan struct{}
 	// evictRetract queues evicted paths whose "nvme" location row this node
 	// still advertises (evict_retract.go).
-	evictRetract   evictRetractor
+	evictRetract evictRetractor
+	// persisted remembers durable local files across restarts
+	// (persisted_ledger.go); nil when the NVMe dir is unset.
+	persisted      *persistedLedger
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	// bgWg tracks one-shot background work (cloud persist, promote-after-read,
@@ -765,6 +768,7 @@ func (cm *DefaultCacheManager) Shutdown() {
 	cm.shutdownCancel()
 	cm.loopWg.Wait()
 	cm.bgWg.Wait()
+	cm.persisted.close()
 }
 
 // goBackground tracks one-shot fn in bgWg so Shutdown can drain it. Work
@@ -2187,6 +2191,9 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if e, ok := cm.entries.get(filePath); ok && e != nil {
+		if !e.PersistedToCloud && e.Tier == TierNVMe && cm.persisted != nil {
+			cm.persisted.record(filePath, filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/")))
+		}
 		e.PersistedToCloud = true
 	}
 	parentPath, isChunk := parentFilePathFromChunkPath(filePath)
@@ -4343,6 +4350,9 @@ type CacheMetrics struct {
 	// ChunkCompletionEager counts assemblies triggered by the last chunk
 	// landing rather than by the range cache going idle.
 	ChunkCompletionEager atomic.Int64
+	// RehydratePersistedTrusted counts files rehydration marked durable from
+	// the persisted ledger (no cloud probe needed to evict them).
+	RehydratePersistedTrusted atomic.Int64
 	// Location-row retraction after eviction (evict_retract.go).
 	EvictRetracted              atomic.Int64
 	EvictRetractFailed          atomic.Int64

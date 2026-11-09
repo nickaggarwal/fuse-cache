@@ -64,7 +64,7 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 		}
 		if d.IsDir() {
 			// The durability journal is cache-internal state, not objects.
-			if d.Name() == durabilityDirName && filepath.Dir(path) == filepath.Clean(base) {
+			if (d.Name() == durabilityDirName || d.Name() == persistedLedgerDirName) && filepath.Dir(path) == filepath.Clean(base) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -99,12 +99,23 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 	// files in directory order.
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
 
-	adopted := 0
+	// The persisted ledger says which of these were already durable before
+	// the restart; a line is trusted only while the file's size and mtime
+	// still match it, and the ledger is compacted to exactly those lines.
+	ledger, seen := openPersistedLedger(filepath.Join(base, persistedLedgerDirName))
+	keep := map[string]ledgerKey{}
+
+	adopted, trusted := 0, 0
 	var bytes int64
 	cm.mu.Lock()
 	for _, f := range files {
 		if existing, ok := cm.entries.get(f.key); ok && existing != nil {
 			continue
+		}
+		persisted := trustedPersisted(seen, f.key, f.size, f.modTime)
+		if persisted {
+			keep[f.key] = ledgerKey{size: f.size, mtime: f.modTime.UnixNano()}
+			trusted++
 		}
 		cm.entries.put(&CacheEntry{
 			FilePath:    f.key,
@@ -114,17 +125,22 @@ func (cm *DefaultCacheManager) rehydrateNVMeAccounting() (int, int64) {
 			// LRU age instead of all looking brand new.
 			LastAccessed: f.modTime,
 			Tier:         TierNVMe,
-			// Not marked persisted: evictionSafe's cloud probe decides.
+			// Untrusted files stay unpersisted: evictionSafe's cloud probe
+			// decides for them.
+			PersistedToCloud: persisted,
 		})
 		cm.accountNVMeLocked(f.key, f.size)
 		adopted++
 		bytes += f.size
 	}
+	cm.persisted = ledger
 	cm.mu.Unlock()
+	ledger.compact(keep)
+	cm.metrics.RehydratePersistedTrusted.Add(int64(trusted))
 
 	if adopted > 0 {
-		cm.logger.Printf("NVMe rehydration: adopted %d files (%d MB) from %s",
-			adopted, bytes/(1024*1024), base)
+		cm.logger.Printf("NVMe rehydration: adopted %d files (%d MB) from %s, %d already durable per the ledger",
+			adopted, bytes/(1024*1024), base, trusted)
 	}
 	return adopted, bytes
 }
