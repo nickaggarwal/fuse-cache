@@ -121,6 +121,7 @@ func main() {
 		// CSI agent server
 		agentSocket       = flag.String("agent-socket", "/var/run/fuse-client/agent.sock", "Unix socket path for CSI agent gRPC server")
 		enableAgentServer = flag.Bool("enable-agent-server", true, "Enable the agent gRPC server for CSI integration")
+		sessionState      = flag.String("session-state", "", "File persisting CSI sessions (pins, warmup intents, refcounts) across daemon restarts; default <nvme>/.fuse-ledger/sessions.json, \"none\" disables")
 
 		// Model KV store: a durable store for LLM KV-cache blocks with a write
 		// path deliberately unlike the weights path. Off by default because it
@@ -578,6 +579,15 @@ func main() {
 	var sessMgr *session.Manager
 	if *enableAgentServer {
 		sessMgr = session.NewManager(*mountPoint)
+		// Restore sessions before the cache manager exists so restored pins
+		// hold from the first eviction pass (see session persistence).
+		if statePath := resolveSessionState(*sessionState, *nvmePath); statePath != "" {
+			if n, err := sessMgr.EnablePersistence(statePath); err != nil {
+				logger.Printf("WARNING: session persistence disabled: %v", err)
+			} else {
+				logger.Printf("Session state: %s (%d restored)", statePath, n)
+			}
+		}
 		cacheConfig.PinnedPrefixesFn = sessMgr.PinnedPrefixes
 	}
 
@@ -615,6 +625,9 @@ func main() {
 		sessMgr.SetTeardownHook(func(volumeID string) {
 			cacheManager.ForgetWarmIntent(volumeID)
 		})
+		// Sessions restored from disk declared their warmup before the
+		// restart; re-register those intents now that the hook is set.
+		sessMgr.ReplayWarmups()
 	}
 
 	// Start peer gRPC server
@@ -1376,4 +1389,20 @@ func blobScrubInterval(hours int) time.Duration {
 		return -1
 	}
 	return time.Duration(hours) * time.Hour
+}
+
+// resolveSessionState maps the -session-state flag to a path: "" means the
+// reserved ledger directory on the NVMe cache (a hostPath that outlives the
+// pod), "none" disables persistence.
+func resolveSessionState(flagVal, nvmeDir string) string {
+	switch flagVal {
+	case "none":
+		return ""
+	case "":
+		if nvmeDir == "" {
+			return ""
+		}
+		return filepath.Join(nvmeDir, ".fuse-ledger", "sessions.json")
+	}
+	return flagVal
 }

@@ -58,15 +58,11 @@ type warmIntent struct {
 
 // warmIntentRegistry holds the declared warmup intents for this node.
 //
-// Deliberately in-memory, matching session.Manager, which also keeps no
-// on-disk state. That means a daemon restart drops every intent — and because
-// the CSI driver short-circuits NodePublishVolume when the target path is
-// already a mountpoint (internal/csidriver/driver.go), a surviving bind mount
-// will not recreate the session, so nothing re-registers the intent either.
-// The same restart already drops pinning for the same reason. Fixing that
-// belongs with session persistence, not here; until then a restarted daemon
-// serves the subtree correctly through just-in-time pulls, just without the
-// residency guarantee.
+// In memory: the durable record is the CSI session table, which
+// session.Manager persists (pins, warmup policy, refcounts) and replays on
+// startup through the warmup hook, so a daemon restart re-registers every
+// intent whose bind mount survived (the CSI driver short-circuits
+// NodePublishVolume for those, so nothing else would).
 type warmIntentRegistry struct {
 	mu      sync.Mutex
 	intents map[string]*warmIntent
