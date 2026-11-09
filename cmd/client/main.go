@@ -943,8 +943,11 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 	defer t.Stop()
 	last := ""
 	for {
-		if inst := coordinatorInstance(ctx, addr); inst != "" && inst != last {
-			logger.Printf("Coordinator instance %q -> %q: republishing local objects", last, inst)
+		if inst, caps := coordinatorHealth(ctx, addr); inst != "" && inst != last {
+			logger.Printf("Coordinator instance %q -> %q: republishing local objects (capabilities %v)", last, inst, caps)
+			if cs, ok := cm.(interface{ SetCoordinatorCapabilities([]string) }); ok {
+				cs.SetCoordinatorCapabilities(caps)
+			}
 			rp.RepublishLocal(ctx)
 			last = inst
 		}
@@ -1002,27 +1005,35 @@ func watchMountHealth(ctx context.Context, coordClient coordinator.Coordinator, 
 // coordinatorInstance returns the coordinator's instance ID from
 // GET /api/health, or "" when unreachable or too old to report one.
 func coordinatorInstance(ctx context.Context, addr string) string {
+	inst, _ := coordinatorHealth(ctx, addr)
+	return inst
+}
+
+// coordinatorHealth returns the instance ID and advertised capabilities from
+// GET /api/health ("" and nil when unreachable or too old).
+func coordinatorHealth(ctx context.Context, addr string) (string, []string) {
 	if addr == "" {
-		return ""
+		return "", nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "http://"+addr+"/api/health", nil)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	defer resp.Body.Close()
 	var h struct {
-		Instance string `json:"instance"`
+		Instance     string   `json:"instance"`
+		Capabilities []string `json:"capabilities"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
-		return ""
+		return "", nil
 	}
-	return h.Instance
+	return h.Instance, h.Capabilities
 }
 
 func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coordHTTPAddr string, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {

@@ -40,7 +40,21 @@ func retractTestManager(t *testing.T) (*DefaultCacheManager, *tierRetractCoordin
 	coord := &tierRetractCoordinator{deleteCoordinator: newDeleteCoordinator()}
 	cm.config.Coordinator = coord
 	cm.config.LocalPeerID = "peer-a"
+	cm.SetCoordinatorCapabilities([]string{"tier-retract"})
 	return cm, coord
+}
+
+// Before the coordinator advertises tier-retract nothing is queued: an older
+// coordinator would read the request as a per-peer delete and drop the cloud
+// row too.
+func TestEvictionRetractNeedsCapability(t *testing.T) {
+	cm, coord := retractTestManager(t)
+	cm.SetCoordinatorCapabilities(nil)
+	cm.queueEvictRetraction("/old-coordinator.bin")
+	cm.flushEvictRetractions(context.Background())
+	if got := coord.calls(); len(got) != 0 {
+		t.Fatalf("retracted against a coordinator without tier-retract: %v", got)
+	}
 }
 
 // An evicted file's "nvme" row is retracted for this peer only, and a chunk

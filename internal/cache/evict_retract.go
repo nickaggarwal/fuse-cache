@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fuse-client/internal/coordinator"
@@ -41,6 +42,10 @@ type evictRetractor struct {
 	mu      sync.Mutex
 	pending map[string]struct{}
 	order   []string
+	// enabled is set once the coordinator advertises "tier-retract": before
+	// that, a tier-filtered delete would reach an older coordinator as a
+	// per-peer delete and drop this node's cloud row as well.
+	enabled atomic.Bool
 }
 
 func (r *evictRetractor) add(path string) bool {
@@ -79,7 +84,7 @@ func (cm *DefaultCacheManager) queueEvictRetraction(filePath string) {
 	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
 		return
 	}
-	if _, ok := cm.config.Coordinator.(coordinator.TierLocationDeleter); !ok {
+	if _, ok := cm.config.Coordinator.(coordinator.TierLocationDeleter); !ok || !cm.evictRetract.enabled.Load() {
 		return
 	}
 	if parent, isChunk := parentFilePathFromChunkPath(filePath); isChunk {
@@ -88,6 +93,18 @@ func (cm *DefaultCacheManager) queueEvictRetraction(filePath string) {
 	if !cm.evictRetract.add(filePath) {
 		cm.metrics.EvictRetractDropped.Add(1)
 	}
+}
+
+// SetCoordinatorCapabilities records the features the coordinator advertises
+// in GET /api/health; the client calls it on every coordinator instance.
+func (cm *DefaultCacheManager) SetCoordinatorCapabilities(caps []string) {
+	has := false
+	for _, c := range caps {
+		if c == "tier-retract" {
+			has = true
+		}
+	}
+	cm.evictRetract.enabled.Store(has)
 }
 
 // startEvictRetractor runs the batched retraction loop.

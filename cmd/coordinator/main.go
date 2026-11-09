@@ -998,6 +998,11 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			// back the rows of files nodes already hold.
 			"instance": coordinatorInstance,
 			"durable":  coordinatorDurable,
+			// Features a client must not use before the coordinator says
+			// it has them. "tier-retract": DeleteFileLocation honours
+			// storage_tier; an older coordinator would treat the request as
+			// a per-peer delete and drop the cloud row too.
+			"capabilities": []string{"tier-retract"},
 		}
 		writeJSONResponse(w, health)
 	})
