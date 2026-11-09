@@ -191,6 +191,58 @@ func TestMaybeScheduleChunkCompletion_Dedupes(t *testing.T) {
 	}
 }
 
+// The last chunk landing assembles the whole file at once, without waiting
+// for the range cache to go idle; with a chunk still missing nothing runs.
+func TestChunkCompletion_EagerOnLastChunk(t *testing.T) {
+	const chunkSize = 1024
+	cm, parent, full := completionTestManager(t, 4, chunkSize, map[int64]bool{3: true})
+	ctx := context.Background()
+
+	cm.maybeCompleteOnLastChunk(ctx, parent)
+	cm.bgWg.Wait()
+	if _, whole := cm.LocalFilePath(ctx, parent); whole {
+		t.Fatal("assembled with chunk 3 still missing")
+	}
+	if got := cm.metrics.ChunkCompletionEager.Load(); got != 0 {
+		t.Fatalf("eager trigger fired with a missing chunk: %d", got)
+	}
+
+	last := fmt.Sprintf("%s_chunk_3", parent)
+	cm.promoteChunkAndAdvertise(ctx, parent, last, full[3*chunkSize:])
+	cm.bgWg.Wait()
+
+	if _, whole := cm.LocalFilePath(ctx, parent); !whole {
+		t.Fatal("whole file not assembled after its last chunk landed")
+	}
+	if got := cm.metrics.ChunkCompletionEager.Load(); got != 1 {
+		t.Fatalf("ChunkCompletionEager = %d, want 1", got)
+	}
+	if got := cm.metrics.ChunkCompletionAssembled.Load(); got != 1 {
+		t.Fatalf("ChunkCompletionAssembled = %d, want 1", got)
+	}
+}
+
+// A node that read the file only remotely has no local parent row; the
+// shape comes from the metadata view and the file is still assembled.
+func TestChunkCompletion_ShapeFromMetadataView(t *testing.T) {
+	const chunkSize = 1024
+	cm, parent, full := completionTestManager(t, 4, chunkSize, nil)
+	cm.mu.Lock()
+	cm.entries.del(parent)
+	cm.metadataView = []*CacheEntry{{FilePath: parent, Size: int64(len(full)), IsChunked: true, ChunkSize: chunkSize}}
+	cm.mu.Unlock()
+
+	n, size, ok := cm.chunkedShape(parent)
+	if !ok || n != 4 || size != int64(len(full)) {
+		t.Fatalf("chunkedShape = %d, %d, %v; want 4, %d, true", n, size, ok, len(full))
+	}
+	cm.maybeCompleteOnLastChunk(context.Background(), parent)
+	cm.bgWg.Wait()
+	if _, whole := cm.LocalFilePath(context.Background(), parent); !whole {
+		t.Fatal("not assembled when the shape came from metadata only")
+	}
+}
+
 // busyThenOKStorage fails the first Read per path with busy, then serves.
 type busyThenOKStorage struct {
 	*mockStorage

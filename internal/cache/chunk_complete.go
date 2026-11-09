@@ -49,15 +49,8 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 	// mutates a live parent row (Tier, Size, LastAccessed, ChunkSize) under
 	// cm.mu — so dereferencing out here is a read of memory another goroutine
 	// is writing, not a stale-but-safe read.
-	cm.mu.RLock()
-	entry, _ := cm.entries.get(filePath)
-	var isChunked bool
-	var numChunks, entrySize int64
-	if entry != nil {
-		isChunked, numChunks, entrySize = entry.IsChunked, entry.NumChunks, entry.Size
-	}
-	cm.mu.RUnlock()
-	if entry == nil || !isChunked || numChunks <= 0 || entrySize <= 0 {
+	numChunks, entrySize, ok := cm.chunkedShape(filePath)
+	if !ok {
 		return
 	}
 	if _, whole := cm.LocalFilePath(context.Background(), filePath); whole {
@@ -104,6 +97,58 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 			cm.logger.Printf("Chunk completion for %s: %v", filePath, err)
 		}
 	})
+}
+
+// maybeCompleteOnLastChunk assembles filePath as soon as every one of its
+// chunks is on local NVMe, instead of waiting for the range cache to sit idle
+// (30 s) or for a later read. Until the whole file exists, gofuse passthrough
+// does not apply and measured residency reads near zero although the bytes
+// are local (live: 4 of 11 model files still chunked after the first read).
+// Called after a chunk lands; cheap when chunks are still missing, since it
+// stops at the first absent one.
+func (cm *DefaultCacheManager) maybeCompleteOnLastChunk(ctx context.Context, filePath string) {
+	if cm.config.ChunkCompletionDisabled {
+		return
+	}
+	numChunks, _, ok := cm.chunkedShape(filePath)
+	if !ok {
+		return
+	}
+	for i := numChunks - 1; i >= 0; i-- { // the last chunk lands last in a sequential read
+		if !cm.nvmeStorage.Exists(ctx, chunkPathFor(filePath, i)) {
+			return
+		}
+	}
+	cm.metrics.ChunkCompletionEager.Add(1)
+	cm.maybeScheduleChunkCompletion(filePath)
+}
+
+// chunkedShape returns filePath's chunk count and size from the local parent
+// row, or, when this node only ever read the file remotely and so has no
+// parent row, from the coordinator metadata view (size + the stride it was
+// written with). ok is false when the file is not known to be chunked.
+func (cm *DefaultCacheManager) chunkedShape(filePath string) (numChunks, size int64, ok bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if e, found := cm.entries.get(filePath); found && e != nil && e.IsChunked && e.NumChunks > 0 && e.Size > 0 {
+		return e.NumChunks, e.Size, true
+	}
+	e, found := findInView(cm.metadataView, filePath)
+	if !found || e == nil || !e.IsChunked || e.Size <= 0 {
+		return 0, 0, false
+	}
+	stride := e.ChunkSize
+	if stride <= 0 {
+		stride = cm.config.ChunkSize
+	}
+	if stride <= 0 {
+		return 0, 0, false
+	}
+	n := e.NumChunks
+	if n <= 0 {
+		n = (e.Size + stride - 1) / stride
+	}
+	return n, e.Size, true
 }
 
 // tryStartCompletion claims the in-flight slot for filePath, sharing the same

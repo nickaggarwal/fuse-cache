@@ -4340,6 +4340,9 @@ type CacheMetrics struct {
 	ChunkCompletionSkipped   atomic.Int64
 	// Eviction durability guard + watermark evictor.
 	EvictionSkippedUnpersisted atomic.Int64
+	// ChunkCompletionEager counts assemblies triggered by the last chunk
+	// landing rather than by the range cache going idle.
+	ChunkCompletionEager atomic.Int64
 	// Location-row retraction after eviction (evict_retract.go).
 	EvictRetracted              atomic.Int64
 	EvictRetractFailed          atomic.Int64
