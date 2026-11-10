@@ -301,6 +301,11 @@ type CacheConfig struct {
 	// Advisory — coordinator errors degrade to plain cloud reads.
 	FetchLeaseEnabled bool
 
+	// VerifyRemoteChunks checks chunks read from the peer or cloud tier
+	// against the file's CRC-32C manifest, and makes chunked persists write
+	// one (chunk_sums.go).
+	VerifyRemoteChunks bool
+
 	// GlobalReadEnabled lets a cloud miss fall through to another cluster's
 	// object storage, resolved via the coordinator's mirror of the global
 	// index. Default off, and off is a complete configuration: nothing on
@@ -366,6 +371,8 @@ type DefaultCacheManager struct {
 	// checked, so serving a file through many small FUSE reads hashes it once
 	// rather than once per read.
 	nvmeVerify nvmeVerifier
+	// chunkSums caches per-file chunk checksum manifests (chunk_sums.go).
+	chunkSums chunkSumsCache
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -2385,6 +2392,10 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 	// the max pool, a 3-chunk file the floor (the old fixed cap of 8
 	// throttled multi-GB uploads).
 	workers := cm.persistWorkersFor(numChunks)
+	if err := cm.dropChunkSums(ctx, filePath); err != nil {
+		return err
+	}
+	sums := newChunkSumsBuilder(numChunks)
 
 	var errMu sync.Mutex
 	var firstErr error
@@ -2429,7 +2440,9 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 				}
 				if err := cm.persistToCloudGen(ctx, chunkPath, data, filePath, gen); err != nil {
 					setErr(err)
+					continue
 				}
+				sums.add(idx, data)
 			}
 		}()
 	}
@@ -2452,6 +2465,7 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 		return errPersistAbandoned
 	}
 
+	cm.writeChunkSums(ctx, filePath, sums)
 	cm.completeChunkedPersist(ctx, filePath, numChunks, gen)
 	return nil
 }
@@ -2715,6 +2729,13 @@ func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath
 		}
 		return nil, err
 	}
+	// Remote chunk bytes are checked before anything uses or lands them; a
+	// mismatch fails this tier so the caller falls through to the next.
+	if tier == TierPeer || tier == TierCloud {
+		if verr := cm.verifyRemoteChunk(ctx, filePath, tier, data); verr != nil {
+			return nil, verr
+		}
+	}
 
 	entry := &CacheEntry{
 		FilePath:     filePath,
@@ -2862,6 +2883,10 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 	}
 	defer f.Close()
 
+	if err := cm.dropChunkSums(ctx, filePath); err != nil {
+		return err
+	}
+	sums := newChunkSumsBuilder(numChunks)
 	buf := make([]byte, chunkSize)
 	var total int64
 	var uploaded int64
@@ -2888,6 +2913,7 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 		if err := cm.persistToCloudGen(ctx, chunkPath, chunkData, filePath, gen); err != nil {
 			return err
 		}
+		sums.add(i, chunkData)
 		total += int64(n)
 		uploaded++
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
@@ -2903,6 +2929,7 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 		return errPersistAbandoned
 	}
 
+	cm.writeChunkSums(ctx, filePath, sums)
 	shape := persistShape{Size: total, IsChunked: true, ChunkSize: chunkSize, NumChunks: numChunks}
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.Size == total {
@@ -4358,8 +4385,14 @@ type CacheMetrics struct {
 	EvictRetractFailed          atomic.Int64
 	EvictRetractSkippedRelanded atomic.Int64
 	EvictRetractDropped         atomic.Int64
-	WatermarkEvictorRuns        atomic.Int64
-	WatermarkEvictedBytes       atomic.Int64
+	// Remote chunk content verification (chunk_sums.go).
+	RemoteChunkVerified   atomic.Int64
+	RemoteChunkUnverified atomic.Int64
+	RemoteChunkCorrupt    atomic.Int64
+	ChunkSumsWritten      atomic.Int64
+	ChunkSumsWriteFailed  atomic.Int64
+	WatermarkEvictorRuns  atomic.Int64
+	WatermarkEvictedBytes atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics

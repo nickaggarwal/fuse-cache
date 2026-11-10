@@ -540,8 +540,10 @@ Merge order: #4 → #5 → #6 (each PR's base is the previous branch).
 
 ### Known gaps / follow-ups
 
-- Remote-tier chunk reads verify size only, not content checksums
-  (noted in test plan IR-3).
+- Remote-tier chunk reads are checked against a per-file CRC-32C manifest
+  (`<file>.chunksums`, `chunk_sums.go`) written by chunked persists; files
+  persisted before it read as unverified (`fuse_remote_chunk_unverified_total`).
+  Unchunked whole-file cloud objects still verify size only.
 - Fetch leases ride the coordinator HTTP fallback, not gRPC proto (add to
   `proto/coordinator.proto` if lease QPS matters).
 - node-init end-to-end tested against synthetic host roots only — needs one

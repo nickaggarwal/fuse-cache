@@ -1084,6 +1084,11 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", cmx.ChunkCompletionSkipped.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_eager_total %d\n", cmx.ChunkCompletionEager.Load())
 	fmt.Fprintf(w, "fuse_rehydrate_persisted_trusted_total %d\n", cmx.RehydratePersistedTrusted.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_verified_total %d\n", cmx.RemoteChunkVerified.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_unverified_total %d\n", cmx.RemoteChunkUnverified.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_corrupt_total %d\n", cmx.RemoteChunkCorrupt.Load())
+	fmt.Fprintf(w, "fuse_chunk_sums_written_total %d\n", cmx.ChunkSumsWritten.Load())
+	fmt.Fprintf(w, "fuse_chunk_sums_write_failed_total %d\n", cmx.ChunkSumsWriteFailed.Load())
 
 	// Observed pairwise latency (this node → each peer), used for traversal
 	// ordering on the peer read path.

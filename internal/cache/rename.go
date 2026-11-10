@@ -263,6 +263,14 @@ func (cm *DefaultCacheManager) moveCloudObjects(ctx context.Context, oldPath, ne
 		}
 	}
 
+	// The checksum manifest follows its chunks (chunk_sums.go). Best-effort:
+	// without it the renamed file reads unverified, not wrong.
+	if parent.IsChunked && cm.config.VerifyRemoteChunks {
+		if err := copier.CopyObject(ctx, chunkSumsKey(oldPath), chunkSumsKey(newPath)); err == nil {
+			oldKeys = append(oldKeys, chunkSumsKey(oldPath))
+		}
+	}
+
 	// Chunks first: a chunked parent only flips once every one of its chunks
 	// has, so marking the parent before them would be a no-op.
 	for _, key := range newKeys {

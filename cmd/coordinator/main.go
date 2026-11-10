@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/hex"
-	"crypto/rand"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
