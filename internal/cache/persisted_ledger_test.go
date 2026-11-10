@@ -112,3 +112,34 @@ func splitLines(s string) []string {
 	}
 	return out
 }
+
+// A chunked file persisted from its whole local copy flips the parent
+// directly (not via markPersistedToCloud); it must reach the ledger too.
+// Live on cpu-w3 only 3 of 12 durable files were trusted after a restart
+// before this.
+func TestPersistedLedgerRecordsWholeFileChunkedPersist(t *testing.T) {
+	ctx := context.Background()
+	cm := evictTestManager(t, 1<<30)
+	cm.rehydrateNVMeAccounting()
+	defer cm.persisted.close()
+	const p = "/models/m/big.bin"
+	data := make([]byte, 3*int(cm.config.ChunkSize)+10)
+	full := filepath.Join(cm.config.NVMePath, "models/m/big.bin")
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cm.mu.Lock()
+	cm.entries.put(&CacheEntry{FilePath: p, StoragePath: p, Size: int64(len(data)), Tier: TierNVMe, IsChunked: true, NumChunks: 4, ChunkSize: cm.config.ChunkSize})
+	cm.mu.Unlock()
+	if err := cm.persistWholeFileAsChunksToCloud(ctx, p, full, 4); err != nil {
+		t.Fatal(err)
+	}
+	cm.persisted.close()
+	_, seen := openPersistedLedger(filepath.Join(cm.config.NVMePath, persistedLedgerDirName))
+	if _, ok := seen[p]; !ok {
+		t.Fatalf("whole-file chunked persist not in the ledger: %v", seen)
+	}
+}

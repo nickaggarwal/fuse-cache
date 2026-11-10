@@ -2225,9 +2225,7 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if e, ok := cm.entries.get(filePath); ok && e != nil {
-		if !e.PersistedToCloud && e.Tier == TierNVMe && cm.persisted != nil {
-			cm.persisted.record(filePath, filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/")))
-		}
+		cm.notePersistedLocked(filePath, e)
 		e.PersistedToCloud = true
 	}
 	parentPath, isChunk := parentFilePathFromChunkPath(filePath)
@@ -2244,7 +2242,21 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 			return
 		}
 	}
+	cm.notePersistedLocked(parentPath, parent)
 	parent.PersistedToCloud = true
+}
+
+// notePersistedLocked records in the persisted ledger that e, about to be
+// flagged durable, has its bytes on local NVMe; every place that flips
+// PersistedToCloud goes through here so a restart trusts all of them
+// (persisted_ledger.go). A no-op when the entry was already durable or is not
+// a local file (chunk files of a parent are recorded individually). Caller
+// holds cm.mu.
+func (cm *DefaultCacheManager) notePersistedLocked(filePath string, e *CacheEntry) {
+	if e == nil || e.PersistedToCloud || e.Tier != TierNVMe || cm.persisted == nil {
+		return
+	}
+	cm.persisted.record(filePath, filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/")))
 }
 
 // evictionSafe reports whether an entry's bytes exist beyond this node.
@@ -2520,6 +2532,7 @@ func (cm *DefaultCacheManager) completeChunkedPersist(ctx context.Context, fileP
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.IsChunked {
 		if !haveShape || parent.Size == shape.Size {
+			cm.notePersistedLocked(filePath, parent)
 			parent.PersistedToCloud = true
 			if !haveShape {
 				shape = persistShape{
@@ -2960,6 +2973,7 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 	shape := persistShape{Size: total, IsChunked: true, ChunkSize: chunkSize, NumChunks: numChunks}
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.Size == total {
+		cm.notePersistedLocked(filePath, parent)
 		parent.PersistedToCloud = true
 	}
 	cm.mu.Unlock()
