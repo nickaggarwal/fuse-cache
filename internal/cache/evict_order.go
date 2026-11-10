@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"path"
 	"sort"
 	"sync"
 	"time"
@@ -22,6 +23,15 @@ import (
 // one other NVMe holder first, then by idle time × size, so the bytes
 // cheapest to get back and longest unused go first. LRU still decides which
 // files are candidates at all; this only orders within the cold end.
+//
+// Releases are evicted as units. A model is a directory of shards, and a
+// model missing one shard loads exactly as slowly as a model missing all of
+// them: the load blocks on the cold one. So a file's idle time for ordering
+// is its directory's, measured from the most recent access to any file in
+// that directory, and siblings sort next to each other. A cold release goes
+// whole before a hot release loses its one rarely-read file (a tokenizer
+// or config that LRU alone would pick first and the next load would then
+// fetch cold).
 //
 // Advisory: the holder lookup is bounded (a deadline for the whole batch,
 // cached for holderCacheTTL), and if the coordinator is slow or down the
@@ -96,9 +106,40 @@ func (cm *DefaultCacheManager) otherNVMeHolders(ctx context.Context, path string
 type evictCandidate struct {
 	key    string
 	entry  *CacheEntry
-	idle   time.Duration
+	idle   time.Duration // the release's idle time (see releaseKey)
 	size   int64
 	others int // other NVMe holders; -1 unknown
+	group  string
+}
+
+// releaseKey is the unit a file is evicted with: the directory of the file
+// (of the parent file, for a chunk).
+func releaseKey(key string) string {
+	if parent, ok := parentFilePathFromChunkPath(key); ok {
+		key = parent
+	}
+	return path.Dir(key)
+}
+
+// releaseLastAccess returns, for each release in batch, the most recent
+// access to any NVMe entry in it. One pass over the table, under the read
+// lock the caller already holds; eviction passes are seconds apart.
+func (cm *DefaultCacheManager) releaseLastAccessLocked(batch []evictCandidate) map[string]time.Time {
+	want := make(map[string]time.Time, len(batch))
+	for _, c := range batch {
+		want[c.group] = time.Time{}
+	}
+	cm.entries.each(func(k string, e *CacheEntry) bool {
+		if e == nil || e.Tier != TierNVMe {
+			return true
+		}
+		g := releaseKey(k)
+		if last, ok := want[g]; ok && e.LastAccessed.After(last) {
+			want[g] = e.LastAccessed
+		}
+		return true
+	})
+	return want
 }
 
 // orderEvictionBatch reorders one cold batch in place: shared copies first,
@@ -128,7 +169,10 @@ func (cm *DefaultCacheManager) orderEvictionBatch(ctx context.Context, batch []e
 		if si != sj {
 			return si
 		}
-		return weight(batch[i]) > weight(batch[j])
+		if batch[i].group == batch[j].group {
+			return false // siblings keep LRU order among themselves
+		}
+		return groupWeight(batch, batch[i].group) > groupWeight(batch, batch[j].group)
 	})
 	for _, c := range batch {
 		if c.others > 0 {
@@ -137,14 +181,23 @@ func (cm *DefaultCacheManager) orderEvictionBatch(ctx context.Context, batch []e
 	}
 }
 
-// weight is idle seconds × size in MiB, floored at 1 each so a just-touched
-// or tiny file still orders by the other factor.
-func weight(c evictCandidate) float64 {
-	idle := c.idle.Seconds()
+// groupWeight is the release's idle seconds × the MiB of it in this batch,
+// floored at 1 each so a just-touched or tiny release still orders by the
+// other factor. Every member shares the release's idle time, so siblings
+// compare equal and sort together.
+func groupWeight(batch []evictCandidate, group string) float64 {
+	var idle float64
+	var size int64
+	for _, c := range batch {
+		if c.group == group {
+			idle = c.idle.Seconds()
+			size += c.size
+		}
+	}
 	if idle < 1 {
 		idle = 1
 	}
-	mb := float64(c.size) / (1 << 20)
+	mb := float64(size) / (1 << 20)
 	if mb < 1 {
 		mb = 1
 	}

@@ -51,24 +51,47 @@ func TestEvictPrefersFilesOtherNodesHold(t *testing.T) {
 }
 
 // Without holder information, idle x size orders the batch: one big cold
-// file frees in one delete what would take several small ones.
+// release frees in one go what would take several small ones.
 func TestEvictWeighsSizeAndIdle(t *testing.T) {
 	cm, _ := orderTestManager(t, 1<<30)
 	cm.config.Coordinator = nil
 	mb := 1 << 20
-	seedNVMe(t, cm, "/small-old-1.bin", mb, true, 3*time.Hour)
-	seedNVMe(t, cm, "/small-old-2.bin", mb, true, 3*time.Hour)
-	seedNVMe(t, cm, "/big.bin", 20*mb, true, 2*time.Hour)
-	seedNVMe(t, cm, "/recent.bin", mb, true, time.Second)
+	seedNVMe(t, cm, "/a/small-old-1.bin", mb, true, 3*time.Hour)
+	seedNVMe(t, cm, "/b/small-old-2.bin", mb, true, 3*time.Hour)
+	seedNVMe(t, cm, "/c/big.bin", 20*mb, true, 2*time.Hour)
+	seedNVMe(t, cm, "/d/recent.bin", mb, true, time.Second)
 
 	used, _ := cm.Stats()
 	cm.evictToTarget(context.Background(), used-10*int64(mb))
 
-	if !evicted(cm, "/big.bin") {
+	if !evicted(cm, "/c/big.bin") {
 		t.Fatal("big cold file kept")
 	}
-	if evicted(cm, "/small-old-1.bin") || evicted(cm, "/small-old-2.bin") {
+	if evicted(cm, "/a/small-old-1.bin") || evicted(cm, "/b/small-old-2.bin") {
 		t.Fatal("small files evicted although the big one alone freed enough")
+	}
+}
+
+// A release (directory) is as old as its most recent access. The rarely-read
+// config of a model in active use is the LRU tail, but evicting it would make
+// the next load of that model fetch it cold: the idle release goes instead,
+// whole.
+func TestEvictGroupsByRelease(t *testing.T) {
+	cm, _ := orderTestManager(t, 1<<30)
+	cm.config.Coordinator = nil
+	seedNVMe(t, cm, "/models/hot/config.json", 4000, true, 5*time.Hour)
+	seedNVMe(t, cm, "/models/cold/shard-1.bin", 4000, true, 4*time.Hour)
+	seedNVMe(t, cm, "/models/cold/shard-2.bin", 4000, true, 4*time.Hour)
+	seedNVMe(t, cm, "/models/hot/shard-1.bin", 4000, true, time.Minute)
+
+	used, _ := cm.Stats()
+	cm.evictToTarget(context.Background(), used-8000)
+
+	if evicted(cm, "/models/hot/config.json") {
+		t.Fatal("evicted a file of a release in active use")
+	}
+	if !evicted(cm, "/models/cold/shard-1.bin") || !evicted(cm, "/models/cold/shard-2.bin") {
+		t.Fatal("idle release not evicted whole")
 	}
 }
 

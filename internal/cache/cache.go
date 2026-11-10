@@ -302,7 +302,8 @@ type CacheConfig struct {
 	FetchLeaseEnabled bool
 
 	// EvictPreferReplicated orders each cold eviction batch so files other
-	// nodes also hold go first, then by idle time x size (evict_order.go).
+	// nodes also hold go first, then whole cold releases (directories) by
+	// idle time x size (evict_order.go).
 	EvictPreferReplicated bool
 
 	// VerifyRemoteChunks checks chunks read from the peer or cloud tier
@@ -2148,9 +2149,18 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 			}
 			batch = append(batch, evictCandidate{
 				key: k, entry: e, idle: now.Sub(e.LastAccessed), size: e.Size, others: -1,
+				group: releaseKey(k),
 			})
 			return len(batch) < evictBatchSize
 		})
+		if cm.config.EvictPreferReplicated && len(batch) > 1 {
+			last := cm.releaseLastAccessLocked(batch)
+			for i := range batch {
+				if t := last[batch[i].group]; !t.IsZero() {
+					batch[i].idle = now.Sub(t)
+				}
+			}
+		}
 		cm.mu.RUnlock()
 		cm.orderEvictionBatch(ctx, batch)
 
