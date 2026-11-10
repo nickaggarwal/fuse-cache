@@ -54,6 +54,9 @@ type warmIntent struct {
 	lastVerified time.Time
 	lastErr      error
 	passes       int64
+	// rewarmStreak counts consecutive passes (after the first) that had to
+	// fetch files back: the thrashing signal in cache_health.go.
+	rewarmStreak int
 }
 
 // warmIntentRegistry holds the declared warmup intents for this node.
@@ -120,6 +123,12 @@ func (r *warmIntentRegistry) recordPass(volumeID string, res *WarmupResult, err 
 		return
 	}
 	in.passes++
+	// The first pass is the initial warm, not a re-warm.
+	if in.passes > 1 && err == nil && res != nil && res.Warmed > 0 {
+		in.rewarmStreak++
+	} else if err == nil && res != nil && res.Warmed == 0 {
+		in.rewarmStreak = 0
+	}
 	in.lastResult = res
 	in.lastErr = err
 	// lastVerified advances only on a clean pass. A failed pass must not
@@ -138,6 +147,7 @@ type WarmIntentStatus struct {
 	Source       string        `json:"source,omitempty"`
 	Bandwidth    string        `json:"bandwidth,omitempty"`
 	Passes       int64         `json:"passes"`
+	RewarmStreak int           `json:"rewarm_streak"`
 	LastVerified time.Time     `json:"last_verified,omitempty"`
 	LastError    string        `json:"last_error,omitempty"`
 	LastResult   *WarmupResult `json:"last_result,omitempty"`
@@ -174,7 +184,8 @@ func (cm *DefaultCacheManager) WarmIntents() []WarmIntentStatus {
 		st := WarmIntentStatus{
 			VolumeID: in.volumeID, Prefix: in.prefix,
 			Mode: in.opts.Mode, Source: in.opts.Source, Bandwidth: in.opts.Bandwidth,
-			Passes: in.passes, LastVerified: in.lastVerified, LastResult: in.lastResult,
+			Passes: in.passes, RewarmStreak: in.rewarmStreak,
+			LastVerified: in.lastVerified, LastResult: in.lastResult,
 		}
 		if in.lastErr != nil {
 			st.LastError = in.lastErr.Error()

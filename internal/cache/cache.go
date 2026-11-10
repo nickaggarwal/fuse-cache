@@ -383,6 +383,8 @@ type DefaultCacheManager struct {
 	// openPins counts open FUSE handles per file; eviction skips them
 	// (open_pins.go).
 	openPins openPins
+	// evictBytes is the recent eviction volume for Health (cache_health.go).
+	evictBytes evictWindow
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -2210,6 +2212,7 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				continue
 			}
 			cm.metrics.RecordEviction()
+			cm.evictBytes.add(freed, time.Now())
 			cm.queueEvictRetraction(ref.key)
 			cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 		}
