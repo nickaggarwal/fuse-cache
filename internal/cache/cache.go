@@ -4401,6 +4401,9 @@ type CacheMetrics struct {
 	// ChunkCompletionEager counts assemblies triggered by the last chunk
 	// landing rather than by the range cache going idle.
 	ChunkCompletionEager atomic.Int64
+	// ChunkCompletionOnOpen counts completions queued because a read-only
+	// open wanted passthrough and the file was not whole yet.
+	ChunkCompletionOnOpen atomic.Int64
 	// RehydratePersistedTrusted counts files rehydration marked durable from
 	// the persisted ledger (no cloud probe needed to evict them).
 	RehydratePersistedTrusted atomic.Int64

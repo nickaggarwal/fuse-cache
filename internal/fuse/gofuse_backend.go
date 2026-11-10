@@ -227,6 +227,12 @@ type goFuseNode struct {
 	io ioModeTracker
 }
 
+// passthroughAssembler builds the whole local copy of a chunked file in the
+// background, so a later open can use passthrough (cache/chunk_complete.go).
+type passthroughAssembler interface {
+	AssembleForPassthrough(filePath string)
+}
+
 // openTracker is told about every file handle opened and released, so the
 // cache never evicts a file being read (cache/open_pins.go).
 type openTracker interface {
@@ -483,6 +489,11 @@ func (n *goFuseNode) Open(ctx context.Context, flags uint32) (gfs.FileHandle, ui
 	}
 	if want {
 		fusemetrics.RecordPassthroughOpen(false)
+		if ptFile == nil {
+			if a, ok := n.gfs.cacheManager.(passthroughAssembler); ok {
+				a.AssembleForPassthrough(n.path)
+			}
+		}
 	}
 	return n, gfuse.FOPEN_KEEP_CACHE, 0
 }

@@ -123,6 +123,20 @@ func (cm *DefaultCacheManager) maybeCompleteOnLastChunk(ctx context.Context, fil
 	cm.maybeScheduleChunkCompletion(filePath)
 }
 
+// AssembleForPassthrough is called when a read-only open wanted kernel
+// passthrough but the file is not whole on NVMe yet (still chunks, or not
+// local at all). The open is served through the daemon; this queues the
+// background completion so the next open gets passthrough, instead of waiting
+// for the range cache to go idle. Same guards as every completion: headroom
+// (never evicts for it), cooldown, single flight.
+func (cm *DefaultCacheManager) AssembleForPassthrough(filePath string) {
+	if _, _, ok := cm.chunkedShape(filePath); !ok {
+		return
+	}
+	cm.metrics.ChunkCompletionOnOpen.Add(1)
+	cm.maybeScheduleChunkCompletion(filePath)
+}
+
 // chunkedShape returns filePath's chunk count and size from the local parent
 // row, or, when this node only ever read the file remotely and so has no
 // parent row, from the coordinator metadata view (size + the stride it was

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -374,5 +375,28 @@ func TestAdaptivePrefetchMaxChunks(t *testing.T) {
 	cm.metrics.PeerReadBytes.Store(1024 * 1024) // 1MB/s
 	if got := cm.adaptivePrefetchMaxChunks(chunkSize); got != 16 {
 		t.Fatalf("slow-link window = %d, want static 16", got)
+	}
+}
+
+// A read-only open that wanted passthrough but found only chunks queues the
+// assembly (fetching holes), so the next open can use passthrough.
+func TestAssembleForPassthrough(t *testing.T) {
+	cm, parent, full := completionTestManager(t, 4, 1024, map[int64]bool{1: true})
+	ctx := context.Background()
+
+	cm.AssembleForPassthrough("/not-chunked.bin")
+	cm.AssembleForPassthrough(parent)
+	cm.bgWg.Wait()
+
+	p, whole := cm.LocalFilePath(ctx, parent)
+	if !whole {
+		t.Fatal("not assembled after a passthrough open asked for it")
+	}
+	got, err := os.ReadFile(p)
+	if err != nil || !bytes.Equal(got, full) {
+		t.Fatalf("assembled bytes wrong (err %v)", err)
+	}
+	if n := cm.metrics.ChunkCompletionOnOpen.Load(); n != 1 {
+		t.Fatalf("ChunkCompletionOnOpen = %d, want 1 (unchunked file must not count)", n)
 	}
 }
