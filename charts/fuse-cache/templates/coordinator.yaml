@@ -1,4 +1,6 @@
-{{- if .Values.coordinator.persistence.enabled }}
+{{- $etcd := .Values.etcd.enabled }}
+{{- $persist := and .Values.coordinator.persistence.enabled (not $etcd) }}
+{{- if $persist }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -21,9 +23,13 @@ metadata:
   labels:
     app: coordinator
 spec:
-  replicas: {{ .Values.coordinator.replicaCount }}
+  replicas: {{ if $etcd }}{{ .Values.coordinator.haReplicaCount }}{{ else }}{{ .Values.coordinator.replicaCount }}{{ end }}
   strategy:
+    {{- if $etcd }}
+    type: RollingUpdate
+    {{- else }}
     type: Recreate
+    {{- end }}
   selector:
     matchLabels:
       app: coordinator
@@ -40,6 +46,14 @@ spec:
           args:
             - "-port"
             - "{{ .Values.coordinator.httpPort }}"
+            {{- if $etcd }}
+            - "-etcd-endpoints"
+            - "{{ range $i, $_ := until (int .Values.etcd.replicaCount) }}{{ if $i }},{{ end }}http://etcd-{{ $i }}.etcd.{{ include "fuse-cache.namespace" $ }}.svc.cluster.local:2379{{ end }}"
+            - "-etcd-prefix"
+            - {{ .Values.etcd.prefix | quote }}
+            - "-etcd-peer-lease-ttl"
+            - "{{ .Values.etcd.peerLeaseTTL }}"
+            {{- end }}
             {{- if and .Values.globalCP.enabled .Values.globalCP.embedded }}
             # DEV ONLY: the control plane runs in-process on loopback with
             # no TLS. Every -global-* setting arrives through the ConfigMap;
@@ -64,9 +78,9 @@ spec:
               name: http
             - containerPort: {{ .Values.coordinator.grpcPort }}
               name: grpc
-          {{- if or .Values.coordinator.persistence.enabled (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
+          {{- if or $persist (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
           volumeMounts:
-            {{- if .Values.coordinator.persistence.enabled }}
+            {{- if $persist }}
             - name: state
               mountPath: /data
             {{- end }}
@@ -80,7 +94,7 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-          {{- if .Values.coordinator.persistence.enabled }}
+          {{- if $persist }}
           workingDir: /data
           {{- end }}
           livenessProbe:
@@ -97,9 +111,9 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
-      {{- if or .Values.coordinator.persistence.enabled (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
+      {{- if or $persist (and .Values.globalCP.enabled .Values.globalCP.tls.secretName) }}
       volumes:
-        {{- if .Values.coordinator.persistence.enabled }}
+        {{- if $persist }}
         - name: state
           persistentVolumeClaim:
             claimName: coordinator-state

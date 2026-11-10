@@ -603,7 +603,7 @@ gRPC ports and peering that the examples below omit.
 |---|---|---|
 | `-port` | `8080` | HTTP |
 | `-grpc-port` | `9080` | gRPC — the default client transport |
-| `-etcd-endpoints` | *(empty)* | Empty ⇒ in-memory store (single-node / local dev) |
+| `-etcd-endpoints` | *(empty)* | Empty ⇒ in-memory store (single-node / local dev). The Helm chart sets it by default (`etcd.enabled: true`, a 3-member StatefulSet, 2 coordinator replicas) |
 | `-etcd-prefix` | `/fuse` | Key prefix |
 | `-etcd-peer-lease-ttl` | | Peer lease TTL |
 
