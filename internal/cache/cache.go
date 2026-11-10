@@ -301,6 +301,10 @@ type CacheConfig struct {
 	// Advisory — coordinator errors degrade to plain cloud reads.
 	FetchLeaseEnabled bool
 
+	// EvictPreferReplicated orders each cold eviction batch so files other
+	// nodes also hold go first, then by idle time x size (evict_order.go).
+	EvictPreferReplicated bool
+
 	// VerifyRemoteChunks checks chunks read from the peer or cloud tier
 	// against the file's CRC-32C manifest, and makes chunked persists write
 	// one (chunk_sums.go).
@@ -373,6 +377,8 @@ type DefaultCacheManager struct {
 	nvmeVerify nvmeVerifier
 	// chunkSums caches per-file chunk checksum manifests (chunk_sums.go).
 	chunkSums chunkSumsCache
+	// evictHolders caches other-holder counts for eviction order.
+	evictHolders evictHolderCache
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -2109,10 +2115,6 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 		pinnedPrefixes = cm.config.PinnedPrefixesFn()
 	}
 
-	type entryRef struct {
-		key   string
-		entry *CacheEntry
-	}
 	// Paths already considered and rejected this call: pinned, not yet durable,
 	// or a failed delete. They stay in the list at their current position, so
 	// without this the next batch would start on the same ones and never
@@ -2125,7 +2127,8 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 			cm.mu.RUnlock()
 			return
 		}
-		batch := make([]entryRef, 0, evictBatchSize)
+		batch := make([]evictCandidate, 0, evictBatchSize)
+		now := time.Now()
 		cm.entries.eachColdest(func(k string, e *CacheEntry) bool {
 			if e == nil || e.Tier != TierNVMe {
 				return true
@@ -2140,10 +2143,13 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 					return true
 				}
 			}
-			batch = append(batch, entryRef{k, e})
+			batch = append(batch, evictCandidate{
+				key: k, entry: e, idle: now.Sub(e.LastAccessed), size: e.Size, others: -1,
+			})
 			return len(batch) < evictBatchSize
 		})
 		cm.mu.RUnlock()
+		cm.orderEvictionBatch(ctx, batch)
 
 		if len(batch) == 0 {
 			// Nothing left that this call can reclaim; usage stays above
@@ -4385,6 +4391,9 @@ type CacheMetrics struct {
 	EvictRetractFailed          atomic.Int64
 	EvictRetractSkippedRelanded atomic.Int64
 	EvictRetractDropped         atomic.Int64
+	// EvictOrderShared counts eviction candidates moved forward because
+	// another node holds them (evict_order.go).
+	EvictOrderShared atomic.Int64
 	// Remote chunk content verification (chunk_sums.go).
 	RemoteChunkVerified   atomic.Int64
 	RemoteChunkUnverified atomic.Int64
