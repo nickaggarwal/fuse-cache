@@ -379,6 +379,9 @@ type DefaultCacheManager struct {
 	chunkSums chunkSumsCache
 	// evictHolders caches other-holder counts for eviction order.
 	evictHolders evictHolderCache
+	// openPins counts open FUSE handles per file; eviction skips them
+	// (open_pins.go).
+	openPins openPins
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -2165,6 +2168,11 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				return
 			}
 			if isPathPinned(ref.key, pinnedPrefixes) {
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			if cm.isOpen(ref.key) {
+				cm.metrics.EvictionSkippedOpen.Add(1)
 				skipped[ref.key] = struct{}{}
 				continue
 			}
@@ -4391,6 +4399,9 @@ type CacheMetrics struct {
 	EvictRetractFailed          atomic.Int64
 	EvictRetractSkippedRelanded atomic.Int64
 	EvictRetractDropped         atomic.Int64
+	// EvictionSkippedOpen counts candidates kept because a FUSE handle on
+	// them is open (open_pins.go).
+	EvictionSkippedOpen atomic.Int64
 	// EvictOrderShared counts eviction candidates moved forward because
 	// another node holds them (evict_order.go).
 	EvictOrderShared atomic.Int64

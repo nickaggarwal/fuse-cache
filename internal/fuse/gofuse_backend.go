@@ -227,6 +227,13 @@ type goFuseNode struct {
 	io ioModeTracker
 }
 
+// openTracker is told about every file handle opened and released, so the
+// cache never evicts a file being read (cache/open_pins.go).
+type openTracker interface {
+	NoteOpen(filePath string)
+	NoteRelease(filePath string)
+}
+
 type localFilePathResolver interface {
 	LocalFilePath(ctx context.Context, filePath string) (string, bool)
 }
@@ -449,6 +456,9 @@ func (n *goFuseNode) Open(ctx context.Context, flags uint32) (gfs.FileHandle, ui
 		return nil, 0, syscall.EISDIR
 	}
 
+	if t, ok := n.gfs.cacheManager.(openTracker); ok {
+		t.NoteOpen(n.path)
+	}
 	readOnly := (flags & uint32(syscall.O_ACCMODE)) == uint32(syscall.O_RDONLY)
 	want := n.gfs.enablePassthrough && readOnly
 	var ptFile *os.File
@@ -892,6 +902,9 @@ func (n *goFuseNode) Fsync(ctx context.Context, f gfs.FileHandle, flags uint32) 
 
 func (n *goFuseNode) Release(ctx context.Context, f gfs.FileHandle) syscall.Errno {
 	n.io.release()
+	if t, ok := n.gfs.cacheManager.(openTracker); ok {
+		t.NoteRelease(n.path)
+	}
 	// go-fuse calls the node's Release, never the handle's (NodeReleaser
 	// wins in rawBridge.Release), so a passthrough handle's fd was only
 	// ever closed by the GC finalizer.

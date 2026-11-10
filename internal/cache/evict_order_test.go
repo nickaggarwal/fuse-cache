@@ -106,3 +106,38 @@ func TestEvictOrderKeepsGuards(t *testing.T) {
 		t.Fatal("nothing evictable was evicted")
 	}
 }
+
+// A file with an open handle (a model being served, possibly through kernel
+// passthrough the daemon never sees reads for) is not evicted, nor are its
+// chunks; releasing the last handle makes it evictable again.
+func TestEvictSkipsOpenFiles(t *testing.T) {
+	cm, _ := orderTestManager(t, 10_000)
+	cm.config.EvictPreferReplicated = false
+	seedNVMe(t, cm, "/served.bin", 3000, true, 3*time.Hour)
+	seedNVMe(t, cm, "/chunked.bin_chunk_0", 3000, true, 2*time.Hour)
+	seedNVMe(t, cm, "/plain.bin", 3000, true, time.Hour)
+	cm.NoteOpen("/served.bin")
+	cm.NoteOpen("/served.bin")
+	cm.NoteOpen("/chunked.bin")
+
+	cm.evictToTarget(context.Background(), 6500)
+	if evicted(cm, "/served.bin") || evicted(cm, "/chunked.bin_chunk_0") {
+		t.Fatal("evicted a file with an open handle")
+	}
+	if !evicted(cm, "/plain.bin") {
+		t.Fatal("closed file not evicted")
+	}
+	if cm.metrics.EvictionSkippedOpen.Load() < 2 {
+		t.Fatalf("EvictionSkippedOpen = %d", cm.metrics.EvictionSkippedOpen.Load())
+	}
+
+	cm.NoteRelease("/served.bin")
+	if !cm.isOpen("/served.bin") {
+		t.Fatal("one of two handles released, file reported closed")
+	}
+	cm.NoteRelease("/served.bin")
+	cm.evictToTarget(context.Background(), 3500)
+	if !evicted(cm, "/served.bin") {
+		t.Fatal("file still pinned after its last handle closed")
+	}
+}

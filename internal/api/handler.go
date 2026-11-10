@@ -1084,6 +1084,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", cmx.ChunkCompletionSkipped.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_eager_total %d\n", cmx.ChunkCompletionEager.Load())
 	fmt.Fprintf(w, "fuse_rehydrate_persisted_trusted_total %d\n", cmx.RehydratePersistedTrusted.Load())
+	fmt.Fprintf(w, "fuse_eviction_skipped_open_total %d\n", cmx.EvictionSkippedOpen.Load())
+	fmt.Fprintf(w, "fuse_open_files %d\n", dcm.OpenFileCount())
 	fmt.Fprintf(w, "fuse_evict_order_shared_total %d\n", cmx.EvictOrderShared.Load())
 	fmt.Fprintf(w, "fuse_remote_chunk_verified_total %d\n", cmx.RemoteChunkVerified.Load())
 	fmt.Fprintf(w, "fuse_remote_chunk_unverified_total %d\n", cmx.RemoteChunkUnverified.Load())
