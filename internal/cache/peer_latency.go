@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -166,8 +167,12 @@ func (ps *PeerStorage) sortByObservedLatency(peers []*coordinator.PeerInfo, key 
 				return a
 			}
 		}
-		si := ps.pairScore(peers[i])
-		sj := ps.pairScore(peers[j])
+		// Scores are bucketed: measured EWMAs are continuous and almost
+		// never tie, so an exact comparison sent every chunk of a cold start
+		// to the one fastest holder and the per-chunk spread below never
+		// applied. Holders within ~25% of each other share the load.
+		si := scoreBucket(ps.pairScore(peers[i]))
+		sj := scoreBucket(ps.pairScore(peers[j]))
 		if si == sj {
 			// Deterministic tie break keeps chunk distribution stable.
 			hi := peerStartIndexForKey(key+"#"+peers[i].ID, 1<<30)
@@ -176,6 +181,19 @@ func (ps *PeerStorage) sortByObservedLatency(peers []*coordinator.PeerInfo, key 
 		}
 		return si > sj
 	})
+}
+
+// scoreBucketRatio is the width of one score bucket: holders whose scores
+// are within this factor of each other are treated as equally good.
+const scoreBucketRatio = 1.25
+
+// scoreBucket quantizes a pair score onto a log scale, so the comparison
+// stays transitive (a tolerance band compared pairwise would not be).
+func scoreBucket(score float64) int {
+	if score <= 0 {
+		return math.MinInt32
+	}
+	return int(math.Floor(math.Log(score) / math.Log(scoreBucketRatio)))
 }
 
 // PeerPairLatencies exposes the observed per-peer latency table (this node →
