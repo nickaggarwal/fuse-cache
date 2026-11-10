@@ -3359,10 +3359,14 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 				filePath, endChunk, len(prefetchChunks), float64(prefetchBudgetBytes)/(1024*1024), float64(rangeBytes)/(1024*1024))
 		}
 		cm.metrics.PrefetchIssued.Add(int64(len(prefetchChunks)))
+		// The same budget a foreground read of these chunks gets: a prefetch
+		// that falls through to the cloud tier under the peer timeout gave
+		// up on exactly the chunks that most needed a head start.
+		prefetchTimeout := cm.chunkReadTimeout(remoteOrder, hybridRead)
 		for _, prefetchChunk := range prefetchChunks {
 			go func(chunkIndex int64) {
 				defer cm.releasePrefetchReservation(filePath, chunkIndex, chunkSize)
-				prefetchCtx, cancel := context.WithTimeout(context.Background(), cm.config.PeerTimeout)
+				prefetchCtx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
 				defer cancel()
 				if _, _, err := cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead); err == nil {
 					cm.markChunkPrefetched(filePath, chunkIndex)
