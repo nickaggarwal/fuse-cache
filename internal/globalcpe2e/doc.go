@@ -16,7 +16,7 @@
 // Why a Go test and not scripts/ops/e2e-global.sh, which the plan named and
 // the mTLS harness's header points at. Two hard constraints:
 //
-//  1. cmd/client is Linux-only (bazil.org/fuse), so a script driving two
+//  1. cmd/client is Linux-only (go-fuse), so a script driving two
 //     real clients cannot run on a developer laptop, which is where this
 //     has to be runnable to be run at all.
 //  2. The plan assumed MinIO for object storage. MinIO's image is not

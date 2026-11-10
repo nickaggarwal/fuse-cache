@@ -16,8 +16,8 @@ The end goal: any node can read any file at NVMe speed, with the guarantee that 
 │       │                                                          │
 │       ▼                                                          │
 │  ┌──────────┐   FUSE mount at /mnt/fuse                         │
-│  │   FUSE   │   backend = bazil.org/fuse OR hanwen/go-fuse      │
-│  └────┬─────┘   (-fuse-backend bazil|gofuse)                     │
+│  │   FUSE   │   backend = hanwen/go-fuse                        │
+│  └────┬─────┘   (-fuse-backend gofuse)                           │
 │       │                                                          │
 │       ▼                                                          │
 │  ┌─────────────────────────────────────────────────────────────┐ │
@@ -221,7 +221,7 @@ chars, so tests use `/tmp`, not `t.TempDir()`.
 | `internal/api/` | `handler.go` | Client HTTP API: file CRUD, peer ops, cache stats, health, snapshot/restore, Prometheus `/metrics`. Auth middleware, upload limits, path validation |
 | | `warm.go` | `POST /api/cache/warm` + the async warm-job registry behind `GET /api/cache/warm[/{id}]` |
 | `internal/nodelabels/` | `nodelabels.go` | Reads this pod's Node object to derive peer labels (`-peer-labels-from-node`); advisory, no client-go |
-| `internal/fuse/` | `filesystem.go` | FUSE filesystem (bazil backend): Dir/File nodes backed by CacheManager |
+| `internal/fuse/` | `common.go` | Helpers shared by the FUSE layer (cache-manager interfaces, rename, inode hashing) |
 | | `gofuse_backend.go` | Alternative FUSE backend on `hanwen/go-fuse/v2` (`-fuse-backend gofuse`); supports passthrough + writeback tuning |
 | `internal/fusemetrics/` | `metrics.go` | Atomic counters for the go-fuse write path, surfaced via `/metrics` |
 | `internal/agentserver/`, `internal/session/`, `internal/csidriver/` | — | CSI subsystem (see section above) |
@@ -238,7 +238,7 @@ make dev-stop                 # kill all processes
 make proto                    # regenerate internal/pb from proto/*.proto
 ```
 
-> `bazil.org/fuse` and `hanwen/go-fuse` are Linux-only — `cmd/client` cannot
+> `hanwen/go-fuse` is Linux-only — `cmd/client` cannot
 > build on macOS. Cross-compile with `GOOS=linux go build ./cmd/client`.
 > `make proto` needs `protoc` plus `protoc-gen-go`/`protoc-gen-go-grpc` on
 > `PATH` (e.g. `PATH=$PATH:$HOME/go/bin`).
@@ -319,7 +319,7 @@ load-bearing ones:
 
 ```
 -mount             /tmp/fuse-client    FUSE mount point
--fuse-backend      bazil               FUSE backend: "bazil" or "gofuse"
+-fuse-backend      gofuse              FUSE backend: "gofuse" (bazil removed)
 -nvme              /tmp/nvme-cache     NVMe cache directory
 -coordinator       localhost:8080      Coordinator HTTP address
 -coordinator-grpc  localhost:9080      Coordinator gRPC address (default transport)
@@ -390,7 +390,6 @@ All non-health endpoints require `X-API-Key` header when `-api-key` is set.
 
 ## Dependencies
 
-- `bazil.org/fuse` — default FUSE implementation
 - `github.com/hanwen/go-fuse/v2` — alternative FUSE backend (`-fuse-backend gofuse`). **Replaced with a local fork**: `replace github.com/hanwen/go-fuse/v2 => ./third_party/go-fuse-local` in `go.mod`
 - `github.com/container-storage-interface/spec` v1.9.0 — CSI API
 - `google.golang.org/grpc` + `google.golang.org/protobuf` — coordinator/peer/agent transports

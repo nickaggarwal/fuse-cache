@@ -62,7 +62,7 @@ wait_for() {
 }
 
 # Only the three binaries this script drives. Deliberately not `make
-# build`: that also builds cmd/client, which is Linux-only (bazil.org/fuse),
+# build`: that also builds cmd/client, which is Linux-only (go-fuse),
 # so a full build would make this script undiagnosably fail on a laptop for
 # a reason unrelated to what it tests.
 echo "Building..."

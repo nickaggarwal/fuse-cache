@@ -30,14 +30,13 @@ import (
 	pb "fuse-client/internal/pb"
 	"fuse-client/internal/session"
 
-	fusepkg "bazil.org/fuse"
 	"google.golang.org/grpc"
 )
 
 func main() {
 	var (
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
-		fuseBackendName = flag.String("fuse-backend", "gofuse", "FUSE backend: gofuse (default; kernel passthrough with FUSE_GOFUSE_ENABLE_PASSTHROUGH) or bazil")
+		fuseBackendName = flag.String("fuse-backend", "gofuse", "FUSE backend: gofuse (the only backend; kernel passthrough with FUSE_GOFUSE_ENABLE_PASSTHROUGH). The bazil backend was removed")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
 		nodeInitConfig  = flag.String("node-init-config", "", "Path to a node-init config file; when set and readable, its discovered cache dir and byte budget override -nvme/-nvme-max-gb")
 		nodeInitWaitSec = flag.Int("node-init-wait-sec", 30, "How long to wait for the node-init config file to appear before falling back to -nvme")
@@ -726,14 +725,13 @@ func main() {
 	// Create FUSE backend
 	var filesystem fusemount.Backend
 	switch backend := normalizeFuseBackend(*fuseBackendName); backend {
-	case "bazil":
-		filesystem = &bazilFuseBackend{fs: fusefs.NewFileSystem(cacheManager)}
-		*fuseBackendName = "bazil"
 	case "gofuse":
 		filesystem = fusefs.NewGoFuseFileSystem(cacheManager)
 		*fuseBackendName = "gofuse"
+	case "bazil":
+		logger.Fatalf("FUSE backend bazil was removed; use gofuse (unset FUSE_BACKEND / -fuse-backend)")
 	default:
-		logger.Fatalf("Unsupported FUSE backend %q (expected bazil or gofuse)", *fuseBackendName)
+		logger.Fatalf("Unsupported FUSE backend %q (expected gofuse)", *fuseBackendName)
 	}
 
 	// Mount the FUSE filesystem
@@ -1318,31 +1316,6 @@ func getLocalIP() string {
 		}
 	}
 	return "localhost"
-}
-
-type bazilFuseBackend struct {
-	fs   *fusefs.FileSystem
-	conn *fusepkg.Conn
-}
-
-func (b *bazilFuseBackend) Mount(ctx context.Context, mountPoint string) error {
-	conn, err := b.fs.Mount(ctx, mountPoint)
-	if err != nil {
-		return err
-	}
-	b.conn = conn
-	return nil
-}
-
-func (b *bazilFuseBackend) Serve(ctx context.Context) error {
-	if b.conn == nil {
-		return fmt.Errorf("bazil backend serve called before mount")
-	}
-	return b.fs.Serve(ctx, b.conn)
-}
-
-func (b *bazilFuseBackend) Unmount(mountPoint string) error {
-	return b.fs.Unmount(mountPoint)
 }
 
 func enabledState(on bool) string {
