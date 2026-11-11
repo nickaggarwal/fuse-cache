@@ -186,6 +186,26 @@ func (cm *DefaultCacheManager) tryStartCompletion(filePath string) bool {
 	return true
 }
 
+// assembling reports whether key, or the parent of chunk key, is being
+// assembled right now. Eviction skips those: deleting a chunk mid-assembly
+// fails the assembly ("chunk N vanished") and throws away the fetch work.
+func (cm *DefaultCacheManager) assembling(key string) bool {
+	st := &cm.chunkCompletion
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.inFlight) == 0 {
+		return false
+	}
+	if _, ok := st.inFlight[key]; ok {
+		return true
+	}
+	if parent, isChunk := parentFilePathFromChunkPath(key); isChunk {
+		_, ok := st.inFlight[parent]
+		return ok
+	}
+	return false
+}
+
 func (cm *DefaultCacheManager) endCompletion(filePath string) {
 	st := &cm.chunkCompletion
 	st.mu.Lock()

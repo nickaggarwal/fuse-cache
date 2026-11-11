@@ -1203,6 +1203,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "fuse_peer_failure_reports_sent_total %d\n", ps)
 	}
 	fmt.Fprintf(w, "fuse_eviction_skipped_open_total %d\n", cmx.EvictionSkippedOpen.Load())
+	fmt.Fprintf(w, "fuse_eviction_skipped_assembling_total %d\n", cmx.EvictionSkippedAssembling.Load())
 	fmt.Fprintf(w, "fuse_open_files %d\n", dcm.OpenFileCount())
 	fmt.Fprintf(w, "fuse_evict_order_shared_total %d\n", cmx.EvictOrderShared.Load())
 	fmt.Fprintf(w, "fuse_remote_chunk_verified_total %d\n", cmx.RemoteChunkVerified.Load())

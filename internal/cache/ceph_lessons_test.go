@@ -440,3 +440,31 @@ func TestIOSchedConcurrentWorkersHoldRate(t *testing.T) {
 		t.Fatalf("8 workers ran at %.1f MB/s under a 20 MB/s cap (%v)", rate/(1<<20), elapsed)
 	}
 }
+
+// Chunks of a file being assembled are not evicted (live: a warm failed with
+// "chunk 0 vanished during assembly" when watermark eviction ran mid-warm).
+func TestEvictSkipsFileBeingAssembled(t *testing.T) {
+	cm, _ := orderTestManager(t, 10_000)
+	cm.config.EvictPreferReplicated = false
+	seedNVMe(t, cm, "/w/s3.bin_chunk_0", 3000, true, 3*time.Hour)
+	seedNVMe(t, cm, "/w/s3.bin_chunk_3", 3000, true, 3*time.Hour)
+	seedNVMe(t, cm, "/old/plain.bin", 3000, true, 2*time.Hour)
+	seedNVMe(t, cm, "/old/other.bin", 3000, true, time.Hour)
+	if !cm.tryStartCompletion("/w/s3.bin") {
+		t.Fatal("could not claim assembly")
+	}
+	cm.evictToTarget(context.Background(), 6500)
+	if evicted(cm, "/w/s3.bin_chunk_0") || evicted(cm, "/w/s3.bin_chunk_3") {
+		t.Fatal("evicted a chunk of a file being assembled")
+	}
+	if !evicted(cm, "/old/plain.bin") || !evicted(cm, "/old/other.bin") {
+		t.Fatal("evictable files kept")
+	}
+	if cm.metrics.EvictionSkippedAssembling.Load() < 2 {
+		t.Fatalf("EvictionSkippedAssembling = %d", cm.metrics.EvictionSkippedAssembling.Load())
+	}
+	cm.endCompletion("/w/s3.bin")
+	if cm.assembling("/w/s3.bin_chunk_0") {
+		t.Fatal("still protected after assembly ended")
+	}
+}

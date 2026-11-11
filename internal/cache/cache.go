@@ -2213,6 +2213,11 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				skipped[ref.key] = struct{}{}
 				continue
 			}
+			if cm.assembling(ref.key) {
+				cm.metrics.EvictionSkippedAssembling.Add(1)
+				skipped[ref.key] = struct{}{}
+				continue
+			}
 			// Durability guard: never evict the only copy. Under sustained
 			// pressure with a slow cloud link this can leave usage above target —
 			// by design; ENOSPC risk beats data loss.
@@ -4479,6 +4484,9 @@ type CacheMetrics struct {
 	// EvictionSkippedOpen counts candidates kept because a FUSE handle on
 	// them is open (open_pins.go).
 	EvictionSkippedOpen atomic.Int64
+	// EvictionSkippedAssembling counts candidates kept because their file
+	// was being assembled from chunks.
+	EvictionSkippedAssembling atomic.Int64
 	// EvictOrderShared counts eviction candidates moved forward because
 	// another node holds them (evict_order.go).
 	EvictOrderShared atomic.Int64
