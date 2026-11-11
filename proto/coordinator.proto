@@ -120,6 +120,10 @@ message DeleteFileLocationRequest {
   string file_path = 1;
   string peer_id = 2;
   bool whole_path = 3;
+  // storage_tier, when set with a per-peer delete, drops only that peer's
+  // rows in this tier ("nvme"): an evicted local copy must not take the
+  // peer's cloud-durability row with it.
+  string storage_tier = 4;
 }
 
 message DeleteFileLocationResponse {}

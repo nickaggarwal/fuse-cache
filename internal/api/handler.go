@@ -210,6 +210,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
+	router.HandleFunc("/api/cache/health", h.handleCacheHealth).Methods("GET")
 	// Durability barrier/receipt for artifact consumers (pod-snapshotter
 	// restore eligibility). POST because a receipt may block and may kick
 	// retries; GET is the same query without side effects.
@@ -932,6 +933,18 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+// handleCacheHealth reports whether this node can keep its declared warm set
+// resident (cache/cache_health.go): ok, degraded or thrashing, with reasons.
+func (h *Handler) handleCacheHealth(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "cache health not available", http.StatusNotImplemented)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(dcm.Health())
+}
+
 // handleNetProbe streams a fixed-size payload for network throughput probes.
 func (h *Handler) handleNetProbe(w http.ResponseWriter, r *http.Request) {
 	size := defaultNetProbeBytes
@@ -996,6 +1009,10 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	cmx := dcm.GetCacheMetrics()
 	fmt.Fprintf(w, "fuse_range_cache_file_evictions_total %d\n", cmx.RangeCacheFileEvictions.Load())
 	fmt.Fprintf(w, "fuse_range_cache_idle_expiries_total %d\n", cmx.RangeCacheIdleExpiries.Load())
+	fmt.Fprintf(w, "fuse_evict_retracted_total %d\n", cmx.EvictRetracted.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_failed_total %d\n", cmx.EvictRetractFailed.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_skipped_relanded_total %d\n", cmx.EvictRetractSkippedRelanded.Load())
+	fmt.Fprintf(w, "fuse_evict_retract_dropped_total %d\n", cmx.EvictRetractDropped.Load())
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
@@ -1078,6 +1095,22 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_chunk_completion_assembled_total %d\n", cmx.ChunkCompletionAssembled.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_fetched_total %d\n", cmx.ChunkCompletionFetched.Load())
 	fmt.Fprintf(w, "fuse_chunk_completion_skipped_total %d\n", cmx.ChunkCompletionSkipped.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_eager_total %d\n", cmx.ChunkCompletionEager.Load())
+	fmt.Fprintf(w, "fuse_chunk_completion_on_open_total %d\n", cmx.ChunkCompletionOnOpen.Load())
+	fmt.Fprintf(w, "fuse_rehydrate_persisted_trusted_total %d\n", cmx.RehydratePersistedTrusted.Load())
+	ch := dcm.Health()
+	fmt.Fprintf(w, "fuse_cache_health_state %d\n", ch.HealthStateValue())
+	fmt.Fprintf(w, "fuse_cache_max_rewarm_streak %d\n", ch.MaxRewarmStreak)
+	fmt.Fprintf(w, "fuse_cache_unsatisfied_intents %d\n", ch.Unsatisfied)
+	fmt.Fprintf(w, "fuse_cache_evicted_bytes_window %d\n", ch.EvictedBytesWindow)
+	fmt.Fprintf(w, "fuse_eviction_skipped_open_total %d\n", cmx.EvictionSkippedOpen.Load())
+	fmt.Fprintf(w, "fuse_open_files %d\n", dcm.OpenFileCount())
+	fmt.Fprintf(w, "fuse_evict_order_shared_total %d\n", cmx.EvictOrderShared.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_verified_total %d\n", cmx.RemoteChunkVerified.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_unverified_total %d\n", cmx.RemoteChunkUnverified.Load())
+	fmt.Fprintf(w, "fuse_remote_chunk_corrupt_total %d\n", cmx.RemoteChunkCorrupt.Load())
+	fmt.Fprintf(w, "fuse_chunk_sums_written_total %d\n", cmx.ChunkSumsWritten.Load())
+	fmt.Fprintf(w, "fuse_chunk_sums_write_failed_total %d\n", cmx.ChunkSumsWriteFailed.Load())
 
 	// Observed pairwise latency (this node → each peer), used for traversal
 	// ordering on the peer read path.

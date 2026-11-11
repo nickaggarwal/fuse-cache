@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/hex"
-	"crypto/rand"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -709,6 +709,15 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 				return
 			}
 
+			if tier := r.URL.Query().Get("storage_tier"); tier != "" && !wholePath {
+				if err := coordinatorService.DeletePeerTierLocation(r.Context(), filePath, peerID, tier); err != nil {
+					http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"success": true}`))
+				return
+			}
 			if err := coordinatorService.DeleteFileLocation(r.Context(), filePath, peerID, wholePath); err != nil {
 				http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
 				return
@@ -989,6 +998,11 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			// back the rows of files nodes already hold.
 			"instance": coordinatorInstance,
 			"durable":  coordinatorDurable,
+			// Features a client must not use before the coordinator says
+			// it has them. "tier-retract": DeleteFileLocation honours
+			// storage_tier; an older coordinator would treat the request as
+			// a per-peer delete and drop the cloud row too.
+			"capabilities": []string{"tier-retract"},
 		}
 		writeJSONResponse(w, health)
 	})

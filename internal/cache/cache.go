@@ -301,6 +301,16 @@ type CacheConfig struct {
 	// Advisory — coordinator errors degrade to plain cloud reads.
 	FetchLeaseEnabled bool
 
+	// EvictPreferReplicated orders each cold eviction batch so files other
+	// nodes also hold go first, then whole cold releases (directories) by
+	// idle time x size (evict_order.go).
+	EvictPreferReplicated bool
+
+	// VerifyRemoteChunks checks chunks read from the peer or cloud tier
+	// against the file's CRC-32C manifest, and makes chunked persists write
+	// one (chunk_sums.go).
+	VerifyRemoteChunks bool
+
 	// GlobalReadEnabled lets a cloud miss fall through to another cluster's
 	// object storage, resolved via the coordinator's mirror of the global
 	// index. Default off, and off is a complete configuration: nothing on
@@ -366,6 +376,15 @@ type DefaultCacheManager struct {
 	// checked, so serving a file through many small FUSE reads hashes it once
 	// rather than once per read.
 	nvmeVerify nvmeVerifier
+	// chunkSums caches per-file chunk checksum manifests (chunk_sums.go).
+	chunkSums chunkSumsCache
+	// evictHolders caches other-holder counts for eviction order.
+	evictHolders evictHolderCache
+	// openPins counts open FUSE handles per file; eviction skips them
+	// (open_pins.go).
+	openPins openPins
+	// evictBytes is the recent eviction volume for Health (cache_health.go).
+	evictBytes evictWindow
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -433,7 +452,13 @@ type DefaultCacheManager struct {
 	chunkCompletion chunkCompletionState
 	// evictSignal wakes the watermark evictor between its periodic sweeps.
 	// Depth 1, non-blocking send: a pending wake already covers a burst.
-	evictSignal    chan struct{}
+	evictSignal chan struct{}
+	// evictRetract queues evicted paths whose "nvme" location row this node
+	// still advertises (evict_retract.go).
+	evictRetract evictRetractor
+	// persisted remembers durable local files across restarts
+	// (persisted_ledger.go); nil when the NVMe dir is unset.
+	persisted      *persistedLedger
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	// bgWg tracks one-shot background work (cloud persist, promote-after-read,
@@ -723,6 +748,10 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// real device fullness (shared host disk), not just our own accounting.
 	cm.startWatermarkEvictor()
 
+	// Retract this node's location rows for files eviction removed, so
+	// "holder" in coordinator metadata means "holds now".
+	cm.startEvictRetractor()
+
 	// Background GC for hybridHints — prevents unbounded growth.
 	gcInterval := config.MetadataRefreshTTL * 10
 	if gcInterval < 30*time.Second {
@@ -758,6 +787,7 @@ func (cm *DefaultCacheManager) Shutdown() {
 	cm.shutdownCancel()
 	cm.loopWg.Wait()
 	cm.bgWg.Wait()
+	cm.persisted.close()
 }
 
 // goBackground tracks one-shot fn in bgWg so Shutdown can drain it. Work
@@ -2091,10 +2121,6 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 		pinnedPrefixes = cm.config.PinnedPrefixesFn()
 	}
 
-	type entryRef struct {
-		key   string
-		entry *CacheEntry
-	}
 	// Paths already considered and rejected this call: pinned, not yet durable,
 	// or a failed delete. They stay in the list at their current position, so
 	// without this the next batch would start on the same ones and never
@@ -2107,7 +2133,8 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 			cm.mu.RUnlock()
 			return
 		}
-		batch := make([]entryRef, 0, evictBatchSize)
+		batch := make([]evictCandidate, 0, evictBatchSize)
+		now := time.Now()
 		cm.entries.eachColdest(func(k string, e *CacheEntry) bool {
 			if e == nil || e.Tier != TierNVMe {
 				return true
@@ -2122,10 +2149,22 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 					return true
 				}
 			}
-			batch = append(batch, entryRef{k, e})
+			batch = append(batch, evictCandidate{
+				key: k, entry: e, idle: now.Sub(e.LastAccessed), size: e.Size, others: -1,
+				group: releaseKey(k),
+			})
 			return len(batch) < evictBatchSize
 		})
+		if cm.config.EvictPreferReplicated && len(batch) > 1 {
+			last := cm.releaseLastAccessLocked(batch)
+			for i := range batch {
+				if t := last[batch[i].group]; !t.IsZero() {
+					batch[i].idle = now.Sub(t)
+				}
+			}
+		}
 		cm.mu.RUnlock()
+		cm.orderEvictionBatch(ctx, batch)
 
 		if len(batch) == 0 {
 			// Nothing left that this call can reclaim; usage stays above
@@ -2141,6 +2180,11 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				return
 			}
 			if isPathPinned(ref.key, pinnedPrefixes) {
+				skipped[ref.key] = struct{}{}
+				continue
+			}
+			if cm.isOpen(ref.key) {
+				cm.metrics.EvictionSkippedOpen.Add(1)
 				skipped[ref.key] = struct{}{}
 				continue
 			}
@@ -2168,6 +2212,8 @@ func (cm *DefaultCacheManager) evictToTarget(ctx context.Context, target int64) 
 				continue
 			}
 			cm.metrics.RecordEviction()
+			cm.evictBytes.add(freed, time.Now())
+			cm.queueEvictRetraction(ref.key)
 			cm.logger.Printf("Evicted %s (%d bytes)", ref.key, freed)
 		}
 	}
@@ -2179,6 +2225,7 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if e, ok := cm.entries.get(filePath); ok && e != nil {
+		cm.notePersistedLocked(filePath, e)
 		e.PersistedToCloud = true
 	}
 	parentPath, isChunk := parentFilePathFromChunkPath(filePath)
@@ -2195,7 +2242,21 @@ func (cm *DefaultCacheManager) markPersistedToCloud(filePath string) {
 			return
 		}
 	}
+	cm.notePersistedLocked(parentPath, parent)
 	parent.PersistedToCloud = true
+}
+
+// notePersistedLocked records in the persisted ledger that e, about to be
+// flagged durable, has its bytes on local NVMe; every place that flips
+// PersistedToCloud goes through here so a restart trusts all of them
+// (persisted_ledger.go). A no-op when the entry was already durable or is not
+// a local file (chunk files of a parent are recorded individually). Caller
+// holds cm.mu.
+func (cm *DefaultCacheManager) notePersistedLocked(filePath string, e *CacheEntry) {
+	if e == nil || e.PersistedToCloud || e.Tier != TierNVMe || cm.persisted == nil {
+		return
+	}
+	cm.persisted.record(filePath, filepath.Join(cm.config.NVMePath, strings.TrimPrefix(filePath, "/")))
 }
 
 // evictionSafe reports whether an entry's bytes exist beyond this node.
@@ -2370,6 +2431,10 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 	// the max pool, a 3-chunk file the floor (the old fixed cap of 8
 	// throttled multi-GB uploads).
 	workers := cm.persistWorkersFor(numChunks)
+	if err := cm.dropChunkSums(ctx, filePath); err != nil {
+		return err
+	}
+	sums := newChunkSumsBuilder(numChunks)
 
 	var errMu sync.Mutex
 	var firstErr error
@@ -2414,7 +2479,9 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 				}
 				if err := cm.persistToCloudGen(ctx, chunkPath, data, filePath, gen); err != nil {
 					setErr(err)
+					continue
 				}
+				sums.add(idx, data)
 			}
 		}()
 	}
@@ -2437,6 +2504,7 @@ func (cm *DefaultCacheManager) persistChunkedFileToCloudGen(ctx context.Context,
 		return errPersistAbandoned
 	}
 
+	cm.writeChunkSums(ctx, filePath, sums)
 	cm.completeChunkedPersist(ctx, filePath, numChunks, gen)
 	return nil
 }
@@ -2464,6 +2532,7 @@ func (cm *DefaultCacheManager) completeChunkedPersist(ctx context.Context, fileP
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.IsChunked {
 		if !haveShape || parent.Size == shape.Size {
+			cm.notePersistedLocked(filePath, parent)
 			parent.PersistedToCloud = true
 			if !haveShape {
 				shape = persistShape{
@@ -2700,6 +2769,13 @@ func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath
 		}
 		return nil, err
 	}
+	// Remote chunk bytes are checked before anything uses or lands them; a
+	// mismatch fails this tier so the caller falls through to the next.
+	if tier == TierPeer || tier == TierCloud {
+		if verr := cm.verifyRemoteChunk(ctx, filePath, tier, data); verr != nil {
+			return nil, verr
+		}
+	}
 
 	entry := &CacheEntry{
 		FilePath:     filePath,
@@ -2847,6 +2923,10 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 	}
 	defer f.Close()
 
+	if err := cm.dropChunkSums(ctx, filePath); err != nil {
+		return err
+	}
+	sums := newChunkSumsBuilder(numChunks)
 	buf := make([]byte, chunkSize)
 	var total int64
 	var uploaded int64
@@ -2873,6 +2953,7 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 		if err := cm.persistToCloudGen(ctx, chunkPath, chunkData, filePath, gen); err != nil {
 			return err
 		}
+		sums.add(i, chunkData)
 		total += int64(n)
 		uploaded++
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
@@ -2888,9 +2969,11 @@ func (cm *DefaultCacheManager) persistWholeFileAsChunksStride(ctx context.Contex
 		return errPersistAbandoned
 	}
 
+	cm.writeChunkSums(ctx, filePath, sums)
 	shape := persistShape{Size: total, IsChunked: true, ChunkSize: chunkSize, NumChunks: numChunks}
 	cm.mu.Lock()
 	if parent, ok := cm.entries.get(filePath); ok && parent != nil && parent.Size == total {
+		cm.notePersistedLocked(filePath, parent)
 		parent.PersistedToCloud = true
 	}
 	cm.mu.Unlock()
@@ -3293,10 +3376,14 @@ func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, o
 				filePath, endChunk, len(prefetchChunks), float64(prefetchBudgetBytes)/(1024*1024), float64(rangeBytes)/(1024*1024))
 		}
 		cm.metrics.PrefetchIssued.Add(int64(len(prefetchChunks)))
+		// The same budget a foreground read of these chunks gets: a prefetch
+		// that falls through to the cloud tier under the peer timeout gave
+		// up on exactly the chunks that most needed a head start.
+		prefetchTimeout := cm.chunkReadTimeout(remoteOrder, hybridRead)
 		for _, prefetchChunk := range prefetchChunks {
 			go func(chunkIndex int64) {
 				defer cm.releasePrefetchReservation(filePath, chunkIndex, chunkSize)
-				prefetchCtx, cancel := context.WithTimeout(context.Background(), cm.config.PeerTimeout)
+				prefetchCtx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
 				defer cancel()
 				if _, _, err := cm.readChunkData(prefetchCtx, filePath, chunkIndex, remoteOrder, hybridRead); err == nil {
 					cm.markChunkPrefetched(filePath, chunkIndex)
@@ -4332,8 +4419,34 @@ type CacheMetrics struct {
 	ChunkCompletionSkipped   atomic.Int64
 	// Eviction durability guard + watermark evictor.
 	EvictionSkippedUnpersisted atomic.Int64
-	WatermarkEvictorRuns       atomic.Int64
-	WatermarkEvictedBytes      atomic.Int64
+	// ChunkCompletionEager counts assemblies triggered by the last chunk
+	// landing rather than by the range cache going idle.
+	ChunkCompletionEager atomic.Int64
+	// ChunkCompletionOnOpen counts completions queued because a read-only
+	// open wanted passthrough and the file was not whole yet.
+	ChunkCompletionOnOpen atomic.Int64
+	// RehydratePersistedTrusted counts files rehydration marked durable from
+	// the persisted ledger (no cloud probe needed to evict them).
+	RehydratePersistedTrusted atomic.Int64
+	// Location-row retraction after eviction (evict_retract.go).
+	EvictRetracted              atomic.Int64
+	EvictRetractFailed          atomic.Int64
+	EvictRetractSkippedRelanded atomic.Int64
+	EvictRetractDropped         atomic.Int64
+	// EvictionSkippedOpen counts candidates kept because a FUSE handle on
+	// them is open (open_pins.go).
+	EvictionSkippedOpen atomic.Int64
+	// EvictOrderShared counts eviction candidates moved forward because
+	// another node holds them (evict_order.go).
+	EvictOrderShared atomic.Int64
+	// Remote chunk content verification (chunk_sums.go).
+	RemoteChunkVerified   atomic.Int64
+	RemoteChunkUnverified atomic.Int64
+	RemoteChunkCorrupt    atomic.Int64
+	ChunkSumsWritten      atomic.Int64
+	ChunkSumsWriteFailed  atomic.Int64
+	WatermarkEvictorRuns  atomic.Int64
+	WatermarkEvictedBytes atomic.Int64
 }
 
 // NewCacheMetrics creates a new CacheMetrics

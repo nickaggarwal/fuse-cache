@@ -226,6 +226,32 @@ func (cc *CoordinatorClient) UpdateFileLocation(ctx context.Context, location *F
 	return nil
 }
 
+// TierLocationDeleter is implemented by coordinators that can retract one
+// peer's rows in a single storage tier. Optional, so test doubles of
+// Coordinator need not implement it; callers fall back to doing nothing.
+type TierLocationDeleter interface {
+	DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error
+}
+
+func (cc *CoordinatorClient) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
+	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s&storage_tier=%s", cc.addr,
+		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID), neturl.QueryEscape(tier))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := cc.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete tier location failed: %s", string(b))
+	}
+	return nil
+}
+
 func (cc *CoordinatorClient) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
 	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s", cc.addr,
 		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID))

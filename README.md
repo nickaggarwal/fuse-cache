@@ -90,7 +90,7 @@ Orientation for "I want to change X — which file?"
 | Eviction / NVMe budget | `internal/cache/nvme_storage.go`, the watermark evictor in `cache.go` |
 | Thundering-herd control | `peer_admission.go`, `origin_lease.go`, `replica_reconciler.go`, `chunk_advertise.go` |
 | Peer registry, file locations, etcd | `internal/coordinator/` (`coordinator.go`, `store.go`, `etcd_store.go`) |
-| The FUSE syscall layer | `internal/fuse/gofuse_backend.go` (default), `filesystem.go` (bazil) |
+| The FUSE syscall layer | `internal/fuse/gofuse_backend.go` (shared helpers in `common.go`) |
 | Kubernetes CSI / volume warmup | `internal/csidriver/`, `internal/agentserver/`, `internal/session/`, `internal/cache/warmup.go` |
 | An HTTP endpoint | `internal/api/handler.go`, `internal/api/warm.go` |
 | A Prometheus metric | `handlePromMetrics` in `internal/api/handler.go` |
@@ -147,7 +147,7 @@ python3 -m unittest discover -s tools/dashboard
 
 ### Developing on macOS
 
-`bazil.org/fuse` and `hanwen/go-fuse` are Linux-only, so a bare
+`hanwen/go-fuse` is Linux-only, so a bare
 `go build ./...` fails on macOS with `undefined: mount` and friends. This is
 expected, not a broken checkout. What works:
 
@@ -558,7 +558,7 @@ fuse-client/
 │   ├── cache/             # Cache manager, tiers, adaptive profiles,
 │   │                      #   tee promotion, completion, eviction
 │   ├── coordinator/       # Coordinator service + etcd store + leases
-│   ├── fuse/              # bazil + gofuse backends (passthrough)
+│   ├── fuse/              # go-fuse backend (passthrough)
 │   ├── nodeinit/          # Disk discovery/benchmark/mount
 │   ├── agentserver/, session/, csidriver/   # CSI subsystem
 │   └── pb/                # Generated gRPC stubs
@@ -603,7 +603,7 @@ gRPC ports and peering that the examples below omit.
 |---|---|---|
 | `-port` | `8080` | HTTP |
 | `-grpc-port` | `9080` | gRPC — the default client transport |
-| `-etcd-endpoints` | *(empty)* | Empty ⇒ in-memory store (single-node / local dev) |
+| `-etcd-endpoints` | *(empty)* | Empty ⇒ in-memory store (single-node / local dev). The Helm chart sets it by default (`etcd.enabled: true`, a 3-member StatefulSet, 2 coordinator replicas) |
 | `-etcd-prefix` | `/fuse` | Key prefix |
 | `-etcd-peer-lease-ttl` | | Peer lease TTL |
 
@@ -618,7 +618,7 @@ gRPC ports and peering that the examples below omit.
 |---|---|---|
 | `-mount` | `/tmp/fuse-client` | FUSE mount point |
 | `-nvme` | `/tmp/nvme-cache` | NVMe cache directory |
-| `-fuse-backend` | `gofuse` | `gofuse` (kernel passthrough with `FUSE_GOFUSE_ENABLE_PASSTHROUGH=1`, Linux 6.9+) or `bazil` |
+| `-fuse-backend` | `gofuse` | `gofuse` only (kernel passthrough with `FUSE_GOFUSE_ENABLE_PASSTHROUGH=1`, Linux 6.9+); the bazil backend was removed |
 | `-coordinator-grpc` | `localhost:9080` | Default transport |
 | `-coordinator` | `localhost:8080` | HTTP fallback |
 | `-port` / `-grpc-port` | `8081` / `9081` | Peer API |

@@ -30,14 +30,13 @@ import (
 	pb "fuse-client/internal/pb"
 	"fuse-client/internal/session"
 
-	fusepkg "bazil.org/fuse"
 	"google.golang.org/grpc"
 )
 
 func main() {
 	var (
 		mountPoint      = flag.String("mount", "/tmp/fuse-client", "Mount point for FUSE filesystem")
-		fuseBackendName = flag.String("fuse-backend", "gofuse", "FUSE backend: gofuse (default; kernel passthrough with FUSE_GOFUSE_ENABLE_PASSTHROUGH) or bazil")
+		fuseBackendName = flag.String("fuse-backend", "gofuse", "FUSE backend: gofuse (the only backend; kernel passthrough with FUSE_GOFUSE_ENABLE_PASSTHROUGH). The bazil backend was removed")
 		nvmePath        = flag.String("nvme", "/tmp/nvme-cache", "Path for NVME cache storage")
 		nodeInitConfig  = flag.String("node-init-config", "", "Path to a node-init config file; when set and readable, its discovered cache dir and byte budget override -nvme/-nvme-max-gb")
 		nodeInitWaitSec = flag.Int("node-init-wait-sec", 30, "How long to wait for the node-init config file to appear before falling back to -nvme")
@@ -81,46 +80,49 @@ func main() {
 		cloudKeyPrefix = flag.String("cloud-key-prefix", "", "Prefix every cloud object key with this cluster scope (empty = flat, legacy layout)")
 
 		// NVMe capacity
-		nvmeMaxGB            = flag.Int("nvme-max-gb", 0, "Maximum NVMe cache size in GB; 0 (default) sizes it from the -nvme filesystem like node-init (80% of free space), falling back to 10 GB when the filesystem cannot be read")
-		peerMaxGB            = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
-		peerReadMBps         = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
-		parallelReads        = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
-		prefetchChunks       = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
-		prefetchMaxChunks    = flag.Int("range-prefetch-max-chunks", 16, "Max chunks the adaptive readahead window grows to on sequential reads")
-		rangeChunkCache      = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
-		rangeChunkCacheMaxMB = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
-		rangePrefetchMaxMB   = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
-		rangeWholeFileReads  = flag.Bool("range-whole-file-reads", false, "Serve windows of a chunked file straight from its whole local copy (exact bytes, no read amplification) instead of the per-chunk path. Off by default: it has no read-ahead, so on fast local NVMe it is slower than the prefetching chunk path (A100 node, page cache dropped: 21.1 s vs 8.7 s for 15 GB). FUSE_RANGE_WHOLE_FILE_READS env overrides")
-		noChunkWindowReads   = flag.Bool("no-chunk-window-reads", false, "Read a whole chunk for every random window that misses the range cache, instead of only the window's bytes from the local chunk file. Off by default; sequential streams use the per-chunk path either way")
-		noBlobFill           = flag.Bool("no-blob-fill", false, "Do not keep fetched OCI blob chunks on this node (the blob endpoint still serves them). For model nodes where nydusd's own cache already holds the image; FUSE_NO_BLOB_FILL=1 sets it")
-		blobScrubHours       = flag.Int("blob-scrub-hours", 24, "Re-hash every local OCI blob against its digest this often; bad copies are moved aside and stop being served. 0 disables the periodic scrub (unverified blobs are still checked once at startup)")
-		peerSortNet          = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
-		peerFanout           = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
-		hybridAlwaysMB       = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
-		hybridStripeMB       = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
-		hybridHedgeMS        = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
-		hybridHedgeMax       = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
-		adaptiveRemoteRead   = flag.Bool("adaptive-remote-read", true, "Choose peer vs cloud read order and hedging from measured per-tier latency/success instead of a static peer-first policy")
-		peerRawTransport     = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
-		peerServeMaxIn       = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
-		peerReplStaggerMS    = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
-		globalRead           = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
-		fetchLeaseEnabled    = flag.Bool("fetch-lease", false, "Take a short-TTL coordinator lease before cloud pulls so simultaneous misses of one object collapse to a single origin fetch (thundering-herd Phase 2; opt-in — adds cold-read latency on isolated reads)")
-		fastChunkAdvertise   = flag.Bool("fast-chunk-advertise", false, "Publish this node as a holder the moment the first remotely-fetched chunk lands on NVMe, so later readers pull from the growing swarm (thundering-herd Phase 3; opt-in — promotion competes with isolated reads)")
-		reconcileIntervalSec = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
-		reconcileTarget      = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
-		reconcileMaxPerRun   = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
-		reconcileMaxTarget   = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
-		warmReconcileSec     = flag.Int("warm-reconcile-interval-sec", 0, "How often declared CSI warmup intents are re-asserted against actual residency; 0 uses the default (120s), negative disables re-assertion (first pass at mount still runs)")
-		peerLabelsFlag       = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
-		peerLabelsFromNode   = flag.String("peer-labels-from-node", "", "Comma-separated node label keys to import as peer labels, each optionally renamed peerKey=nodeKey (e.g. pool=agentpool,topology.kubernetes.io/zone); needs NODE_NAME and RBAC get on nodes. FUSE_PEER_LABELS_FROM_NODE env overrides; imported keys win over -peer-labels")
-		mountRetries         = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
-		mountDelayS          = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
-		mountRemountAttempts = flag.Int("mount-remount-attempts", fusemount.DefaultRemountAttempts, "Consecutive remounts to attempt when the FUSE serve loop dies before exiting so the DaemonSet restarts the pod; negative disables remounting (first death is fatal)")
+		nvmeMaxGB             = flag.Int("nvme-max-gb", 0, "Maximum NVMe cache size in GB; 0 (default) sizes it from the -nvme filesystem like node-init (80% of free space), falling back to 10 GB when the filesystem cannot be read")
+		peerMaxGB             = flag.Int("peer-max-gb", 5, "File size threshold in GB for peer-first reads; larger files prefer cloud-first")
+		peerReadMBps          = flag.Int64("peer-read-mbps", 200, "Assumed per-peer read throughput in MB/s for hybrid peer+cloud read decisions")
+		parallelReads         = flag.Int("parallel-range-reads", 8, "Parallel workers for multi-chunk range reads")
+		prefetchChunks        = flag.Int("range-prefetch-chunks", 2, "How many sequential chunks to prefetch")
+		prefetchMaxChunks     = flag.Int("range-prefetch-max-chunks", 16, "Max chunks the adaptive readahead window grows to on sequential reads")
+		rangeChunkCache       = flag.Int("range-chunk-cache-size", 16, "Max cached chunks per file for range reads")
+		rangeChunkCacheMaxMB  = flag.Int("range-chunk-cache-max-bytes-mb", 512, "Max per-file range cache budget in MiB")
+		rangePrefetchMaxMB    = flag.Int("range-prefetch-max-bytes-mb", 128, "Max in-flight prefetch budget per file in MiB")
+		rangeWholeFileReads   = flag.Bool("range-whole-file-reads", false, "Serve windows of a chunked file straight from its whole local copy (exact bytes, no read amplification) instead of the per-chunk path. Off by default: it has no read-ahead, so on fast local NVMe it is slower than the prefetching chunk path (A100 node, page cache dropped: 21.1 s vs 8.7 s for 15 GB). FUSE_RANGE_WHOLE_FILE_READS env overrides")
+		noChunkWindowReads    = flag.Bool("no-chunk-window-reads", false, "Read a whole chunk for every random window that misses the range cache, instead of only the window's bytes from the local chunk file. Off by default; sequential streams use the per-chunk path either way")
+		noBlobFill            = flag.Bool("no-blob-fill", false, "Do not keep fetched OCI blob chunks on this node (the blob endpoint still serves them). For model nodes where nydusd's own cache already holds the image; FUSE_NO_BLOB_FILL=1 sets it")
+		blobScrubHours        = flag.Int("blob-scrub-hours", 24, "Re-hash every local OCI blob against its digest this often; bad copies are moved aside and stop being served. 0 disables the periodic scrub (unverified blobs are still checked once at startup)")
+		peerSortNet           = flag.Bool("peer-read-sort-by-network", true, "Sort peer read candidates by measured network score")
+		peerFanout            = flag.Bool("peer-read-parallel-fanout", true, "Enable parallel peer fanout for chunk-path reads")
+		hybridAlwaysMB        = flag.Int("hybrid-always-min-size-mb", 512, "Always enable hybrid peer+cloud hedging for files at/above this size in MB")
+		hybridStripeMB        = flag.Int("hybrid-stripe-min-size-mb", 1024, "Enable deterministic peer/cloud chunk striping for files at/above this size in MB")
+		hybridHedgeMS         = flag.Int("hybrid-hedge-delay-ms", 20, "Delay before launching cloud fallback in hybrid reads")
+		hybridHedgeMax        = flag.Int("hybrid-max-secondary-inflight", 16, "Max concurrent hedged cloud fallback reads")
+		adaptiveRemoteRead    = flag.Bool("adaptive-remote-read", true, "Choose peer vs cloud read order and hedging from measured per-tier latency/success instead of a static peer-first policy")
+		peerRawTransport      = flag.Bool("peer-raw-transport", true, "Use a plain-HTTP bulk transport (sendfile) for peer chunk reads instead of gRPC, falling back to gRPC on error")
+		peerServeMaxIn        = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
+		peerReplStaggerMS     = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
+		globalRead            = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
+		evictPreferReplicated = flag.Bool("evict-prefer-replicated", true, "Within the coldest eviction candidates, evict files other nodes also hold first, then whole cold releases (a directory, idle since its most recent access) by idle time x size")
+		verifyRemoteChunks    = flag.Bool("verify-remote-chunks", true, "Check chunks read from peers or object storage against the file's CRC-32C manifest, written when a chunked file is persisted; a mismatching copy is rejected and the next tier tried")
+		fetchLeaseEnabled     = flag.Bool("fetch-lease", false, "Take a short-TTL coordinator lease before cloud pulls so simultaneous misses of one object collapse to a single origin fetch (thundering-herd Phase 2; opt-in — adds cold-read latency on isolated reads)")
+		fastChunkAdvertise    = flag.Bool("fast-chunk-advertise", false, "Publish this node as a holder the moment the first remotely-fetched chunk lands on NVMe, so later readers pull from the growing swarm (thundering-herd Phase 3; opt-in — promotion competes with isolated reads)")
+		reconcileIntervalSec  = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
+		reconcileTarget       = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
+		reconcileMaxPerRun    = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
+		reconcileMaxTarget    = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
+		warmReconcileSec      = flag.Int("warm-reconcile-interval-sec", 0, "How often declared CSI warmup intents are re-asserted against actual residency; 0 uses the default (120s), negative disables re-assertion (first pass at mount still runs)")
+		peerLabelsFlag        = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
+		peerLabelsFromNode    = flag.String("peer-labels-from-node", "", "Comma-separated node label keys to import as peer labels, each optionally renamed peerKey=nodeKey (e.g. pool=agentpool,topology.kubernetes.io/zone); needs NODE_NAME and RBAC get on nodes. FUSE_PEER_LABELS_FROM_NODE env overrides; imported keys win over -peer-labels")
+		mountRetries          = flag.Int("mount-retries", 8, "Number of retries for FUSE mount recovery")
+		mountDelayS           = flag.Int("mount-retry-delay-sec", 2, "Base delay in seconds between FUSE mount retries")
+		mountRemountAttempts  = flag.Int("mount-remount-attempts", fusemount.DefaultRemountAttempts, "Consecutive remounts to attempt when the FUSE serve loop dies before exiting so the DaemonSet restarts the pod; negative disables remounting (first death is fatal)")
 
 		// CSI agent server
 		agentSocket       = flag.String("agent-socket", "/var/run/fuse-client/agent.sock", "Unix socket path for CSI agent gRPC server")
 		enableAgentServer = flag.Bool("enable-agent-server", true, "Enable the agent gRPC server for CSI integration")
+		sessionState      = flag.String("session-state", "", "File persisting CSI sessions (pins, warmup intents, refcounts) across daemon restarts; default <nvme>/.fuse-ledger/sessions.json, \"none\" disables")
 
 		// Model KV store: a durable store for LLM KV-cache blocks with a write
 		// path deliberately unlike the weights path. Off by default because it
@@ -285,6 +287,8 @@ func main() {
 		PeerServeMaxInflight:       *peerServeMaxIn,
 		PeerReplicationStagger:     time.Duration(*peerReplStaggerMS) * time.Millisecond,
 		FetchLeaseEnabled:          *fetchLeaseEnabled,
+		VerifyRemoteChunks:         *verifyRemoteChunks,
+		EvictPreferReplicated:      *evictPreferReplicated,
 		GlobalReadEnabled:          *globalRead,
 		FastChunkAdvertise:         *fastChunkAdvertise,
 		ReplicaReconcileInterval:   time.Duration(*reconcileIntervalSec) * time.Second,
@@ -578,6 +582,15 @@ func main() {
 	var sessMgr *session.Manager
 	if *enableAgentServer {
 		sessMgr = session.NewManager(*mountPoint)
+		// Restore sessions before the cache manager exists so restored pins
+		// hold from the first eviction pass (see session persistence).
+		if statePath := resolveSessionState(*sessionState, *nvmePath); statePath != "" {
+			if n, err := sessMgr.EnablePersistence(statePath); err != nil {
+				logger.Printf("WARNING: session persistence disabled: %v", err)
+			} else {
+				logger.Printf("Session state: %s (%d restored)", statePath, n)
+			}
+		}
 		cacheConfig.PinnedPrefixesFn = sessMgr.PinnedPrefixes
 	}
 
@@ -615,6 +628,9 @@ func main() {
 		sessMgr.SetTeardownHook(func(volumeID string) {
 			cacheManager.ForgetWarmIntent(volumeID)
 		})
+		// Sessions restored from disk declared their warmup before the
+		// restart; re-register those intents now that the hook is set.
+		sessMgr.ReplayWarmups()
 	}
 
 	// Start peer gRPC server
@@ -709,14 +725,13 @@ func main() {
 	// Create FUSE backend
 	var filesystem fusemount.Backend
 	switch backend := normalizeFuseBackend(*fuseBackendName); backend {
-	case "bazil":
-		filesystem = &bazilFuseBackend{fs: fusefs.NewFileSystem(cacheManager)}
-		*fuseBackendName = "bazil"
 	case "gofuse":
 		filesystem = fusefs.NewGoFuseFileSystem(cacheManager)
 		*fuseBackendName = "gofuse"
+	case "bazil":
+		logger.Fatalf("FUSE backend bazil was removed; use gofuse (unset FUSE_BACKEND / -fuse-backend)")
 	default:
-		logger.Fatalf("Unsupported FUSE backend %q (expected bazil or gofuse)", *fuseBackendName)
+		logger.Fatalf("Unsupported FUSE backend %q (expected gofuse)", *fuseBackendName)
 	}
 
 	// Mount the FUSE filesystem
@@ -943,8 +958,11 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 	defer t.Stop()
 	last := ""
 	for {
-		if inst := coordinatorInstance(ctx, addr); inst != "" && inst != last {
-			logger.Printf("Coordinator instance %q -> %q: republishing local objects", last, inst)
+		if inst, caps := coordinatorHealth(ctx, addr); inst != "" && inst != last {
+			logger.Printf("Coordinator instance %q -> %q: republishing local objects (capabilities %v)", last, inst, caps)
+			if cs, ok := cm.(interface{ SetCoordinatorCapabilities([]string) }); ok {
+				cs.SetCoordinatorCapabilities(caps)
+			}
 			rp.RepublishLocal(ctx)
 			last = inst
 		}
@@ -1002,27 +1020,35 @@ func watchMountHealth(ctx context.Context, coordClient coordinator.Coordinator, 
 // coordinatorInstance returns the coordinator's instance ID from
 // GET /api/health, or "" when unreachable or too old to report one.
 func coordinatorInstance(ctx context.Context, addr string) string {
+	inst, _ := coordinatorHealth(ctx, addr)
+	return inst
+}
+
+// coordinatorHealth returns the instance ID and advertised capabilities from
+// GET /api/health ("" and nil when unreachable or too old).
+func coordinatorHealth(ctx context.Context, addr string) (string, []string) {
 	if addr == "" {
-		return ""
+		return "", nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "http://"+addr+"/api/health", nil)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	defer resp.Body.Close()
 	var h struct {
-		Instance string `json:"instance"`
+		Instance     string   `json:"instance"`
+		Capabilities []string `json:"capabilities"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
-		return ""
+		return "", nil
 	}
-	return h.Instance
+	return h.Instance, h.Capabilities
 }
 
 func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coordHTTPAddr string, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
@@ -1292,31 +1318,6 @@ func getLocalIP() string {
 	return "localhost"
 }
 
-type bazilFuseBackend struct {
-	fs   *fusefs.FileSystem
-	conn *fusepkg.Conn
-}
-
-func (b *bazilFuseBackend) Mount(ctx context.Context, mountPoint string) error {
-	conn, err := b.fs.Mount(ctx, mountPoint)
-	if err != nil {
-		return err
-	}
-	b.conn = conn
-	return nil
-}
-
-func (b *bazilFuseBackend) Serve(ctx context.Context) error {
-	if b.conn == nil {
-		return fmt.Errorf("bazil backend serve called before mount")
-	}
-	return b.fs.Serve(ctx, b.conn)
-}
-
-func (b *bazilFuseBackend) Unmount(mountPoint string) error {
-	return b.fs.Unmount(mountPoint)
-}
-
 func enabledState(on bool) string {
 	if on {
 		return "enabled"
@@ -1365,4 +1366,20 @@ func blobScrubInterval(hours int) time.Duration {
 		return -1
 	}
 	return time.Duration(hours) * time.Hour
+}
+
+// resolveSessionState maps the -session-state flag to a path: "" means the
+// reserved ledger directory on the NVMe cache (a hostPath that outlives the
+// pod), "none" disables persistence.
+func resolveSessionState(flagVal, nvmeDir string) string {
+	switch flagVal {
+	case "none":
+		return ""
+	case "":
+		if nvmeDir == "" {
+			return ""
+		}
+		return filepath.Join(nvmeDir, ".fuse-ledger", "sessions.json")
+	}
+	return flagVal
 }

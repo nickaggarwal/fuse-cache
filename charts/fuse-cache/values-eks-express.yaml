@@ -20,8 +20,12 @@ image:
   repository: 375353318962.dkr.ecr.us-east-1.amazonaws.com/fuse-client
   tag: express-v1
 
+etcd:
+  storageClassName: gp2
+
 coordinator:
   replicaCount: 3
+  haReplicaCount: 3
   persistence:
     enabled: true
     storageClassName: gp2

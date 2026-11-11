@@ -54,19 +54,18 @@ type warmIntent struct {
 	lastVerified time.Time
 	lastErr      error
 	passes       int64
+	// rewarmStreak counts consecutive passes (after the first) that had to
+	// fetch files back: the thrashing signal in cache_health.go.
+	rewarmStreak int
 }
 
 // warmIntentRegistry holds the declared warmup intents for this node.
 //
-// Deliberately in-memory, matching session.Manager, which also keeps no
-// on-disk state. That means a daemon restart drops every intent — and because
-// the CSI driver short-circuits NodePublishVolume when the target path is
-// already a mountpoint (internal/csidriver/driver.go), a surviving bind mount
-// will not recreate the session, so nothing re-registers the intent either.
-// The same restart already drops pinning for the same reason. Fixing that
-// belongs with session persistence, not here; until then a restarted daemon
-// serves the subtree correctly through just-in-time pulls, just without the
-// residency guarantee.
+// In memory: the durable record is the CSI session table, which
+// session.Manager persists (pins, warmup policy, refcounts) and replays on
+// startup through the warmup hook, so a daemon restart re-registers every
+// intent whose bind mount survived (the CSI driver short-circuits
+// NodePublishVolume for those, so nothing else would).
 type warmIntentRegistry struct {
 	mu      sync.Mutex
 	intents map[string]*warmIntent
@@ -124,6 +123,12 @@ func (r *warmIntentRegistry) recordPass(volumeID string, res *WarmupResult, err 
 		return
 	}
 	in.passes++
+	// The first pass is the initial warm, not a re-warm.
+	if in.passes > 1 && err == nil && res != nil && res.Warmed > 0 {
+		in.rewarmStreak++
+	} else if err == nil && res != nil && res.Warmed == 0 {
+		in.rewarmStreak = 0
+	}
 	in.lastResult = res
 	in.lastErr = err
 	// lastVerified advances only on a clean pass. A failed pass must not
@@ -142,6 +147,7 @@ type WarmIntentStatus struct {
 	Source       string        `json:"source,omitempty"`
 	Bandwidth    string        `json:"bandwidth,omitempty"`
 	Passes       int64         `json:"passes"`
+	RewarmStreak int           `json:"rewarm_streak"`
 	LastVerified time.Time     `json:"last_verified,omitempty"`
 	LastError    string        `json:"last_error,omitempty"`
 	LastResult   *WarmupResult `json:"last_result,omitempty"`
@@ -178,7 +184,8 @@ func (cm *DefaultCacheManager) WarmIntents() []WarmIntentStatus {
 		st := WarmIntentStatus{
 			VolumeID: in.volumeID, Prefix: in.prefix,
 			Mode: in.opts.Mode, Source: in.opts.Source, Bandwidth: in.opts.Bandwidth,
-			Passes: in.passes, LastVerified: in.lastVerified, LastResult: in.lastResult,
+			Passes: in.passes, RewarmStreak: in.rewarmStreak,
+			LastVerified: in.lastVerified, LastResult: in.lastResult,
 		}
 		if in.lastErr != nil {
 			st.LastError = in.lastErr.Error()

@@ -41,7 +41,7 @@ need helm
 need python3
 
 # Only the binaries this script drives. `make build` includes cmd/client,
-# which is Linux-only (bazil/go-fuse), so it cannot be used here.
+# which is Linux-only (go-fuse), so it cannot be used here.
 echo "Building binaries..."
 go build -o bin/globalcp ./cmd/globalcp \
   && go build -o bin/coordinator ./cmd/coordinator \

@@ -102,6 +102,7 @@ func (cm *DefaultCacheManager) promoteChunkAndAdvertise(ctx context.Context, fil
 	}
 
 	cm.advertiseChunkParent(ctx, filePath)
+	cm.maybeCompleteOnLastChunk(ctx, filePath)
 }
 
 // advertiseChunkParent publishes this node as a holder of filePath (coalesced

@@ -1,0 +1,127 @@
+{{- if .Values.etcd.enabled }}
+{{- $ns := include "fuse-cache.namespace" . }}
+{{- $n := int .Values.etcd.replicaCount }}
+# Coordinator state store. With etcd the coordinator is stateless: it can run
+# several replicas, and a restart or reschedule keeps every peer, location row
+# and lease instead of starting empty while holders republish.
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: {{ $ns }}
+  labels:
+    app: etcd
+spec:
+  type: ClusterIP
+  clusterIP: None
+  # Per-pod DNS before readiness: members must resolve each other to form the
+  # initial quorum, and readiness itself requires quorum.
+  publishNotReadyAddresses: true
+  selector:
+    app: etcd
+  ports:
+    - port: 2379
+      name: client
+    - port: 2380
+      name: peer
+---
+{{- if gt $n 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: etcd
+  namespace: {{ $ns }}
+spec:
+  minAvailable: {{ add (div $n 2) 1 }}
+  selector:
+    matchLabels:
+      app: etcd
+---
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: {{ $ns }}
+  labels:
+    app: etcd
+spec:
+  serviceName: etcd
+  replicas: {{ $n }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: etcd
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: etcd
+          # etcd v3.5+ images have no shell: direct exec with $(VAR) expansion.
+          image: {{ .Values.etcd.image | quote }}
+          command:
+            - etcd
+            - --name=$(HOSTNAME)
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(HOSTNAME).etcd:2379
+            - --initial-advertise-peer-urls=http://$(HOSTNAME).etcd:2380
+            - --initial-cluster-token=fuse-etcd-cluster
+            - --initial-cluster={{ range $i, $_ := until $n }}{{ if $i }},{{ end }}etcd-{{ $i }}=http://etcd-{{ $i }}.etcd:2380{{ end }}
+            - --initial-cluster-state=new
+            - --data-dir=/var/lib/etcd
+            - --auto-compaction-mode=periodic
+            - --auto-compaction-retention=1h
+            - --snapshot-count=10000
+            - --quota-backend-bytes=2147483648
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+          livenessProbe:
+            exec:
+              command: ["etcdctl", "endpoint", "health", "--endpoints=http://127.0.0.1:2379"]
+            # Health requires quorum; a tight probe deadlocks bootstrap
+            # (kill, restart, re-elect, kill).
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 8
+          readinessProbe:
+            exec:
+              command: ["etcdctl", "endpoint", "health", "--endpoints=http://127.0.0.1:2379"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.etcd.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.etcd.storageClassName }}
+        resources:
+          requests:
+            storage: {{ .Values.etcd.size }}
+{{- end }}

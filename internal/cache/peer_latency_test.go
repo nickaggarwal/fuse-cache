@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -239,5 +240,37 @@ func TestReadPeerData_TransferFailureStillRecorded(t *testing.T) {
 	}
 	if success > 0.01 {
 		t.Fatalf("dead peer success = %.4f, want ~0", success)
+	}
+}
+
+// Two holders measured within a few percent of each other share a cold
+// start: chunks spread across both instead of all going to whichever EWMA
+// happens to be a hair lower. A clearly faster holder still wins.
+func TestSortByObservedLatency_SpreadsAcrossNearEqualHolders(t *testing.T) {
+	ps := newLatencyTestPeerStorage(t)
+	defer ps.Close()
+	a := &coordinator.PeerInfo{ID: "a"}
+	b := &coordinator.PeerInfo{ID: "b"}
+	samplePair(ps, "a", 2000*time.Microsecond, true, 5)
+	samplePair(ps, "b", 2050*time.Microsecond, true, 5)
+
+	first := map[string]int{}
+	for i := 0; i < 64; i++ {
+		peers := []*coordinator.PeerInfo{a, b}
+		ps.sortByObservedLatency(peers, fmt.Sprintf("/m.bin_chunk_%d", i))
+		first[peers[0].ID]++
+	}
+	if first["a"] < 16 || first["b"] < 16 {
+		t.Fatalf("near-equal holders not sharing chunks: %v", first)
+	}
+
+	c := &coordinator.PeerInfo{ID: "c"}
+	samplePair(ps, "c", 10*time.Millisecond, true, 5)
+	for i := 0; i < 16; i++ {
+		peers := []*coordinator.PeerInfo{c, a}
+		ps.sortByObservedLatency(peers, fmt.Sprintf("/m.bin_chunk_%d", i))
+		if peers[0].ID != "a" {
+			t.Fatal("a 5x slower holder was put first")
+		}
 	}
 }

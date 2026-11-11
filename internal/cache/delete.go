@@ -230,6 +230,7 @@ func (cm *DefaultCacheManager) Delete(ctx context.Context, filePath string) erro
 	cm.retractLocationRows(ctx, filePath)
 	cm.deleteFromPeers(ctx, filePath)
 	cm.deleteCloudObjects(ctx, cloudKeys)
+	cm.deleteChunkSums(ctx, filePath, cloudKeys)
 
 	// Again after the fan-out: a chunk fetch in flight when the first
 	// invalidation ran would otherwise have re-populated the range cache, and
@@ -449,4 +450,25 @@ func (cm *DefaultCacheManager) retractLocationRows(ctx context.Context, filePath
 		cm.deleteStats.coordinatorFailures.Add(1)
 		cm.logger.Printf("Coordinator retraction of %s failed: %v", filePath, err)
 	}
+}
+
+// deleteChunkSums removes a chunked file's checksum manifest (chunk_sums.go).
+// Best-effort and uncounted: a leftover manifest is a few hundred bytes that
+// the next persist under this name replaces, not a durability failure.
+func (cm *DefaultCacheManager) deleteChunkSums(ctx context.Context, filePath string, cloudKeys []string) {
+	if cm.cloudStorage == nil {
+		return
+	}
+	chunked := false
+	for _, k := range cloudKeys {
+		if _, ok := parentFilePathFromChunkPath(k); ok {
+			chunked = true
+			break
+		}
+	}
+	if !chunked {
+		return
+	}
+	_ = cm.cloudStorage.Delete(ctx, chunkSumsKey(filePath))
+	cm.chunkSums.invalidate(filePath)
 }

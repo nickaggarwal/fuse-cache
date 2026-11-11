@@ -320,3 +320,116 @@ func TestManager_TeardownHookFiresAtRefcountZero(t *testing.T) {
 		t.Fatalf("teardown fired %v on a repeat delete, want it to stay [vol-1]", torn)
 	}
 }
+
+func withBootID(t *testing.T, id string) {
+	t.Helper()
+	prev := bootID
+	bootID = func() string { return id }
+	t.Cleanup(func() { bootID = prev })
+}
+
+// A restarted daemon reloads its sessions, pins and refcounts included, so
+// the unpublish that follows the restart releases them through the normal
+// path and fires the teardown hook at zero.
+func TestPersistenceSurvivesRestart(t *testing.T) {
+	withBootID(t, "boot-1")
+	root := tempFuseRoot(t)
+	state := filepath.Join(t.TempDir(), "state", "sessions.json")
+	ctx := context.Background()
+
+	prev := NewManager(root)
+	if _, err := prev.EnablePersistence(state); err != nil {
+		t.Fatal(err)
+	}
+	pol := CachePolicy{Pinned: true, Warmup: "full", SourcePolicy: "peer-first"}
+	for i := 0; i < 2; i++ {
+		if _, err := prev.Create(ctx, "vol-1", "/models/m", true, pol); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := prev.Create(ctx, "vol-2", "/models/other", true, CachePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prev.Delete(ctx, "vol-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	next := NewManager(root)
+	var torn []string
+	next.SetTeardownHook(func(v string) { torn = append(torn, v) })
+	warmed := make(chan WarmupRequest, 4)
+	next.SetWarmupHook(func(r WarmupRequest) { warmed <- r })
+	n, err := next.EnablePersistence(state)
+	if err != nil || n != 1 {
+		t.Fatalf("restored %d sessions (err %v), want 1", n, err)
+	}
+	if got := next.PinnedPrefixes(); len(got) != 1 || got[0] != "/models/m" {
+		t.Fatalf("pins after restart = %v, want [/models/m]", got)
+	}
+	if s := next.Get(ctx, "vol-1"); s == nil || s.RefCount != 2 {
+		t.Fatalf("restored session = %+v, want refcount 2", s)
+	}
+
+	next.ReplayWarmups()
+	select {
+	case r := <-warmed:
+		if r.VolumeID != "vol-1" || r.Mode != "full" || r.RootPath != "/models/m" {
+			t.Fatalf("replayed warmup = %+v", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restored warmup was not replayed")
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := next.Delete(ctx, "vol-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(torn) != 1 || torn[0] != "vol-1" {
+		t.Fatalf("teardown fired %v, want [vol-1]", torn)
+	}
+
+	// And the release itself was persisted.
+	again := NewManager(root)
+	if n, _ := again.EnablePersistence(state); n != 0 {
+		t.Fatalf("restored %d sessions after full release, want 0", n)
+	}
+}
+
+// After a reboot every bind mount is gone and kubelet publishes again, so a
+// table from the previous boot must not be restored (it would double-count).
+func TestPersistenceDiscardedAcrossReboot(t *testing.T) {
+	withBootID(t, "boot-1")
+	root := tempFuseRoot(t)
+	state := filepath.Join(t.TempDir(), "sessions.json")
+	ctx := context.Background()
+
+	prev := NewManager(root)
+	if _, err := prev.EnablePersistence(state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prev.Create(ctx, "vol-1", "/m", true, CachePolicy{Pinned: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	withBootID(t, "boot-2")
+	next := NewManager(root)
+	if n, _ := next.EnablePersistence(state); n != 0 {
+		t.Fatalf("restored %d sessions from a previous boot, want 0", n)
+	}
+	if got := next.PinnedPrefixes(); len(got) != 0 {
+		t.Fatalf("pins from a previous boot survived: %v", got)
+	}
+}
+
+// A corrupt state file starts empty rather than failing the daemon.
+func TestPersistenceCorruptFile(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "sessions.json")
+	if err := os.WriteFile(state, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(tempFuseRoot(t))
+	if n, err := m.EnablePersistence(state); n != 0 || err != nil {
+		t.Fatalf("corrupt state: n=%d err=%v, want 0, nil", n, err)
+	}
+}

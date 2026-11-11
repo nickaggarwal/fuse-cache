@@ -69,6 +69,12 @@ func (s *GRPCServer) UpdateFileLocation(ctx context.Context, req *pb.UpdateFileL
 }
 
 func (s *GRPCServer) DeleteFileLocation(ctx context.Context, req *pb.DeleteFileLocationRequest) (*pb.DeleteFileLocationResponse, error) {
+	if req.StorageTier != "" && !req.WholePath {
+		if err := s.service.DeletePeerTierLocation(ctx, req.FilePath, req.PeerId, req.StorageTier); err != nil {
+			return nil, err
+		}
+		return &pb.DeleteFileLocationResponse{}, nil
+	}
 	if err := s.service.DeleteFileLocation(ctx, req.FilePath, req.PeerId, req.WholePath); err != nil {
 		return nil, err
 	}

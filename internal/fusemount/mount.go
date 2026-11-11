@@ -1,7 +1,7 @@
 // Package fusemount owns the lifecycle of the FUSE mount: establishing it,
 // serving it, and deciding what to do when the serve loop dies. It is
 // deliberately backend-agnostic (see Backend) so the recovery logic can be
-// exercised in tests — the concrete bazil/go-fuse backends are Linux-only.
+// exercised in tests — the concrete go-fuse backend is Linux-only.
 package fusemount
 
 import (

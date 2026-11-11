@@ -315,6 +315,13 @@ func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *
 // DeleteFileLocation retracts file location metadata. Callers use wholePath
 // when the file itself is gone; without it only peerID's own replica rows are
 // dropped.
+// DeletePeerTierLocation retracts one peer's rows in one storage tier, used
+// when a node evicts its local copy: other holders, and this peer's cloud
+// row, are untouched.
+func (cs *CoordinatorService) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
+	return cs.store.DeletePeerTierLocation(ctx, filePath, peerID, tier)
+}
+
 func (cs *CoordinatorService) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
 	if err := cs.store.DeleteFileLocation(ctx, filePath, peerID, wholePath); err != nil {
 		return err
