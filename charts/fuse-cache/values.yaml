@@ -52,6 +52,9 @@ client:
   nodeSelector: {}
   httpPort: 8081
   grpcPort: 9081
+  # Expose the client API on this host port (e.g. 18081) so nydusd on the
+  # node can use it as its registry backend. 0 = no host port.
+  hostPort: 0
   cloudProvider: azure
   resources:
     requests:
@@ -155,6 +158,9 @@ config:
   netProbeTimeoutMs: "2000"
   netProbeEveryHeartbeats: "2"
   fuseBackend: "gofuse"
+  # Cap on one PUT body in GB (FUSE_MAX_UPLOAD_GB); 0 = client default
+  # (2 GB). Raise it above your largest image layer or model shard.
+  maxUploadGB: 0
   goFuseEnablePassthrough: "true"
   goFuseWriteAppendBufferMB: "8"
   # Writeback cache measured on EKS i7ie (2026-08-01): +4-6% on >=64MB

@@ -691,6 +691,11 @@ func main() {
 
 	// Create API handler
 	apiHandler := api.NewHandler(cacheManager, coordClient, *peerID, *apiKey)
+	if !flagSet("max-upload-gb") {
+		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("FUSE_MAX_UPLOAD_GB"))); err == nil && v > 0 {
+			*maxUploadGB = v
+		}
+	}
 	apiHandler.SetMaxUploadSize(int64(*maxUploadGB) << 30)
 
 	// Model KV store, built over the tiers the cache manager already

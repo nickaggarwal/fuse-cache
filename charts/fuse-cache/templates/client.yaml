@@ -275,6 +275,12 @@ spec:
           ports:
             - containerPort: {{ .Values.client.httpPort }}
               name: http
+              {{- if .Values.client.hostPort }}
+              # Lets a host process (nydusd) reach this node's client at
+              # 127.0.0.1:<hostPort>; see "Using fuse-cache as the nydus
+              # backend" in the README.
+              hostPort: {{ .Values.client.hostPort }}
+              {{- end }}
             - containerPort: {{ .Values.client.grpcPort }}
               name: grpc
           securityContext:
