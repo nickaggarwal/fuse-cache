@@ -73,6 +73,7 @@ func completionTestManager(t *testing.T, numChunks int64, chunkSize int64, missi
 			cm.accountNVMeLocked(cp, chunkSize)
 		}
 	}
+	t.Cleanup(cm.bgWg.Wait)
 	return cm, parent, full
 }
 

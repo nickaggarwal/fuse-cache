@@ -195,8 +195,47 @@ That split distinguishes disk limits from FUSE-path limits from peer/cloud
 bottlenecks from cache-budget regressions in one pass. For a live cluster,
 the [Streamlit UI](#streamlit-ui) puts these same endpoints behind a browser.
 
+Two endpoints answer "what is wrong with this node right now":
+
+- `GET /api/cache/health` — `ok`, `degraded` or `thrashing`, with `checks[]`,
+  each carrying a stable code: `INTENT_UNSATISFIED`, `REWARM`,
+  `REWARM_STREAK`, `EVICT_CHURN`, `SLOW_OPS`, `SCRUB_ERRORS`, `NOREBALANCE`.
+  Alert and route on the code, not the message. Silence a known condition
+  with `POST /api/cache/health/mute?code=SLOW_OPS&ttl=1h`.
+- `GET /api/debug/ops` — every peer/cloud fetch in flight (path, tier, age),
+  oldest first, plus the slowest recent ones. Anything over 10 s raises
+  `SLOW_OPS`. A hung peer or a stalled cloud chunk shows up here by name.
+
 Log prefixes to grep for: `[COORDINATOR]`, `[CLIENT]`, `[API]`, `[FUSE]`,
-`[CACHE]`, `[CSI]`, `[AGENT]`.
+`[CACHE]`, `[CSI]`, `[AGENT]`, `[SCRUB]`, `[VERIFY]`.
+
+### Rolling restarts and failing peers
+
+- **Before a rollout of the client DaemonSet**, pause re-replication:
+  `curl -XPOST 'http://<coordinator>:8080/api/flags?name=norebalance&ttl=2h'`
+  (clear with `DELETE`). Clients pick it up within 5 s; health shows
+  `NOREBALANCE` while it is set. Without the flag a node that is merely
+  restarting still counts as a holder for `-down-out-minutes` (default 10):
+  it is "down", not "out", and nothing is copied away from it.
+- **A peer several nodes cannot read from** is marked suspect once
+  `-min-failure-reporters` (default 2) distinct nodes report it within 60 s.
+  It stays listed but every reader tries it last. One badly connected node
+  cannot do this on its own. `GET /api/peers/health` on the coordinator
+  shows flags, suspects and who reported them.
+
+### Background work and the scrubber
+
+Warming, chunk assembly, replication and scrubbing are I/O classes. While a
+pod is reading through FUSE, all of them together are held to
+`-bg-busy-mbps` (default 200), shared by weight (warm 4, assemble 2,
+replicate 1, scrub 1); the foreground is never slowed. `fuse_io_class_*`
+metrics show bytes and time throttled per class.
+
+The scrubber (`-scrub-hours`, default 6; each file re-checked at most weekly,
+capped at `-scrub-mbps`) re-hashes local copies against their `.sha256`
+sidecar or the chunk manifest. A bad copy is moved aside as
+`*.corrupt-<time>` and refetched on the next read; `SCRUB_ERRORS` stays
+raised for 24 h. `POST /api/cache/scrub` runs a pass now.
 
 ## Architecture
 
@@ -355,6 +394,99 @@ Node settings (sky-control skyfleet `fuseImages: true`):
 | nydusd | registry backend `http://127.0.0.1:18081`, ping `/v2/`, fallback on |
 | fuse-client on model nodes | API on hostPort 18081; go-fuse backend; `FUSE_GOFUSE_DIRECT_MOUNT=1` on Ubuntu 26.04 (AppArmor confines `fusermount3`); passthrough on kernel 6.9+ |
 | store | `-max-upload-gb` larger than the largest blob; with store-front, Go runs on `-port=8091 -advertise-port=8081` |
+
+### Using fuse-cache as the nydus backend
+
+Any cluster running [nydus-snapshotter](https://github.com/containerd/nydus-snapshotter)
+can point nydusd at fuse-cache; sky-control's skyfleet is one way to wire it,
+not a requirement. Four steps:
+
+**1. Expose the client on each node.** nydusd runs on the host, so the
+client's API needs a host port. With the Helm chart:
+
+```yaml
+# values-nydus.yaml
+client:
+  hostPort: 18081          # nydusd reaches the node's client at 127.0.0.1:18081
+config:
+  fuseBackend: gofuse
+  maxUploadGB: 32          # larger than your largest image layer
+```
+
+```
+helm upgrade --install fuse-cache charts/fuse-cache -f values-nydus.yaml
+```
+
+**2. Point nydusd's registry backend at it.** In the snapshotter's nydusd
+config (`nydusd-config.fusedev.json`), use fuse-client as the registry
+proxy and keep `fallback: true`, so a blob the cluster does not hold
+(fuse-client answers 503) or a node whose client is down is read straight
+from the source registry:
+
+```json
+{
+  "device": {
+    "backend": {
+      "type": "registry",
+      "config": {
+        "timeout": 30,
+        "connect_timeout": 10,
+        "retry_limit": 3,
+        "proxy": {
+          "url": "http://127.0.0.1:18081",
+          "ping_url": "http://127.0.0.1:18081/v2/",
+          "fallback": true,
+          "check_interval": 5,
+          "check_pause_elapsed": 300,
+          "use_http": true
+        }
+      }
+    },
+    "cache": { "type": "blobcache", "config": { "work_dir": "/var/lib/nydus/cache" } }
+  },
+  "mode": "direct",
+  "fs_prefetch": { "enable": true, "threads_count": 4, "merging_size": 1048576 }
+}
+```
+
+`use_http: true` matters: with it nydusd sends plain HTTP to the node-local
+proxy. Without it nydusd sends `CONNECT`, which fuse-client does not
+terminate, and every read silently falls back to the registry. The
+repository part of the URL is ignored; blobs are keyed by digest only.
+
+**3. Fill the store before launches.** fuse-cache serves blobs it holds; it
+does not pull from your registry itself. Put each layer of an image once,
+by digest, from anywhere that can reach the registry and one client:
+
+```
+# for every layer digest of the nydus image (crane, skopeo or oras manifest)
+crane blob <registry>/<repo>@sha256:<hex> \
+  | curl -sf -X PUT --data-binary @- http://<client>:8081/api/files/oci/sha256/<hex>
+```
+
+The PUT is rejected (400) if the body does not hash to the digest. The
+blob lands on that node, is written through to blob storage, and is
+published to the coordinator; every other node then fetches it from that
+node, a peer or blob storage on first read. Layers you skip still work,
+just from the registry. (sky-control's skywarm automates this per image.)
+
+**4. Check it is used.** On a node that started a pod from the image:
+
+```
+curl -s http://127.0.0.1:18081/metrics | grep -E 'fuse_blob_(verified|quarantined)_total|fuse_cache_(nvme|peer|cloud)_hits_total'
+curl -s http://127.0.0.1:18081/api/cache/health     # state ok, no SLOW_OPS
+```
+
+Rising `fuse_cache_peer_hits_total` / `nvme_hits` while the pod starts means
+nydusd is reading through the cache; flat counters with a working pod mean
+it fell back to the registry (check `use_http`, the host port, and that the
+layers were PUT).
+
+**Gotchas.** On Ubuntu 26.04 nodes set `FUSE_GOFUSE_DIRECT_MOUNT=1`
+(AppArmor confines `fusermount3`). Kernel passthrough needs Linux 6.9+ and
+`FUSE_GOFUSE_ENABLE_PASSTHROUGH=1`. nydusd's own blob cache sits in front of
+fuse-client, so a second start of the same image on one node does not reach
+fuse-cache at all; that is expected.
 
 ## Cross-Cluster (Global Control Plane)
 
@@ -657,7 +789,10 @@ leaving a node advertising a mount nothing can use.
 - `POST /api/snapshot` - Snapshot coordinator metadata state to disk (optional cloud persist via `persist_cloud` + `cloud_path`)
 - `POST /api/restore` - Restore coordinator metadata state from disk (`path`) or cloud object (`cloud_path`)
 - `GET /api/stats` - Get system statistics
-- `GET /api/health` - Health check
+- `GET /api/health` - Health check (also `capabilities` and active cluster `flags`)
+- `GET|POST|DELETE /api/flags?name=&ttl=` - Cluster flags (`norebalance`); TTL capped at 24h
+- `POST /api/peers/report-failure` - `{"target","reporter"}`; used by clients
+- `GET /api/peers/health` - Flags, suspect peers and their reporters
 
 ### Client API
 
@@ -675,6 +810,10 @@ leaving a node advertising a mount nothing can use.
 - `POST /api/fs/restore` - Restore local filesystem/cache entries from direct snapshot payload or from cloud snapshot object (`cloud_path`)
 - `GET /api/netprobe?bytes=N` - Stream probe payload for peer network throughput sampling
 - `GET /api/health` - Health check
+- `GET /api/cache/health` - Node health with coded checks; `POST|DELETE /api/cache/health/mute?code=&ttl=`
+- `GET /api/debug/ops` - In-flight and recent slow remote fetches
+- `POST /api/cache/scrub[?force=true]` - Run one scrub pass now
+- `GET /v2/`, `GET|HEAD /v2/{repo}/blobs/{digest}` - Registry routes for nydusd (see [nydus backend](#using-fuse-cache-as-the-nydus-backend))
 - `GET /metrics` - Prometheus metrics
 
 ## Known Best Configs

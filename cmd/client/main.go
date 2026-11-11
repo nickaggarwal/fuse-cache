@@ -104,6 +104,10 @@ func main() {
 		peerServeMaxIn        = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
 		peerReplStaggerMS     = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
 		globalRead            = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
+		scrubHours            = flag.Int("scrub-hours", 6, "Re-check local copies against their .sha256 sidecar or chunk manifest every N hours (each copy at most weekly; bad ones are moved aside and refetched); 0 disables")
+		downOutMin            = flag.Int("down-out-minutes", 10, "Minutes a holder may be missing from the live peer list before its copies stop counting toward the replica target (it is 'down' before, 'out' after)")
+		bgBusyMBps            = flag.Int("bg-busy-mbps", 200, "While foreground reads are active, cap all background I/O (warm, assembly, replication, scrub) together at this many MB/s; 0 disables")
+		scrubMBps             = flag.Int("scrub-mbps", 100, "Cap the scrubber at this many MB/s at all times; 0 = no cap")
 		evictPreferReplicated = flag.Bool("evict-prefer-replicated", true, "Within the coldest eviction candidates, evict files other nodes also hold first, then whole cold releases (a directory, idle since its most recent access) by idle time x size")
 		verifyRemoteChunks    = flag.Bool("verify-remote-chunks", true, "Check chunks read from peers or object storage against the file's CRC-32C manifest, written when a chunked file is persisted; a mismatching copy is rejected and the next tier tried")
 		fetchLeaseEnabled     = flag.Bool("fetch-lease", false, "Take a short-TTL coordinator lease before cloud pulls so simultaneous misses of one object collapse to a single origin fetch (thundering-herd Phase 2; opt-in — adds cold-read latency on isolated reads)")
@@ -289,12 +293,18 @@ func main() {
 		FetchLeaseEnabled:          *fetchLeaseEnabled,
 		VerifyRemoteChunks:         *verifyRemoteChunks,
 		EvictPreferReplicated:      *evictPreferReplicated,
-		GlobalReadEnabled:          *globalRead,
-		FastChunkAdvertise:         *fastChunkAdvertise,
-		ReplicaReconcileInterval:   time.Duration(*reconcileIntervalSec) * time.Second,
-		ReplicaReconcileTarget:     *reconcileTarget,
-		ReplicaReconcileMaxPerRun:  *reconcileMaxPerRun,
-		ReplicaReconcileMaxTarget:  *reconcileMaxTarget,
+		ScrubInterval:              blobScrubInterval(*scrubHours),
+		DownOutInterval:            time.Duration(*downOutMin) * time.Minute,
+		IOSched: cache.IOSchedConfig{
+			BusyBytesPerSec:  int64(*bgBusyMBps) << 20,
+			ClassBytesPerSec: map[string]int64{"scrub": int64(*scrubMBps) << 20},
+		},
+		GlobalReadEnabled:         *globalRead,
+		FastChunkAdvertise:        *fastChunkAdvertise,
+		ReplicaReconcileInterval:  time.Duration(*reconcileIntervalSec) * time.Second,
+		ReplicaReconcileTarget:    *reconcileTarget,
+		ReplicaReconcileMaxPerRun: *reconcileMaxPerRun,
+		ReplicaReconcileMaxTarget: *reconcileMaxTarget,
 		// Negative disables the loop; 0 leaves the cache default in place.
 		// Separating "off" from "unset" matters because the zero value has to
 		// mean "use the default" for every caller that never sets it.
@@ -681,6 +691,11 @@ func main() {
 
 	// Create API handler
 	apiHandler := api.NewHandler(cacheManager, coordClient, *peerID, *apiKey)
+	if !flagSet("max-upload-gb") {
+		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("FUSE_MAX_UPLOAD_GB"))); err == nil && v > 0 {
+			*maxUploadGB = v
+		}
+	}
 	apiHandler.SetMaxUploadSize(int64(*maxUploadGB) << 30)
 
 	// Model KV store, built over the tiers the cache manager already
@@ -958,7 +973,18 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 	defer t.Stop()
 	last := ""
 	for {
-		if inst, caps := coordinatorHealth(ctx, addr); inst != "" && inst != last {
+		inst, caps := coordinatorHealth(ctx, addr)
+		if inst != "" {
+			// Flags change at any time (an operator sets norebalance before
+			// a rollout), so they apply on every poll, not only on a new
+			// coordinator instance.
+			if f := lastCoordinatorFlags.Load(); f != nil {
+				if fs, ok := cm.(interface{ SetClusterFlags([]string) }); ok {
+					fs.SetClusterFlags(*f)
+				}
+			}
+		}
+		if inst != "" && inst != last {
 			logger.Printf("Coordinator instance %q -> %q: republishing local objects (capabilities %v)", last, inst, caps)
 			if cs, ok := cm.(interface{ SetCoordinatorCapabilities([]string) }); ok {
 				cs.SetCoordinatorCapabilities(caps)
@@ -1044,12 +1070,17 @@ func coordinatorHealth(ctx context.Context, addr string) (string, []string) {
 	var h struct {
 		Instance     string   `json:"instance"`
 		Capabilities []string `json:"capabilities"`
+		Flags        []string `json:"flags"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
 		return "", nil
 	}
+	lastCoordinatorFlags.Store(&h.Flags)
 	return h.Instance, h.Capabilities
 }
+
+// lastCoordinatorFlags holds the cluster flags from the latest health poll.
+var lastCoordinatorFlags atomic.Pointer[[]string]
 
 func registerPeer(ctx context.Context, coordClient coordinator.Coordinator, coordHTTPAddr string, peerID string, port, grpcPort int, nvmePath string, labels map[string]string, cm cache.CacheManager, logger *log.Logger) {
 	used, capacity := cm.Stats()

@@ -72,6 +72,9 @@ type PeerInfo struct {
 	// NodeName: empty outside Kubernetes and on older clients, never required
 	// for registration or peer selection.
 	NodeIP string `json:"node_ip,omitempty"`
+	// Suspect is set on GetPeers results when enough distinct peers recently
+	// reported failing to read from this one (peer_health.go). Never stored.
+	Suspect bool `json:"suspect,omitempty"`
 }
 
 // ChunkInfo represents a file chunk
@@ -123,6 +126,9 @@ type CoordinatorService struct {
 	// shutdown path can otherwise write the same temp file concurrently and
 	// rename a torn snapshot into place.
 	saveMu sync.Mutex
+	// minFailureReporters is how many distinct reporters mark a peer
+	// suspect; <= 0 uses DefaultMinFailureReporters.
+	minFailureReporters int
 	// residency memoizes the per-prefix peer fan-out behind a short TTL and
 	// coalesces concurrent queries. See residency.go.
 	residency residencyCache
@@ -217,9 +223,11 @@ func (cs *CoordinatorService) GetPeers(ctx context.Context, requesterID string) 
 	if err != nil {
 		return nil, err
 	}
+	suspect := cs.suspectPeers(ctx)
 	peers := make([]*PeerInfo, 0, len(all))
 	for _, peer := range all {
 		if peer.ID != requesterID && peer.Status == "active" {
+			_, peer.Suspect = suspect[peer.ID]
 			peers = append(peers, peer)
 		}
 	}

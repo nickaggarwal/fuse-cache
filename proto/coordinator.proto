@@ -54,6 +54,10 @@ message PeerInfo {
   // share nothing. Same contract as node_name: advisory, empty off-Kubernetes
   // and on older clients, never required for registration or selection.
   string node_ip = 11;
+  // Suspect: at least the configured number of distinct peers reported
+  // failing to read from this one recently. Readers try it last; it stays
+  // listed (its heartbeat is fine and it may be the only holder).
+  bool suspect = 12;
 }
 
 message ChunkInfo {

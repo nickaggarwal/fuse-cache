@@ -80,6 +80,7 @@ const MaxWarmFiles = 10000
 // data. Per-file problems are outcomes, not errors; the error return is for a
 // request that cannot be planned at all.
 func (cm *DefaultCacheManager) WarmFiles(ctx context.Context, files []WarmFile, opts WarmupOptions) (*WarmFilesResult, error) {
+	ctx = withIOClass(ctx, ioWarm)
 	mode := strings.ToLower(strings.TrimSpace(opts.Mode))
 	if mode == "" {
 		mode = "full"

@@ -108,6 +108,7 @@ func peerInfoToProto(p *PeerInfo) *pb.PeerInfo {
 		Labels:         p.Labels,
 		NodeName:       p.NodeName,
 		NodeIp:         p.NodeIP,
+		Suspect:        p.Suspect,
 	}
 }
 
@@ -128,6 +129,7 @@ func peerInfoFromProto(p *pb.PeerInfo) *PeerInfo {
 		Labels:         p.Labels,
 		NodeName:       p.NodeName,
 		NodeIP:         p.NodeIp,
+		Suspect:        p.Suspect,
 	}
 }
 

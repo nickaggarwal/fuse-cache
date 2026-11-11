@@ -44,6 +44,11 @@ func chunkWindowManager(tb testing.TB, chunkSize, numChunks int64) (*DefaultCach
 		tierPerf:     newTierPerfTracker(),
 	}
 	cm.entries.put(&CacheEntry{FilePath: parent, Size: int64(len(want)), IsChunked: true, NumChunks: numChunks, ChunkSize: chunkSize, Tier: TierNVMe})
+	// Landing the last missing chunk starts a background assembly
+	// (maybeCompleteOnLastChunk). Wait for it before TempDir's cleanup, which
+	// was registered first and so runs after this one, or it races the
+	// removal ("directory not empty" under -race).
+	tb.Cleanup(cm.bgWg.Wait)
 	return cm, parent, want
 }
 

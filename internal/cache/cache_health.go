@@ -43,8 +43,14 @@ const (
 // CacheHealth is the node-level health report.
 type CacheHealth struct {
 	State string `json:"state"` // ok | degraded | thrashing
-	// Reasons explains a non-ok state in a sentence each.
+	// Checks are the active health conditions, each with a stable code.
+	// Match on Code; Message is for humans and may change.
+	Checks []HealthCheck `json:"checks,omitempty"`
+	// Reasons repeats each check's message (kept for existing readers).
 	Reasons []string `json:"reasons,omitempty"`
+	// Muted lists codes suppressed via MuteHealth: still reported in
+	// Checks (with Muted set) but they no longer raise State.
+	Muted []string `json:"muted,omitempty"`
 	// Intents is how many warm intents are declared; Unsatisfied how many had
 	// failed or skipped files on their last pass.
 	Intents     int `json:"intents"`
@@ -58,6 +64,70 @@ type CacheHealth struct {
 	UsedBytes          int64     `json:"used_bytes"`
 	OpenFiles          int       `json:"open_files"`
 	MeasuredAt         time.Time `json:"measured_at"`
+}
+
+// HealthCheck is one active condition, after Ceph's health checks: a stable
+// code a router or alert matches on, the state it implies, and a message.
+type HealthCheck struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"` // degraded | thrashing
+	Message  string `json:"message"`
+	Count    int    `json:"count,omitempty"`
+	Muted    bool   `json:"muted,omitempty"`
+}
+
+// Stable health codes. Add new ones; never rename or reuse one.
+const (
+	// HealthIntentUnsatisfied: a declared warm intent had failed or skipped
+	// files on its last pass.
+	HealthIntentUnsatisfied = "INTENT_UNSATISFIED"
+	// HealthRewarm: an intent re-fetched evicted files on its last pass.
+	HealthRewarm = "REWARM"
+	// HealthRewarmStreak: re-fetches on consecutive passes; the declared
+	// set does not fit.
+	HealthRewarmStreak = "REWARM_STREAK"
+	// HealthEvictChurn: over half the budget evicted within the window while
+	// intents are declared.
+	HealthEvictChurn = "EVICT_CHURN"
+	// HealthSlowOps: remote fetches in flight longer than slowOpThreshold.
+	HealthSlowOps = "SLOW_OPS"
+	// HealthScrubErrors: the scrubber found corrupt local copies recently.
+	HealthScrubErrors = "SCRUB_ERRORS"
+	// HealthNoRebalance: re-replication paused by an operator (rollout).
+	HealthNoRebalance = "NOREBALANCE"
+)
+
+// healthMutes holds codes an operator silenced (Ceph's "health mute"), each
+// until an expiry.
+type healthMutes struct {
+	mu    sync.Mutex
+	until map[string]time.Time
+}
+
+// MuteHealth silences code for d (d <= 0 unmutes). A muted check is still
+// listed, marked muted, but does not raise the node's state.
+func (cm *DefaultCacheManager) MuteHealth(code string, d time.Duration) {
+	cm.healthMutes.mu.Lock()
+	defer cm.healthMutes.mu.Unlock()
+	if cm.healthMutes.until == nil {
+		cm.healthMutes.until = make(map[string]time.Time)
+	}
+	if d <= 0 {
+		delete(cm.healthMutes.until, code)
+		return
+	}
+	cm.healthMutes.until[code] = time.Now().Add(d)
+}
+
+func (cm *DefaultCacheManager) healthMuted(code string, now time.Time) bool {
+	cm.healthMutes.mu.Lock()
+	defer cm.healthMutes.mu.Unlock()
+	t, ok := cm.healthMutes.until[code]
+	if ok && now.After(t) {
+		delete(cm.healthMutes.until, code)
+		return false
+	}
+	return ok
 }
 
 // evictWindow keeps per-minute eviction byte buckets for the rate signal.
@@ -118,29 +188,45 @@ func (cm *DefaultCacheManager) Health() CacheHealth {
 			h.Unsatisfied++
 		}
 	}
-	degrade := func(reason string) {
-		if h.State == "ok" {
-			h.State = "degraded"
+	add := func(code, severity, msg string, count int) {
+		c := HealthCheck{Code: code, Severity: severity, Message: msg, Count: count}
+		if cm.healthMuted(code, now) {
+			c.Muted = true
+			h.Muted = append(h.Muted, code)
+		} else if healthStateValue(severity) > healthStateValue(h.State) {
+			h.State = severity
 		}
-		h.Reasons = append(h.Reasons, reason)
-	}
-	thrash := func(reason string) {
-		h.State = "thrashing"
-		h.Reasons = append(h.Reasons, reason)
+		h.Checks = append(h.Checks, c)
+		h.Reasons = append(h.Reasons, msg)
 	}
 	if h.Unsatisfied > 0 {
-		degrade("declared warm intents are not fully resident (failed or skipped files on the last pass)")
+		add(HealthIntentUnsatisfied, "degraded", "declared warm intents are not fully resident (failed or skipped files on the last pass)", h.Unsatisfied)
 	}
 	switch {
 	case h.MaxRewarmStreak >= thrashStreak:
-		thrash("warm intents re-fetched evicted files on consecutive reconcile passes: the declared set does not fit")
+		add(HealthRewarmStreak, "thrashing", "warm intents re-fetched evicted files on consecutive reconcile passes: the declared set does not fit", h.MaxRewarmStreak)
 	case h.MaxRewarmStreak > 0:
-		degrade("a warm intent re-fetched evicted files on its last pass")
+		add(HealthRewarm, "degraded", "a warm intent re-fetched evicted files on its last pass", h.MaxRewarmStreak)
 	}
 	if h.Intents > 0 && h.BudgetBytes > 0 && float64(h.EvictedBytesWindow) > thrashEvictFraction*float64(h.BudgetBytes) {
-		thrash("evicted more than half the NVMe budget in the last window while intents are declared")
+		add(HealthEvictChurn, "thrashing", "evicted more than half the NVMe budget in the last window while intents are declared", 0)
+	}
+	for _, extra := range cm.extraHealthChecks(now) {
+		add(extra.Code, extra.Severity, extra.Message, extra.Count)
 	}
 	return h
+}
+
+// extraHealthChecks collects checks owned by other subsystems (slow ops,
+// scrubbing, re-replication state). Each returns nil when healthy.
+func (cm *DefaultCacheManager) extraHealthChecks(now time.Time) []HealthCheck {
+	var out []HealthCheck
+	for _, f := range []func(time.Time) *HealthCheck{cm.slowOpsCheck, cm.scrubHealthCheck, cm.rebalanceHealthCheck} {
+		if c := f(now); c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out
 }
 
 // healthStateValue maps a state to a gauge value for /metrics.

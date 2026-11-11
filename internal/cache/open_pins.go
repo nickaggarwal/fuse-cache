@@ -23,6 +23,7 @@ type openPins struct {
 
 // NoteOpen records an open handle on filePath.
 func (cm *DefaultCacheManager) NoteOpen(filePath string) {
+	cm.sched.noteForeground()
 	cm.openPins.mu.Lock()
 	defer cm.openPins.mu.Unlock()
 	if cm.openPins.n == nil {

@@ -18,7 +18,7 @@ func evictTestManager(t *testing.T, maxNVMe int64) *DefaultCacheManager {
 	}
 	shutdownCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return &DefaultCacheManager{
+	cm := &DefaultCacheManager{
 		config: &CacheConfig{
 			NVMePath: dir, MaxNVMeSize: maxNVMe, ChunkSize: 1024,
 			CloudRetryCount: 1, CloudRetryBaseWait: time.Millisecond,
@@ -34,6 +34,10 @@ func evictTestManager(t *testing.T, maxNVMe int64) *DefaultCacheManager {
 		tierPerf:     newTierPerfTracker(),
 		shutdownCtx:  shutdownCtx,
 	}
+	// Registered after TempDir's cleanup, so it runs first: background work
+	// (assembly, persists) finishes before the directory is removed.
+	t.Cleanup(cm.bgWg.Wait)
+	return cm
 }
 
 // seedAges tracks what each manager has been seeded with, so seedNVMe can hold
