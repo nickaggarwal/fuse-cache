@@ -211,6 +211,9 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
 	router.HandleFunc("/api/cache/health", h.handleCacheHealth).Methods("GET")
+	router.HandleFunc("/api/cache/health/mute", h.handleCacheHealthMute).Methods("POST", "DELETE")
+	router.HandleFunc("/api/debug/ops", h.handleDebugOps).Methods("GET")
+	router.HandleFunc("/api/cache/scrub", h.handleCacheScrub).Methods("POST")
 	// Durability barrier/receipt for artifact consumers (pod-snapshotter
 	// restore eligibility). POST because a receipt may block and may kick
 	// retries; GET is the same query without side effects.
@@ -945,6 +948,65 @@ func (h *Handler) handleCacheHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(dcm.Health())
 }
 
+// handleCacheHealthMute silences a health code (Ceph's "health mute"):
+// POST ?code=SLOW_OPS&ttl=1h, DELETE ?code=SLOW_OPS unmutes.
+func (h *Handler) handleCacheHealthMute(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "not available", http.StatusNotImplemented)
+		return
+	}
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		http.Error(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	ttl := time.Duration(0)
+	if r.Method == http.MethodPost {
+		ttl = time.Hour
+		if raw := r.URL.Query().Get("ttl"); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil {
+				http.Error(w, "bad ttl", http.StatusBadRequest)
+				return
+			}
+			ttl = d
+		}
+	}
+	dcm.MuteHealth(code, ttl)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(dcm.Health())
+}
+
+// handleDebugOps lists in-flight remote fetches (oldest first) and recent
+// slow ones (cache/slow_ops.go).
+func (h *Handler) handleDebugOps(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "not available", http.StatusNotImplemented)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(dcm.Ops())
+}
+
+// handleCacheScrub runs one scrub pass now; ?force=true re-checks copies
+// whose clean result is still fresh. Blocks until the pass ends.
+func (h *Handler) handleCacheScrub(w http.ResponseWriter, r *http.Request) {
+	dcm, ok := h.cacheManager.(*cache.DefaultCacheManager)
+	if !ok {
+		http.Error(w, "not available", http.StatusNotImplemented)
+		return
+	}
+	res, err := dcm.Scrub(r.Context(), r.URL.Query().Get("force") == "true")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
 // handleNetProbe streams a fixed-size payload for network throughput probes.
 func (h *Handler) handleNetProbe(w http.ResponseWriter, r *http.Request) {
 	size := defaultNetProbeBytes
@@ -1103,6 +1165,43 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_cache_max_rewarm_streak %d\n", ch.MaxRewarmStreak)
 	fmt.Fprintf(w, "fuse_cache_unsatisfied_intents %d\n", ch.Unsatisfied)
 	fmt.Fprintf(w, "fuse_cache_evicted_bytes_window %d\n", ch.EvictedBytesWindow)
+	for _, c := range ch.Checks {
+		muted := 0
+		if c.Muted {
+			muted = 1
+		}
+		fmt.Fprintf(w, "fuse_cache_health_check{code=%q,severity=%q,muted=\"%d\"} 1\n", c.Code, c.Severity, muted)
+	}
+	ops := dcm.Ops()
+	slowNow := 0
+	for _, op := range ops.Inflight {
+		if op.AgeSec >= ops.SlowThreshold {
+			slowNow++
+		}
+	}
+	fmt.Fprintf(w, "fuse_ops_inflight %d\n", len(ops.Inflight))
+	fmt.Fprintf(w, "fuse_ops_slow_inflight %d\n", slowNow)
+	fmt.Fprintf(w, "fuse_ops_slow_total %d\n", dcm.SlowOpsTotal())
+	sp, sf, sb, sc := dcm.ScrubStats()
+	fmt.Fprintf(w, "fuse_scrub_passes_total %d\n", sp)
+	fmt.Fprintf(w, "fuse_scrub_files_total %d\n", sf)
+	fmt.Fprintf(w, "fuse_scrub_bytes_total %d\n", sb)
+	fmt.Fprintf(w, "fuse_scrub_corrupt_total %d\n", sc)
+	paused, downHeld, noReb := dcm.RebalanceStats()
+	fmt.Fprintf(w, "fuse_rebalance_paused_passes_total %d\n", paused)
+	fmt.Fprintf(w, "fuse_rebalance_down_holders_kept_total %d\n", downHeld)
+	nr := 0
+	if noReb {
+		nr = 1
+	}
+	fmt.Fprintf(w, "fuse_cluster_flag_norebalance %d\n", nr)
+	for _, st := range dcm.IOClassStats() {
+		fmt.Fprintf(w, "fuse_io_class_bytes_total{class=%q} %d\n", st.Class, st.Bytes)
+		fmt.Fprintf(w, "fuse_io_class_throttled_seconds_total{class=%q} %.3f\n", st.Class, st.ThrottledSec)
+	}
+	if ps := dcm.PeerFailureReportsSent(); ps >= 0 {
+		fmt.Fprintf(w, "fuse_peer_failure_reports_sent_total %d\n", ps)
+	}
 	fmt.Fprintf(w, "fuse_eviction_skipped_open_total %d\n", cmx.EvictionSkippedOpen.Load())
 	fmt.Fprintf(w, "fuse_open_files %d\n", dcm.OpenFileCount())
 	fmt.Fprintf(w, "fuse_evict_order_shared_total %d\n", cmx.EvictOrderShared.Load())

@@ -98,13 +98,19 @@ func (cm *DefaultCacheManager) queueEvictRetraction(filePath string) {
 // SetCoordinatorCapabilities records the features the coordinator advertises
 // in GET /api/health; the client calls it on every coordinator instance.
 func (cm *DefaultCacheManager) SetCoordinatorCapabilities(caps []string) {
-	has := false
+	has, reports := false, false
 	for _, c := range caps {
-		if c == "tier-retract" {
+		switch c {
+		case "tier-retract":
 			has = true
+		case "failure-report":
+			reports = true
 		}
 	}
 	cm.evictRetract.enabled.Store(has)
+	if ps, ok := cm.peerStorage.(*PeerStorage); ok {
+		ps.EnableFailureReports(reports)
+	}
 }
 
 // startEvictRetractor runs the batched retraction loop.

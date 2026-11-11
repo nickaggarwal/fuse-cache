@@ -90,6 +90,10 @@ type PeerStorage struct {
 	jitterRetriesTotal atomic.Int64
 	replBusySkipsTotal atomic.Int64
 	replStaggersTotal  atomic.Int64
+
+	// failReports counts transfer failures per peer and reports repeat
+	// offenders to the coordinator (peer_reports.go).
+	failReports peerFailureReporter
 }
 
 // peerBusyError marks a "source is at capacity" rejection (gRPC
@@ -359,6 +363,9 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	// Observed pairwise latency beats the coordinator's single-target probe:
 	// once real transfer samples exist, traverse measured-closest peers first.
 	ps.sortByObservedLatency(candidates, path)
+	// Peers several nodes reported failing go last: still tried (they may be
+	// the only holder), but after every healthy one.
+	candidates = suspectLast(candidates)
 
 	var lastErr error
 	var busyPeers []*coordinator.PeerInfo
@@ -1025,6 +1032,7 @@ func (ps *PeerStorage) readPeerData(ctx context.Context, peer *coordinator.PeerI
 		ps.missSkipsTotal.Add(1)
 	default:
 		ps.pairLatency.record(peer.ID, time.Since(start), err == nil)
+		ps.recordPeerOutcome(peer, err)
 	}
 	return data, err
 }

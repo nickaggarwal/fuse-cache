@@ -107,7 +107,13 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 	if !ok {
 		return
 	}
+	if cm.downOut.noRebalance.Load() {
+		cm.downOut.pausedPasses.Add(1)
+		return
+	}
 	cm.herdStats.reconcileRuns.Add(1)
+	ctx = withIOClass(ctx, ioReplicate)
+	live := cm.livePeerSet(ctx, ps)
 
 	budget := cm.config.ReplicaReconcileMaxPerRun
 	if budget <= 0 {
@@ -127,6 +133,17 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 		if err != nil {
 			continue // coordinator hiccup: try again next pass
 		}
+		// A holder that is only down (not out) still counts: its disk is
+		// intact and it is most likely restarting.
+		if live != nil {
+			for id := range holders {
+				if !cm.downOut.counts(id, live, cm.startedAt, now, cm.downOutInterval()) {
+					delete(holders, id)
+				} else if _, isLive := live[id]; !isLive {
+					cm.downOut.downHeld.Add(1)
+				}
+			}
+		}
 		// This node serves reads too even if its own publish hasn't landed.
 		holders[cm.config.LocalPeerID] = struct{}{}
 		deficit := target - len(holders)
@@ -143,6 +160,9 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 		}
 
 		written, err := ps.ReplicateTo(ctx, cand.path, entry.Data, holders, deficit)
+		if written > 0 {
+			_ = cm.sched.charge(ctx, ioReplicate, int64(written)*int64(len(entry.Data)))
+		}
 		if written > 0 {
 			budget -= written
 			cm.herdStats.reconcileReplications.Add(int64(written))
@@ -177,4 +197,28 @@ func (cm *DefaultCacheManager) replicaHolders(ctx context.Context, path string) 
 		holders[loc.PeerID] = struct{}{}
 	}
 	return holders, nil
+}
+
+// livePeerSet returns the peers GetPeers lists right now (plus this node),
+// and records them as live for the down/out rule. nil when the list is
+// unavailable: then every holder row counts, as before.
+func (cm *DefaultCacheManager) livePeerSet(ctx context.Context, ps *PeerStorage) map[string]struct{} {
+	peers, err := ps.getPeers(ctx)
+	if err != nil {
+		return nil
+	}
+	live := make(map[string]struct{}, len(peers)+1)
+	ids := make([]string, 0, len(peers)+1)
+	for _, p := range peers {
+		if p != nil && p.ID != "" {
+			live[p.ID] = struct{}{}
+			ids = append(ids, p.ID)
+		}
+	}
+	if cm.config.LocalPeerID != "" {
+		live[cm.config.LocalPeerID] = struct{}{}
+		ids = append(ids, cm.config.LocalPeerID)
+	}
+	cm.downOut.observeLive(ids, time.Now())
+	return live
 }

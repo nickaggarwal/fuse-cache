@@ -93,7 +93,7 @@ func (cm *DefaultCacheManager) maybeScheduleChunkCompletion(filePath string) {
 			delete(st.inFlight, filePath)
 			st.mu.Unlock()
 		}()
-		if err := cm.runChunkCompletion(cm.shutdownCtx, filePath, numChunks, size); err != nil {
+		if err := cm.runChunkCompletion(withIOClass(cm.shutdownCtx, ioAssemble), filePath, numChunks, size); err != nil {
 			cm.logger.Printf("Chunk completion for %s: %v", filePath, err)
 		}
 	})

@@ -58,6 +58,10 @@ type InMemoryStore struct {
 	// is hot and short-TTL and must not contend with metadata reads.
 	fetchLeaseMu sync.Mutex
 	fetchLeases  map[string]memFetchLease
+
+	// Cluster flags and failure reports (peer_health.go), created on first use.
+	phOnce     sync.Once
+	peerHealth *memPeerHealth
 }
 
 func NewInMemoryStore() *InMemoryStore {

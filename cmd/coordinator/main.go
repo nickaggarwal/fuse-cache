@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -34,6 +35,7 @@ func main() {
 		grpcPort        = flag.Int("grpc-port", 9080, "Port for the coordinator gRPC server")
 		etcdEndpoints   = flag.String("etcd-endpoints", "", "Comma-separated etcd endpoints (e.g. http://etcd-0:2379,http://etcd-1:2379). If empty, uses in-memory state.")
 		etcdPrefix      = flag.String("etcd-prefix", "/fuse", "etcd key prefix for coordinator state")
+		minReporters    = flag.Int("min-failure-reporters", coordinator.DefaultMinFailureReporters, "Distinct peers that must report failing to read from a peer within 60s before it is marked suspect (readers try it last)")
 		etcdLeaseTTL    = flag.Int("etcd-peer-lease-ttl", 90, "Peer liveness lease TTL in seconds (etcd-backed only); keep this at ~3x the client heartbeat interval (30s) so one slow heartbeat doesn't expire the peer")
 		etcdDialTimeout = flag.Duration("etcd-dial-timeout", 5*time.Second, "etcd dial timeout")
 
@@ -76,6 +78,7 @@ func main() {
 		logger.Fatalf("Failed to build coordinator store: %v", err)
 	}
 	coordinatorService := coordinator.NewCoordinatorServiceWithStore(store)
+	coordinatorService.SetMinFailureReporters(*minReporters)
 	coordinatorService.Start(ctx)
 	defer func() {
 		if err := store.Close(); err != nil {
@@ -1002,9 +1005,74 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			// it has them. "tier-retract": DeleteFileLocation honours
 			// storage_tier; an older coordinator would treat the request as
 			// a per-peer delete and drop the cloud row too.
-			"capabilities": []string{"tier-retract"},
+			// "failure-report": POST /api/peers/report-failure exists.
+			"capabilities": []string{"tier-retract", "failure-report"},
+			// Active cluster flags (e.g. "norebalance" during a rollout).
+			"flags": coordinatorService.Flags(r.Context()),
 		}
 		writeJSONResponse(w, health)
+	})
+
+	// Cluster flags (Ceph's "ceph osd set noout"):
+	//   GET  /api/flags                       -> {"flags": [...]}
+	//   POST /api/flags?name=norebalance&ttl=2h  (ttl <= 0 clears; capped 24h)
+	//   DELETE /api/flags?name=norebalance
+	mux.HandleFunc("/api/flags", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSONResponse(w, map[string]interface{}{"flags": coordinatorService.Flags(r.Context())})
+		case http.MethodPost, http.MethodDelete:
+			name := strings.TrimSpace(r.URL.Query().Get("name"))
+			if name == "" {
+				http.Error(w, "name is required", http.StatusBadRequest)
+				return
+			}
+			ttl := time.Duration(0)
+			if r.Method == http.MethodPost {
+				ttl = time.Hour
+				if raw := r.URL.Query().Get("ttl"); raw != "" {
+					d, err := time.ParseDuration(raw)
+					if err != nil {
+						http.Error(w, "bad ttl: "+err.Error(), http.StatusBadRequest)
+						return
+					}
+					ttl = d
+				}
+			}
+			if err := coordinatorService.SetFlag(r.Context(), name, ttl); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSONResponse(w, map[string]interface{}{"flags": coordinatorService.Flags(r.Context())})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Peer failure reports: POST {"target": id, "reporter": id}.
+	mux.HandleFunc("/api/peers/report-failure", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Target   string `json:"target"`
+			Reporter string `json:"reporter"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := coordinatorService.ReportFailure(r.Context(), req.Target, req.Reporter); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Flags, suspect peers and raw failure reporters.
+	mux.HandleFunc("/api/peers/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, coordinatorService.PeerHealth(r.Context()))
 	})
 }
 

@@ -251,6 +251,16 @@ type CacheConfig struct {
 	// periodic scrub. Unverified blobs are always hashed once at startup.
 	BlobScrubInterval time.Duration
 
+	// ScrubInterval re-checks local copies against their sidecar or chunk
+	// manifest (scrub.go). 0 = default (6h), < 0 disables.
+	ScrubInterval time.Duration
+	// DownOutInterval is how long a holder may be missing from the live
+	// peer list before its copies stop counting toward the replica target
+	// (rebalance.go). 0 = default (10m).
+	DownOutInterval time.Duration
+	// IOSched sets background I/O rates (io_sched.go).
+	IOSched IOSchedConfig
+
 	// PeerReadThroughputBytesPerSec is the assumed per-peer read throughput used
 	// to decide when to enable hybrid peer+cloud reads for large files.
 	PeerReadThroughputBytesPerSec int64
@@ -385,6 +395,18 @@ type DefaultCacheManager struct {
 	openPins openPins
 	// evictBytes is the recent eviction volume for Health (cache_health.go).
 	evictBytes evictWindow
+	// healthMutes are operator-silenced health codes.
+	healthMutes healthMutes
+	// ops tracks in-flight remote fetches (slow_ops.go).
+	ops opTracker
+	// sched rate-limits background I/O classes (io_sched.go).
+	sched ioScheduler
+	// scrub is the background scrubber's state (scrub.go).
+	scrub scrubState
+	// downOut tracks when peers were last live, for down/out (rebalance.go).
+	downOut peerDownTracker
+	// startedAt is when this manager was created.
+	startedAt time.Time
 	// blobVerify remembers OCI blobs hashed against their digest
 	// (blob_verify.go).
 	blobVerify blobVerifier
@@ -718,6 +740,8 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// a failed first pass or later eviction cannot leave declared and actual
 	// residency silently divergent. The registry exists even when the loop is
 	// off, so intents are still recorded and the first pass still runs.
+	cm.startedAt = time.Now()
+	cm.sched.configure(config.IOSched)
 	cm.warmIntents = newWarmIntentRegistry()
 	if !config.WarmReconcileDisabled {
 		cm.startWarmReconciler(shutdownCtx)
@@ -751,6 +775,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// Retract this node's location rows for files eviction removed, so
 	// "holder" in coordinator metadata means "holds now".
 	cm.startEvictRetractor()
+	cm.startScrubber()
 
 	// Background GC for hybridHints — prevents unbounded growth.
 	gcInterval := config.MetadataRefreshTTL * 10
@@ -2760,7 +2785,22 @@ func (cm *DefaultCacheManager) getFromTierInternal(ctx context.Context, filePath
 		}
 	}
 
-	data, err := storage.Read(ctx, filePath)
+	var data []byte
+	var err error
+	if tier == TierPeer || tier == TierCloud {
+		done := cm.ops.start("fetch", filePath, cacheTierToStorageTier(tier))
+		data, err = storage.Read(ctx, filePath)
+		done(err)
+		if err == nil {
+			// Background classes wait here when over their share; the
+			// foreground is never delayed, only recorded (io_sched.go).
+			if werr := cm.sched.charge(ctx, ioClassOf(ctx), int64(len(data))); werr != nil {
+				return nil, werr
+			}
+		}
+	} else {
+		data, err = storage.Read(ctx, filePath)
+	}
 	if err != nil {
 		if tier == TierNVMe {
 			if chunkEntry, chunkErr := cm.readChunkFromWholeLocalFile(ctx, filePath); chunkErr == nil {
@@ -3181,6 +3221,9 @@ func clampChunkSlice(from, to, n int64) (int64, int64) {
 
 func (cm *DefaultCacheManager) ReadRange(ctx context.Context, filePath string, offset int64, size int) ([]byte, error) {
 	started := time.Now()
+	if ioClassOf(ctx) == ioForeground {
+		cm.sched.noteForeground()
+	}
 	if size <= 0 {
 		return []byte{}, nil
 	}

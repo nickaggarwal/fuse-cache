@@ -145,6 +145,7 @@ func (cm *DefaultCacheManager) WarmPrefix(ctx context.Context, prefix, mode stri
 
 // WarmPrefixOpts is WarmPrefix with an explicit strategy.
 func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string, opts WarmupOptions) (*WarmupResult, error) {
+	ctx = withIOClass(ctx, ioWarm)
 	mode := strings.ToLower(strings.TrimSpace(opts.Mode))
 	res := &WarmupResult{Mode: mode}
 	if mode == "" || mode == "none" {
