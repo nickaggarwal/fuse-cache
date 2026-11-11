@@ -406,3 +406,37 @@ func TestSuspectPeersTriedLast(t *testing.T) {
 		t.Fatalf("order = %s %s %s", got[0].ID, got[1].ID, got[2].ID)
 	}
 }
+
+// Concurrent background workers must not exceed the busy allowance by piling
+// up debt past one sleep step (the live bug: 60 MB/s under a 20 MB/s cap).
+func TestIOSchedConcurrentWorkersHoldRate(t *testing.T) {
+	s := &ioScheduler{}
+	s.configure(IOSchedConfig{BusyBytesPerSec: 20 << 20})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { // keep the node busy
+		for ctx.Err() == nil {
+			_ = s.charge(ctx, ioForeground, 1)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 2; i++ { // 8 workers x 2 x 4 MiB = 64 MiB
+				_ = s.charge(ctx, ioWarm, 4<<20)
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	rate := float64(64<<20) / elapsed.Seconds()
+	// 64 MiB at 20 MB/s is ~3.2 s less the one-second burst bank.
+	if rate > 30<<20 {
+		t.Fatalf("8 workers ran at %.1f MB/s under a 20 MB/s cap (%v)", rate/(1<<20), elapsed)
+	}
+}

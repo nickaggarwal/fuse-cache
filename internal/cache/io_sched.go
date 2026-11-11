@@ -51,8 +51,8 @@ var ioClassWeights = [numIOClasses]float64{0, 4, 2, 1, 1}
 const (
 	// busyWindow is how long after a foreground read the node counts as busy.
 	busyWindow = 5 * time.Second
-	// maxThrottleSleep bounds one wait, so a changed rate (foreground went
-	// idle, a class stopped) takes effect within it.
+	// maxThrottleSleep is the step a wait is slept in, so a change (the
+	// foreground went idle) is noticed within it.
 	maxThrottleSleep = 2 * time.Second
 )
 
@@ -179,19 +179,41 @@ func (s *ioScheduler) charge(ctx context.Context, c ioClass, n int64) error {
 		// instead of carrying debt from an earlier busy period.
 		s.busyB[c] = tokenBucket{}
 	}
+	limitWait := s.limitB[c].pending(s.limits[c])
 	s.mu.Unlock()
-	if wait <= 0 {
-		return nil
-	}
-	if wait > maxThrottleSleep {
-		wait = maxThrottleSleep
-	}
-	s.throttled[c].Add(int64(wait))
 	sleep := s.sleepFn
 	if sleep == nil {
 		sleep = sleepCtx
 	}
-	return sleep(ctx, wait)
+	// Sleep the debt off in steps of at most maxThrottleSleep. Capping one
+	// sleep without looping let concurrent workers pile up debt and skip
+	// past it (live: a warm under a 20 MB/s busy cap ran at 60 MB/s). Between
+	// steps, a debt owed only to the busy allowance is dropped once the
+	// foreground goes idle; a class's own limit is always paid.
+	for wait > 0 {
+		step := wait
+		if step > maxThrottleSleep {
+			step = maxThrottleSleep
+		}
+		s.throttled[c].Add(int64(step))
+		if err := sleep(ctx, step); err != nil {
+			return err
+		}
+		wait -= step
+		limitWait -= step
+		if wait > 0 && limitWait <= 0 && !s.busy(s.now()) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// pending is how long the bucket's current debt takes to repay at rate.
+func (b *tokenBucket) pending(rate float64) time.Duration {
+	if rate <= 0 || b.tokens >= 0 {
+		return 0
+	}
+	return time.Duration(-b.tokens / rate * float64(time.Second))
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
