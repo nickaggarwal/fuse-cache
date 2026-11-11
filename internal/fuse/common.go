@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"fuse-client/internal/cache"
-
 )
 
 const (
@@ -128,4 +127,3 @@ func renameEntry(ctx context.Context, cm cache.CacheManager, logger *log.Logger,
 	}
 	return nil
 }
-
