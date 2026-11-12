@@ -104,6 +104,8 @@ func main() {
 		peerServeMaxIn        = flag.Int("peer-serve-max-inflight", 64, "Max concurrent peer serves (gRPC + raw HTTP) before rejecting with busy; requesters fail over and retry with jitter")
 		peerReplStaggerMS     = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
 		globalRead            = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
+		registryFill          = flag.Bool("registry-fill", true, "On the first miss of an OCI blob nydusd asks for, download the whole blob from the registry it named (with nydusd's own token), verify it against its digest and keep it, so later reads and other nodes are served from the cluster instead of the registry")
+		registryFillHosts     = flag.String("registry-fill-hosts", "", "Comma-separated registry hosts fetch-on-miss may download from (exact match); empty allows any host nydusd names")
 		scrubHours            = flag.Int("scrub-hours", 6, "Re-check local copies against their .sha256 sidecar or chunk manifest every N hours (each copy at most weekly; bad ones are moved aside and refetched); 0 disables")
 		downOutMin            = flag.Int("down-out-minutes", 10, "Minutes a holder may be missing from the live peer list before its copies stop counting toward the replica target (it is 'down' before, 'out' after)")
 		bgBusyMBps            = flag.Int("bg-busy-mbps", 200, "While foreground reads are active, cap all background I/O (warm, assembly, replication, scrub) together at this many MB/s; 0 disables")
@@ -697,6 +699,16 @@ func main() {
 		}
 	}
 	apiHandler.SetMaxUploadSize(int64(*maxUploadGB) << 30)
+	{
+		var hosts []string
+		for _, h := range strings.Split(*registryFillHosts, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		apiHandler.EnableRegistryFill(api.RegistryFillConfig{Enabled: *registryFill, AllowedHosts: hosts})
+		logger.Printf("Registry fill (fetch-on-miss): %s hosts=%v", enabledState(*registryFill), hosts)
+	}
 
 	// Model KV store, built over the tiers the cache manager already
 	// configured so credentials and the node-init cache directory are

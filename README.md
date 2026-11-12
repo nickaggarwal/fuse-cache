@@ -375,8 +375,16 @@ container reads a file in the image
   per GET) and lands the whole chunk on local disk later, after 15 s of
   quiet, so the fill never competes with the start. `-no-blob-fill` turns
   the fill off.
-- **Misses fall back cleanly.** A blob the cluster does not hold answers
-  503, with a 5 s negative cache, and nydusd reads it from the registry.
+- **Misses fill the cache.** A blob the cluster does not hold answers 503
+  (nydusd reads that range from the registry, so no read ever waits), and
+  the first miss starts one background download of the whole blob from the
+  registry nydusd named, with nydusd's own token (used for that request,
+  never stored). The body is hashed on the way in and committed only if it
+  matches the digest, then published, so other nodes read it from this one.
+  One node downloads per blob (coordinator fetch lease); fills run in the
+  warm I/O class, yielding to foreground reads. `-registry-fill=false`
+  restores 503-only; `-registry-fill-hosts` limits which registries may be
+  fetched from. Metrics: `fuse_registry_fill_*`.
 - **Filling the store.** A blob gets to the store through a PUT ahead of
   the launch (sky-control's skywarm does this from the source registry).
   Model nodes fill from the store and from each other as they read.
@@ -454,8 +462,10 @@ proxy. Without it nydusd sends `CONNECT`, which fuse-client does not
 terminate, and every read silently falls back to the registry. The
 repository part of the URL is ignored; blobs are keyed by digest only.
 
-**3. Fill the store before launches.** fuse-cache serves blobs it holds; it
-does not pull from your registry itself. Put each layer of an image once,
+**3. (Optional) Pre-warm before launches.** With `-registry-fill` (default
+on) the first node to start an image downloads its blobs from the registry
+on first miss, and every later start in the cluster reads them from that
+node. To make even the first start fast, put each layer in ahead of time,
 by digest, from anywhere that can reach the registry and one client:
 
 ```
@@ -467,8 +477,8 @@ crane blob <registry>/<repo>@sha256:<hex> \
 The PUT is rejected (400) if the body does not hash to the digest. The
 blob lands on that node, is written through to blob storage, and is
 published to the coordinator; every other node then fetches it from that
-node, a peer or blob storage on first read. Layers you skip still work,
-just from the registry. (sky-control's skywarm automates this per image.)
+node, a peer or blob storage on first read. Layers you skip are filled on
+their first miss. (sky-control's skywarm automates this per image.)
 
 **4. Check it is used.** On a node that started a pod from the image:
 
