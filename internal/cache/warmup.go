@@ -100,11 +100,13 @@ func warmupPlan(opts WarmupOptions) (order []CacheTier, fileConcurrency, chunkWo
 	}
 	switch strings.ToLower(strings.TrimSpace(opts.Bandwidth)) {
 	case "", "background":
-		// Chunked files already fan out internally, so file concurrency
-		// stays small to keep warmup polite next to foreground reads.
-		fileConcurrency, chunkWorkers = 2, chunkCompletionFetchWorkers
+		// About 16 chunk fetches in flight node-wide (measured on cpu-w3,
+		// peer fuse-cache to node disk: 234 MB/s with 1 stream, ~400 MB/s
+		// at 16, slower at 64; the node's disk caps near 424 MB/s). Fills
+		// run in the warm I/O class, so foreground reads still come first.
+		fileConcurrency, chunkWorkers = 4, 4
 	case "max":
-		fileConcurrency, chunkWorkers = 4, 16
+		fileConcurrency, chunkWorkers = 4, 8
 	default:
 		return nil, 0, 0, fmt.Errorf("unknown warmup bandwidth %q", opts.Bandwidth)
 	}

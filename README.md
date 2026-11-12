@@ -465,7 +465,18 @@ proxy. Without it nydusd sends `CONNECT`, which fuse-client does not
 terminate, and every read silently falls back to the registry. The
 repository part of the URL is ignored; blobs are keyed by digest only.
 
-**3. (Optional) Pre-warm before launches.** With `-registry-fill` (default
+**3. (Optional) Pre-warm before launches.** The client can pull a whole
+image itself, with about 16 parallel range requests
+(`-registry-fill-parallel`; measured on cpu-w3: 1 stream 80 MB/s, 16 streams
+237 MB/s from ACR), each blob digest-checked:
+
+```
+curl -X POST http://<client>:8081/api/cache/warm-image -d '{
+  "registry": "<registry>", "repo": "<repo>",
+  "digests": ["sha256:...", "..."], "token": "<pull token>"}'
+```
+
+Or put each layer in yourself. With `-registry-fill` (default
 on) the first node to start an image downloads its blobs from the registry
 on first miss, and every later start in the cluster reads them from that
 node. To make even the first start fast, put each layer in ahead of time,

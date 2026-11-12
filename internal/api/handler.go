@@ -212,6 +212,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/stats", h.handleCacheStats).Methods("GET")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarm).Methods("POST")
 	router.HandleFunc("/api/cache/warm-files", h.handleCacheWarmFiles).Methods("POST")
+	router.HandleFunc("/api/cache/warm-image", h.handleWarmImage).Methods("POST")
 	router.HandleFunc("/api/cache/warm", h.handleCacheWarmList).Methods("GET")
 	router.HandleFunc("/api/cache/warm/{id}", h.handleCacheWarmStatus).Methods("GET")
 	router.HandleFunc("/api/cache/residency", h.handleCacheResidency).Methods("GET")
