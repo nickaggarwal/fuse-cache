@@ -75,6 +75,10 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 
 	entry, ok := h.ociBlobEntry(ctx, filePath)
 	if !ok {
+		// Fetch-on-miss: start one background download of the whole blob
+		// from the registry this request names (registry_fill.go). This
+		// read still answers "not here" and nydusd reads it directly.
+		h.maybeStartRegistryFill(r, m[2])
 		http.Error(w, "blob not found", missing)
 		return
 	}
@@ -286,6 +290,12 @@ func (c *missCache) recent(k string) bool {
 		return false
 	}
 	return ok
+}
+
+func (c *missCache) forget(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.at, k)
 }
 
 func (c *missCache) note(k string) {

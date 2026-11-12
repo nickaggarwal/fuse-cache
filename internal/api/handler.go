@@ -74,6 +74,8 @@ type Handler struct {
 	// ociMisses answers repeat lookups of absent blobs without the
 	// coordinator (oci_blob.go).
 	ociMisses missCache
+	// regFill fetches a missed blob from its registry (registry_fill.go).
+	regFill registryFiller
 }
 
 // SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
@@ -1195,6 +1197,14 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 		nr = 1
 	}
 	fmt.Fprintf(w, "fuse_cluster_flag_norebalance %d\n", nr)
+	rf := h.registryFillStats()
+	fmt.Fprintf(w, "fuse_registry_fill_started_total %d\n", rf.Started)
+	fmt.Fprintf(w, "fuse_registry_fill_completed_total %d\n", rf.Completed)
+	fmt.Fprintf(w, "fuse_registry_fill_failed_total %d\n", rf.Failed)
+	fmt.Fprintf(w, "fuse_registry_fill_rejected_total %d\n", rf.Rejected)
+	fmt.Fprintf(w, "fuse_registry_fill_lease_lost_total %d\n", rf.LeaseLost)
+	fmt.Fprintf(w, "fuse_registry_fill_bytes_total %d\n", rf.Bytes)
+	fmt.Fprintf(w, "fuse_registry_fill_inflight %d\n", rf.Inflight)
 	for _, st := range dcm.IOClassStats() {
 		fmt.Fprintf(w, "fuse_io_class_bytes_total{class=%q} %d\n", st.Class, st.Bytes)
 		fmt.Fprintf(w, "fuse_io_class_throttled_seconds_total{class=%q} %.3f\n", st.Class, st.ThrottledSec)

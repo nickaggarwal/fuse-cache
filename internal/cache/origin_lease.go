@@ -232,3 +232,33 @@ func (cm *DefaultCacheManager) getFromRemoteTierWithBusyRetry(ctx context.Contex
 	}
 	return entry, servedTier, retryErr
 }
+
+// TryOriginLease takes the cluster single-flight lease for key, for work that
+// must happen on one node at a time regardless of -fetch-lease (a registry
+// fill of a whole blob). granted is true with no coordinator or a coordinator
+// that cannot lease: the node then proceeds alone, as every advisory path
+// does. release must always be called.
+func (cm *DefaultCacheManager) TryOriginLease(ctx context.Context, key string, ttl time.Duration) (bool, func()) {
+	noop := func() {}
+	if cm.config.Coordinator == nil || cm.config.LocalPeerID == "" {
+		return true, noop
+	}
+	fl, ok := cm.config.Coordinator.(coordinator.FetchLeaser)
+	if !ok {
+		return true, noop
+	}
+	actx, cancel := context.WithTimeout(ctx, originLeaseCallTimeout)
+	_, granted, err := fl.AcquireFetchLease(actx, key, cm.config.LocalPeerID, ttl)
+	cancel()
+	if err != nil {
+		return true, noop // advisory: coordinator trouble never blocks a fill
+	}
+	if !granted {
+		return false, noop
+	}
+	return true, func() {
+		rctx, cancel := context.WithTimeout(context.Background(), originLeaseCallTimeout)
+		_ = fl.ReleaseFetchLease(rctx, key, cm.config.LocalPeerID)
+		cancel()
+	}
+}

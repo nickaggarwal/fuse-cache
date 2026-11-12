@@ -246,3 +246,9 @@ func (cm *DefaultCacheManager) IOClassStats() []IOClassStat {
 	}
 	return out
 }
+
+// ChargeWarmIO charges n bytes of background fill traffic to the warm class
+// (a registry fill of a missed blob, api/registry_fill.go).
+func (cm *DefaultCacheManager) ChargeWarmIO(ctx context.Context, n int64) error {
+	return cm.sched.charge(ctx, ioWarm, n)
+}
