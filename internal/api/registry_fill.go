@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,9 +58,8 @@ const (
 	registryFillTimeout = 30 * time.Minute
 	// registryFillRetryAfter spaces attempts after a failed fill.
 	registryFillRetryAfter = 30 * time.Second
-	// registryFillMaxConcurrent caps simultaneous downloads per node: a cold
-	// start of a 17-layer image should not open 17 registry streams at once
-	// next to nydusd's own reads.
+	// registryFillMaxConcurrent caps simultaneous blob fills per node (each
+	// runs fillWorkers range GETs).
 	registryFillMaxConcurrent = 4
 )
 
@@ -89,6 +87,11 @@ type registryFiller struct {
 	rejected  atomic.Int64 // digest mismatch
 	leaseLost atomic.Int64 // another node is filling it
 	bytes     atomic.Int64
+	// Reads answered from a fill in progress (fill_serve.go).
+	servedReads atomic.Int64
+	servedBytes atomic.Int64
+	serveMiss   atomic.Int64
+	waitNanos   atomic.Int64
 }
 
 // blobFillCommitter is the cache side of a fill: stage, commit, and mark
@@ -116,6 +119,8 @@ func (h *Handler) EnableRegistryFill(cfg RegistryFillConfig) {
 // RegistryFillStats is exported to /metrics.
 type RegistryFillStats struct {
 	Started, Completed, Failed, Rejected, LeaseLost, Bytes int64
+	ServedReads, ServedBytes, ServeMiss                    int64
+	ServeWaitSec                                           float64
 	Inflight                                               int
 }
 
@@ -127,6 +132,8 @@ func (h *Handler) registryFillStats() RegistryFillStats {
 	return RegistryFillStats{
 		Started: f.started.Load(), Completed: f.completed.Load(), Failed: f.failed.Load(),
 		Rejected: f.rejected.Load(), LeaseLost: f.leaseLost.Load(), Bytes: f.bytes.Load(), Inflight: n,
+		ServedReads: f.servedReads.Load(), ServedBytes: f.servedBytes.Load(), ServeMiss: f.serveMiss.Load(),
+		ServeWaitSec: time.Duration(f.waitNanos.Load()).Seconds(),
 	}
 }
 
@@ -246,21 +253,12 @@ func (h *Handler) runRegistryFill(src *url.URL, auth, hexDigest string) error {
 	if !ok {
 		return errors.New("cache cannot stage files")
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.String(), nil)
+	size, err := f.blobSize(ctx, src, auth)
 	if err != nil {
-		return err
+		return fmt.Errorf("registry size: %w", err)
 	}
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-	resp, err := f.cfg.HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("registry GET: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("registry GET %s: http %d", src.Host, resp.StatusCode)
+	if size > registryFillMaxBytes {
+		return fmt.Errorf("blob larger than %d bytes", int64(registryFillMaxBytes))
 	}
 
 	out, staged, err := committer.CreateWriteFile(ctx, filePath)
@@ -268,57 +266,101 @@ func (h *Handler) runRegistryFill(src *url.URL, auth, hexDigest string) error {
 		return err
 	}
 	defer os.Remove(staged)
-	digester := sha256.New()
-	body := io.Reader(io.LimitReader(resp.Body, registryFillMaxBytes+1))
-	charger, _ := h.cacheManager.(fillCharger)
-	buf := make([]byte, 1<<20)
-	var n int64
-	for {
-		k, rerr := body.Read(buf)
-		if k > 0 {
-			if _, werr := out.Write(buf[:k]); werr != nil {
-				out.Close()
-				return werr
-			}
-			digester.Write(buf[:k])
-			n += int64(k)
-			if charger != nil {
-				if cerr := charger.ChargeWarmIO(ctx, int64(k)); cerr != nil {
-					out.Close()
-					return cerr
-				}
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			out.Close()
-			return fmt.Errorf("registry body: %w", rerr)
-		}
-	}
-	if err := out.Close(); err != nil {
+	if err := out.Truncate(size); err != nil {
+		out.Close()
 		return err
 	}
-	if n > registryFillMaxBytes {
-		return fmt.Errorf("blob larger than %d bytes", int64(registryFillMaxBytes))
-	}
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		if want, perr := strconv.ParseInt(cl, 10, 64); perr == nil && want != n {
-			return fmt.Errorf("short body: %d of %d bytes", n, want)
+	lf := newLiveFill(hexDigest, size, fillUnitBytes, out, staged)
+	h.liveFills.put(lf)
+	defer h.liveFills.del(hexDigest)
+
+	charger, _ := h.cacheManager.(fillCharger)
+	charge := func(n int64) error {
+		f.bytes.Add(n)
+		if charger != nil {
+			return charger.ChargeWarmIO(ctx, n)
 		}
+		return nil
+	}
+	// Parallel range GETs; a waiting read reorders the queue (prioritize).
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+	for w := 0; w < fillWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				u := lf.next()
+				if u < 0 {
+					return
+				}
+				uerr := f.fetchUnit(ctx, src, auth, lf, u, charge)
+				lf.markDone(u, uerr == nil)
+				if uerr != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = uerr
+					}
+					errMu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		lf.finish(firstErr)
+		out.Close()
+		return fmt.Errorf("registry ranges: %w", firstErr)
+	}
+
+	// Every unit is in: hash the whole file against the digest before it is
+	// committed or shared. Reads already served came from the registry the
+	// request named; nothing unverified reaches other nodes.
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		lf.finish(err)
+		out.Close()
+		return err
+	}
+	digester := sha256.New()
+	if _, err := io.Copy(digester, out); err != nil {
+		lf.finish(err)
+		out.Close()
+		return err
 	}
 	if got := hex.EncodeToString(digester.Sum(nil)); got != hexDigest {
+		lf.finish(errFillDigest)
+		out.Close()
 		return fmt.Errorf("%w (got %s)", errFillDigest, got[:12])
 	}
-	if err := committer.PutFromFile(ctx, filePath, staged, n, time.Now()); err != nil {
+	// Commit while readers may still hold the file open: PutFromFile renames
+	// it, and an open descriptor keeps reading the same inode.
+	if err := out.Sync(); err != nil {
+		lf.finish(err)
+		out.Close()
+		return err
+	}
+	if err := committer.PutFromFile(ctx, filePath, staged, size, time.Now()); err != nil {
+		lf.finish(err)
+		out.Close()
 		return err
 	}
 	if bv, ok := h.cacheManager.(blobVerifyMarker); ok {
 		bv.MarkBlobVerified(filePath)
 	}
 	h.ociMisses.forget(filePath)
-	f.bytes.Add(n)
-	h.logger.Printf("[FILL] %s: %d bytes from %s", hexDigest[:12], n, src.Host)
+	lf.finish(nil)
+	h.liveFills.del(hexDigest)
+	// Mark the fill not running only after it is committed and indexed,
+	// so a reader that sees "not running" also sees the blob.
+	out.Close()
+	h.logger.Printf("[FILL] %s: %d bytes from %s (%d-byte units)", hexDigest[:12], size, src.Host, lf.unit)
 	return nil
+}
+
+// running reports whether a fill of hexDigest is in flight on this node.
+func (f *registryFiller) running(hexDigest string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inflight[hexDigest]
 }
