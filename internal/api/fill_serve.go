@@ -40,7 +40,10 @@ import (
 // 503, so nydusd reads that range directly.
 
 const (
-	defaultFillUnit = 4 << 20
+	// defaultFillUnit: measured on cpu-w3 (vLLM 7B, first-node cold start, 2
+	// runs each): 4 MiB 130.6/133.4 s, 8 MiB 129.9/130.6 s (lowest per-read
+	// wait, 5.9 ms), 16 MiB 130.8/145.6 s.
+	defaultFillUnit = 8 << 20
 	// fillWorkers is range GETs per blob; fillNodeParallel caps them across
 	// all fills on the node. Measured on cpu-w3 (E8ds_v6), ACR to node disk:
 	// 80 MB/s with 1 stream, 237 MB/s at 16, flat beyond (unit size did not

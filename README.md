@@ -379,7 +379,7 @@ container reads a file in the image
   of a blob the cluster does not hold starts one download of the whole blob
   from the registry nydusd named, with nydusd's own token (used for that
   download, never stored). The download runs as parallel range requests in
-  4 MiB units (`-registry-fill-unit-mb`); a read waits only for the units it
+  8 MiB units (`-registry-fill-unit-mb`); a read waits only for the units it
   needs, which jump the queue, and is answered from them, so the first node
   pulls the image once and serves itself from it. When every unit is in, the
   blob is hashed against its digest and only then committed and published
