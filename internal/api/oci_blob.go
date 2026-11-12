@@ -75,12 +75,33 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 
 	entry, ok := h.ociBlobEntry(ctx, filePath)
 	if !ok {
-		// Fetch-on-miss: start one background download of the whole blob
-		// from the registry this request names (registry_fill.go). This
-		// read still answers "not here" and nydusd reads it directly.
-		h.maybeStartRegistryFill(r, m[2])
-		http.Error(w, "blob not found", missing)
-		return
+		// Fetch-on-miss (registry_fill.go): start the fill if none is
+		// running, then answer from it once this read's units land
+		// (fill_serve.go). Only if that fails does the read answer "not
+		// here", and nydusd reads it directly.
+		served := false
+		if r.Method == http.MethodGet {
+			h.maybeStartRegistryFill(r, m[2])
+			for i := 0; i < 50; i++ { // the fill registers within its size probe
+				if lf := h.liveFills.get(m[2]); lf != nil {
+					served = h.serveFromLiveFill(w, r, lf, r.Header.Get("Range"))
+					break
+				}
+				if !h.regFill.running(m[2]) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		if served {
+			return
+		}
+		// A small blob can finish filling (and leave liveFills) between the
+		// start and the lookup above: it is committed now, so look again.
+		if entry, ok = h.ociBlobEntry(ctx, filePath); !ok {
+			http.Error(w, "blob not found", missing)
+			return
+		}
 	}
 	size := entry.Size
 	w.Header().Set("Accept-Ranges", "bytes")

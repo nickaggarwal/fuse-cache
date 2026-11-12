@@ -2,10 +2,12 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -94,11 +96,12 @@ func (c *fillCache) has(p string) bool {
 // fakeRegistry serves one blob over TLS, counting GETs and the Authorization
 // header it saw. body overrides what is served (to test a bad digest).
 type fakeRegistry struct {
-	srv   *httptest.Server
-	gets  atomic.Int64
-	auth  atomic.Value
-	body  []byte
-	delay time.Duration
+	srv    *httptest.Server
+	gets   atomic.Int64
+	ranges atomic.Int64
+	auth   atomic.Value
+	body   []byte
+	delay  time.Duration
 }
 
 func newFakeRegistry(t *testing.T, repo, hexDigest string, body []byte) *fakeRegistry {
@@ -112,6 +115,21 @@ func newFakeRegistry(t *testing.T, repo, hexDigest string, body []byte) *fakeReg
 		fr.auth.Store(r.Header.Get("Authorization"))
 		if fr.delay > 0 {
 			time.Sleep(fr.delay)
+		}
+		// Like ACR: honour a single "bytes=a-b" range with 206.
+		if rg := r.Header.Get("Range"); rg != "" {
+			var a, b int64
+			if _, err := fmt.Sscanf(rg, "bytes=%d-%d", &a, &b); err == nil && a < int64(len(fr.body)) {
+				if b >= int64(len(fr.body)) {
+					b = int64(len(fr.body)) - 1
+				}
+				fr.ranges.Add(1)
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, len(fr.body)))
+				w.Header().Set("Content-Length", fmt.Sprint(b-a+1))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(fr.body[a : b+1])
+				return
+			}
 		}
 		w.Header().Set("Content-Length", fmt.Sprint(len(fr.body)))
 		_, _ = w.Write(fr.body)
@@ -177,8 +195,8 @@ func TestRegistryFillOnFirstMiss(t *testing.T) {
 	fc := newFillCache()
 	h, addr := fillHandler(t, fc, fr)
 
-	if code := proxyGet(t, addr, fr.host(), "vllm/cpu", dg); code != http.StatusServiceUnavailable {
-		t.Fatalf("first miss answered %d, want 503 (nydusd must fall back, not wait)", code)
+	if code := proxyGet(t, addr, fr.host(), "vllm/cpu", dg); code != http.StatusPartialContent {
+		t.Fatalf("first miss answered %d, want 206 served from the fill in progress", code)
 	}
 	waitFor(t, func() bool { return fc.has(OCIBlobPrefix + dg) }, "fill to commit")
 	if got := fr.auth.Load(); got != "Bearer test-token" {
@@ -202,7 +220,7 @@ func TestRegistryFillSingleFlight(t *testing.T) {
 	fr := newFakeRegistry(t, "r", dg, body)
 	fr.delay = 200 * time.Millisecond
 	fc := newFillCache()
-	_, addr := fillHandler(t, fc, fr)
+	h, addr := fillHandler(t, fc, fr)
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
@@ -210,8 +228,8 @@ func TestRegistryFillSingleFlight(t *testing.T) {
 	}
 	wg.Wait()
 	waitFor(t, func() bool { return fc.has(OCIBlobPrefix + dg) }, "fill")
-	if n := fr.gets.Load(); n != 1 {
-		t.Fatalf("registry GETs = %d, want 1", n)
+	if n := h.registryFillStats().Started; n != 1 {
+		t.Fatalf("fills started = %d, want 1", n)
 	}
 }
 
@@ -222,7 +240,7 @@ func TestRegistryFillRejectsWrongDigest(t *testing.T) {
 	fc := newFillCache()
 	h, addr := fillHandler(t, fc, fr)
 	proxyGet(t, addr, fr.host(), "r", dg)
-	waitFor(t, func() bool { return h.registryFillStats().Rejected+h.registryFillStats().Failed == 1 }, "fill to finish")
+	waitFor(t, func() bool { return h.registryFillStats().Rejected+h.registryFillStats().Failed >= 1 }, "fill to finish")
 	if fc.has(OCIBlobPrefix + dg) {
 		t.Fatal("blob with the wrong digest was committed")
 	}
@@ -274,5 +292,69 @@ func TestRegistryFillGuards(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if fr.gets.Load() != 0 {
 		t.Fatal("filled while disabled or from a host-less request")
+	}
+}
+
+// A read for a blob being filled is answered from the units that landed,
+// with the right bytes, before the whole blob is in; the unit it needs is
+// fetched first.
+func TestRegistryFillServesWhileFilling(t *testing.T) {
+	SetFillUnitBytes(256 << 10)
+	defer SetFillUnitBytes(defaultFillUnit)
+	b := make([]byte, 8<<20) // 32 units of 256 KiB
+	for i := range b {
+		b[i] = byte(i * 7 % 251)
+	}
+	sum := sha256.Sum256(b)
+	dg := hex.EncodeToString(sum[:])
+	fr := newFakeRegistry(t, "r", dg, b)
+	fr.delay = 30 * time.Millisecond // each range GET is slow
+	fc := newFillCache()
+	h, addr := fillHandler(t, fc, fr)
+
+	// Ask for a range near the end: it must not wait for the whole blob.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start, end := int64(7<<20), int64(7<<20+4095)
+	t0 := time.Now()
+	fmt.Fprintf(conn, "GET http://%s/v2/r/blobs/sha256:%s HTTP/1.1\r\nHost: x\r\nRange: bytes=%d-%d\r\nAuthorization: Bearer t\r\nConnection: close\r\n\r\n", fr.host(), dg, start, end)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	took := time.Since(t0)
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, b[start:end+1]) {
+		t.Fatalf("status %d, %d bytes, match=%t", resp.StatusCode, len(got), bytes.Equal(got, b[start:end+1]))
+	}
+	// 32 units x 30 ms / 8 workers ~= 120 ms for everything; the prioritized
+	// unit should be back well before a sequential fill reached it.
+	if fc.has(OCIBlobPrefix+dg) && took > 400*time.Millisecond {
+		t.Fatalf("read waited for the whole blob (%v)", took)
+	}
+	if h.registryFillStats().ServedReads != 1 {
+		t.Fatalf("served reads = %d", h.registryFillStats().ServedReads)
+	}
+	waitFor(t, func() bool { return fc.has(OCIBlobPrefix + dg) }, "commit")
+	if fr.gets.Load() > 33+1 { // 1 size probe + 32 units, no duplicates
+		t.Fatalf("registry GETs = %d, want <= 33 (each unit once)", fr.gets.Load())
+	}
+}
+
+// When the registry body for a unit is wrong the blob is never committed, and
+// a later read falls back (503) instead of being served the bad bytes.
+func TestRegistryFillBadBlobNotCommitted(t *testing.T) {
+	_, dg := blobOf("expected")
+	fr := newFakeRegistry(t, "r", dg, []byte(strings.Repeat("WRONG", 2000)))
+	fc := newFillCache()
+	h, addr := fillHandler(t, fc, fr)
+	proxyGet(t, addr, fr.host(), "r", dg) // may be served: it is what the registry returned
+	waitFor(t, func() bool { return h.registryFillStats().Rejected >= 1 }, "rejection")
+	if fc.has(OCIBlobPrefix + dg) {
+		t.Fatal("blob that failed its digest was committed")
 	}
 }

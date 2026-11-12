@@ -105,6 +105,7 @@ func main() {
 		peerReplStaggerMS     = flag.Int("peer-replication-stagger-ms", 25, "Base jittered delay in ms between successive peer replica writes of one object (thundering-herd control)")
 		globalRead            = flag.Bool("global-read", false, "On a cloud miss, ask the coordinator whether another cluster published this path and read it from that cluster's object-store prefix. Requires the coordinator to run with -global-enabled; off by default, and off costs nothing because only the miss branch consults it")
 		registryFill          = flag.Bool("registry-fill", true, "On the first miss of an OCI blob nydusd asks for, download the whole blob from the registry it named (with nydusd's own token), verify it against its digest and keep it, so later reads and other nodes are served from the cluster instead of the registry")
+		registryFillUnitMB    = flag.Int("registry-fill-unit-mb", 4, "Fetch unit in MiB for registry fills: a read waiting on a fill in progress needs only its units, so smaller units answer sooner; independent of -chunk-size")
 		registryFillHosts     = flag.String("registry-fill-hosts", "", "Comma-separated registry hosts fetch-on-miss may download from (exact match); empty allows any host nydusd names")
 		scrubHours            = flag.Int("scrub-hours", 6, "Re-check local copies against their .sha256 sidecar or chunk manifest every N hours (each copy at most weekly; bad ones are moved aside and refetched); 0 disables")
 		downOutMin            = flag.Int("down-out-minutes", 10, "Minutes a holder may be missing from the live peer list before its copies stop counting toward the replica target (it is 'down' before, 'out' after)")
@@ -706,6 +707,7 @@ func main() {
 				hosts = append(hosts, h)
 			}
 		}
+		api.SetFillUnitBytes(int64(*registryFillUnitMB) << 20)
 		apiHandler.EnableRegistryFill(api.RegistryFillConfig{Enabled: *registryFill, AllowedHosts: hosts})
 		logger.Printf("Registry fill (fetch-on-miss): %s hosts=%v", enabledState(*registryFill), hosts)
 	}

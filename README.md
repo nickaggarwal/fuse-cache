@@ -375,16 +375,19 @@ container reads a file in the image
   per GET) and lands the whole chunk on local disk later, after 15 s of
   quiet, so the fill never competes with the start. `-no-blob-fill` turns
   the fill off.
-- **Misses fill the cache.** A blob the cluster does not hold answers 503
-  (nydusd reads that range from the registry, so no read ever waits), and
-  the first miss starts one background download of the whole blob from the
-  registry nydusd named, with nydusd's own token (used for that request,
-  never stored). The body is hashed on the way in and committed only if it
-  matches the digest, then published, so other nodes read it from this one.
-  One node downloads per blob (coordinator fetch lease); fills run in the
-  warm I/O class, yielding to foreground reads. `-registry-fill=false`
-  restores 503-only; `-registry-fill-hosts` limits which registries may be
-  fetched from. Metrics: `fuse_registry_fill_*`.
+- **Misses fill the cache, and are served from the fill.** The first read
+  of a blob the cluster does not hold starts one download of the whole blob
+  from the registry nydusd named, with nydusd's own token (used for that
+  download, never stored). The download runs as parallel range requests in
+  4 MiB units (`-registry-fill-unit-mb`); a read waits only for the units it
+  needs, which jump the queue, and is answered from them, so the first node
+  pulls the image once and serves itself from it. When every unit is in, the
+  blob is hashed against its digest and only then committed and published
+  for other nodes; a mismatch is discarded and later reads fall back to the
+  registry, as does any read whose unit fails. One node downloads per blob
+  (coordinator fetch lease), in the warm I/O class. `-registry-fill=false`
+  restores 503-only; `-registry-fill-hosts` limits which registries are
+  allowed. Metrics: `fuse_registry_fill_*`.
 - **Filling the store.** A blob gets to the store through a PUT ahead of
   the launch (sky-control's skywarm does this from the source registry).
   Model nodes fill from the store and from each other as they read.
