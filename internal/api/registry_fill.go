@@ -58,9 +58,9 @@ const (
 	registryFillTimeout = 30 * time.Minute
 	// registryFillRetryAfter spaces attempts after a failed fill.
 	registryFillRetryAfter = 30 * time.Second
-	// registryFillMaxConcurrent caps simultaneous blob fills per node (each
-	// runs fillWorkers range GETs).
-	registryFillMaxConcurrent = 4
+	// registryFillMaxConcurrent caps simultaneous blob fills per node; the
+	// range GETs they issue share fillNodeParallel.
+	registryFillMaxConcurrent = 8
 )
 
 // RegistryFillConfig configures fetch-on-miss.
@@ -77,6 +77,7 @@ type registryFiller struct {
 	cfg      RegistryFillConfig
 	enabled  atomic.Bool
 	sem      chan struct{}
+	reqSem   chan struct{} // range GETs in flight, node-wide
 	mu       sync.Mutex
 	inflight map[string]bool
 	failedAt map[string]time.Time
@@ -113,6 +114,7 @@ func (h *Handler) EnableRegistryFill(cfg RegistryFillConfig) {
 	}
 	h.regFill.cfg = cfg
 	h.regFill.sem = make(chan struct{}, registryFillMaxConcurrent)
+	h.regFill.reqSem = make(chan struct{}, fillNodeParallel)
 	h.regFill.enabled.Store(cfg.Enabled)
 }
 
@@ -182,7 +184,13 @@ func (h *Handler) maybeStartRegistryFill(r *http.Request, hexDigest string) {
 	if !ok || !f.hostAllowed(src.Host) {
 		return
 	}
-	auth := r.Header.Get("Authorization")
+	h.startRegistryFill(src, r.Header.Get("Authorization"), hexDigest, nil)
+}
+
+// startRegistryFill starts one fill unless it is running or failed recently.
+// done, if set, receives the outcome (nil when it was already running).
+func (h *Handler) startRegistryFill(src *url.URL, auth, hexDigest string, done func(error)) bool {
+	f := &h.regFill
 	f.mu.Lock()
 	if f.inflight == nil {
 		f.inflight = map[string]bool{}
@@ -190,7 +198,10 @@ func (h *Handler) maybeStartRegistryFill(r *http.Request, hexDigest string) {
 	}
 	if f.inflight[hexDigest] || time.Since(f.failedAt[hexDigest]) < registryFillRetryAfter {
 		f.mu.Unlock()
-		return
+		if done != nil {
+			done(nil)
+		}
+		return false
 	}
 	f.inflight[hexDigest] = true
 	f.mu.Unlock()
@@ -215,7 +226,11 @@ func (h *Handler) maybeStartRegistryFill(r *http.Request, hexDigest string) {
 			f.failed.Add(1)
 			h.logger.Printf("[FILL] %s: %v", hexDigest[:12], err)
 		}
+		if done != nil {
+			done(err)
+		}
 	}()
+	return true
 }
 
 var (

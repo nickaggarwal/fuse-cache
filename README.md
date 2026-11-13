@@ -379,7 +379,7 @@ container reads a file in the image
   of a blob the cluster does not hold starts one download of the whole blob
   from the registry nydusd named, with nydusd's own token (used for that
   download, never stored). The download runs as parallel range requests in
-  4 MiB units (`-registry-fill-unit-mb`); a read waits only for the units it
+  8 MiB units (`-registry-fill-unit-mb`); a read waits only for the units it
   needs, which jump the queue, and is answered from them, so the first node
   pulls the image once and serves itself from it. When every unit is in, the
   blob is hashed against its digest and only then committed and published
@@ -465,7 +465,18 @@ proxy. Without it nydusd sends `CONNECT`, which fuse-client does not
 terminate, and every read silently falls back to the registry. The
 repository part of the URL is ignored; blobs are keyed by digest only.
 
-**3. (Optional) Pre-warm before launches.** With `-registry-fill` (default
+**3. (Optional) Pre-warm before launches.** The client can pull a whole
+image itself, with about 16 parallel range requests
+(`-registry-fill-parallel`; measured on cpu-w3: 1 stream 80 MB/s, 16 streams
+237 MB/s from ACR), each blob digest-checked:
+
+```
+curl -X POST http://<client>:8081/api/cache/warm-image -d '{
+  "registry": "<registry>", "repo": "<repo>",
+  "digests": ["sha256:...", "..."], "token": "<pull token>"}'
+```
+
+Or put each layer in yourself. With `-registry-fill` (default
 on) the first node to start an image downloads its blobs from the registry
 on first miss, and every later start in the cluster reads them from that
 node. To make even the first start fast, put each layer in ahead of time,

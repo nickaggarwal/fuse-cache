@@ -56,13 +56,21 @@ client:
   # node can use it as its registry backend. 0 = no host port.
   hostPort: 0
   cloudProvider: azure
+  # Sized from a measured cold vLLM 7B start through registry fill on cpu-w3
+  # (E8ds_v6): CPU p50 0.08 / p95 1.5 / max 2.05 cores; heap ~100 MiB, but the
+  # cgroup also counts page cache from blob writes and sat at the old 4 GiB
+  # limit for the whole start (reclaim under pressure, no OOM). No CPU limit:
+  # a throttled client stalls every pod reading through it; the request keeps
+  # it scheduled ahead of best-effort work. The request covers the measured
+  # peak (2 cores); bigger GPU nodes push more bytes and may need more.
+  # Clusters that require a CPU limit (LimitRange/quota) can add one, e.g.
+  # limits.cpu: "4" (~2x the measured peak).
   resources:
     requests:
-      cpu: 500m
-      memory: 512Mi
-    limits:
       cpu: "2"
-      memory: 4Gi
+      memory: 1Gi
+    limits:
+      memory: 8Gi
   fuseDevicePath: /dev/fuse
   nvmeHostPath: /mnt
   fuseHostPath: /mnt

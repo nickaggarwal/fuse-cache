@@ -40,12 +40,30 @@ import (
 // 503, so nydusd reads that range directly.
 
 const (
-	defaultFillUnit     = 4 << 20
-	fillWorkers         = 8
+	// defaultFillUnit: measured on cpu-w3 (vLLM 7B, first-node cold start, 2
+	// runs each): 4 MiB 130.6/133.4 s, 8 MiB 129.9/130.6 s (lowest per-read
+	// wait, 5.9 ms), 16 MiB 130.8/145.6 s.
+	defaultFillUnit = 8 << 20
+	// fillWorkers is range GETs per blob; fillNodeParallel caps them across
+	// all fills on the node. Measured on cpu-w3 (E8ds_v6), ACR to node disk:
+	// 80 MB/s with 1 stream, 237 MB/s at 16, flat beyond (unit size did not
+	// matter). Many small blobs each get workers; one big blob gets 16.
+	fillWorkers         = 16
 	fillUnitAttempts    = 3
 	fillWaitTimeout     = 60 * time.Second
 	fillServeMaxPending = 64
 )
+
+// fillNodeParallel caps registry range GETs in flight on this node, across
+// every fill; set from -registry-fill-parallel.
+var fillNodeParallel = 16
+
+// SetFillParallel sets the node-wide range-GET cap (1..256).
+func SetFillParallel(n int) {
+	if n >= 1 && n <= 256 {
+		fillNodeParallel = n
+	}
+}
 
 // fillUnitBytes is the fetch unit; set from -registry-fill-unit-mb.
 var fillUnitBytes int64 = defaultFillUnit
@@ -254,6 +272,8 @@ func (f *registryFiller) fetchUnit(ctx context.Context, src *url.URL, auth strin
 		end = lf.size - 1
 	}
 	var lastErr error
+	f.reqSem <- struct{}{}
+	defer func() { <-f.reqSem }()
 	for attempt := 0; attempt < fillUnitAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()

@@ -160,11 +160,11 @@ func TestWarmupPlan_StrategyResolution(t *testing.T) {
 		wantFiles, wantWk int
 		wantErr           bool
 	}{
-		{"", "", nil, 2, chunkCompletionFetchWorkers, false},
-		{"peer-first", "background", nil, 2, chunkCompletionFetchWorkers, false},
-		{"hybrid", "", nil, 2, chunkCompletionFetchWorkers, false},
-		{"cloud-first", "max", []CacheTier{TierCloud, TierPeer}, 4, 16, false},
-		{"cloud-only", "", []CacheTier{TierCloud}, 2, chunkCompletionFetchWorkers, false},
+		{"", "", nil, 4, 4, false},
+		{"peer-first", "background", nil, 4, 4, false},
+		{"hybrid", "", nil, 4, 4, false},
+		{"cloud-first", "max", []CacheTier{TierCloud, TierPeer}, 4, 8, false},
+		{"cloud-only", "", []CacheTier{TierCloud}, 4, 4, false},
 		{"warp-speed", "", nil, 0, 0, true},
 		{"", "ludicrous", nil, 0, 0, true},
 	}

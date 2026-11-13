@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -356,5 +357,90 @@ func TestRegistryFillBadBlobNotCommitted(t *testing.T) {
 	waitFor(t, func() bool { return h.registryFillStats().Rejected >= 1 }, "rejection")
 	if fc.has(OCIBlobPrefix + dg) {
 		t.Fatal("blob that failed its digest was committed")
+	}
+}
+
+// POST /api/cache/warm-image fills every listed blob, keeps the node-wide
+// request cap, and reports per-blob outcomes; a bad digest is a per-blob
+// failure, not a request failure.
+func TestWarmImage(t *testing.T) {
+	SetFillUnitBytes(256 << 10)
+	defer SetFillUnitBytes(defaultFillUnit)
+	var blobs [][]byte
+	var digests []string
+	mux := http.NewServeMux()
+	var inflight, peak atomic.Int64
+	for i := 0; i < 3; i++ {
+		b := make([]byte, 2<<20)
+		for j := range b {
+			b[j] = byte(i*31 + j%251)
+		}
+		s := sha256.Sum256(b)
+		d := hex.EncodeToString(s[:])
+		blobs = append(blobs, b)
+		digests = append(digests, "sha256:"+d)
+		body := b
+		mux.HandleFunc("/v2/img/blobs/sha256:"+d, func(w http.ResponseWriter, r *http.Request) {
+			n := inflight.Add(1)
+			defer inflight.Add(-1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			var a, z int64
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &a, &z); err != nil {
+				http.Error(w, "range required", http.StatusBadRequest)
+				return
+			}
+			if z >= int64(len(body)) {
+				z = int64(len(body)) - 1
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, z, len(body)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[a : z+1])
+		})
+	}
+	reg := httptest.NewTLSServer(mux)
+	defer reg.Close()
+	u, _ := url.Parse(reg.URL)
+
+	SetFillParallel(4)
+	defer SetFillParallel(16)
+	fc := newFillCache()
+	h := NewHandler(fc, nil, "p", "")
+	h.EnableRegistryFill(RegistryFillConfig{Enabled: true, HTTPClient: reg.Client()})
+	srv := httptest.NewServer(h.SetupRoutes())
+	defer srv.Close()
+
+	reqBody := fmt.Sprintf(`{"registry":%q,"repo":"img","digests":["%s","%s","%s","sha256:%s"],"token":"t"}`,
+		u.Host, digests[0], digests[1], digests[2], strings.Repeat("0", 64))
+	resp, err := http.Post(srv.URL+"/api/cache/warm-image", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out warmImageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	filled := 0
+	for _, b := range out.Blobs {
+		if b.State == "filled" {
+			filled++
+		}
+	}
+	if filled != 3 || out.Failed != 1 || resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("status %d, filled %d, failed %d: %+v", resp.StatusCode, filled, out.Failed, out.Blobs)
+	}
+	for i, d := range digests {
+		if !bytes.Equal(fc.files[OCIBlobPrefix+strings.TrimPrefix(d, "sha256:")], blobs[i]) {
+			t.Fatalf("blob %d bytes differ", i)
+		}
+	}
+	if p := peak.Load(); p > 4 {
+		t.Fatalf("peak range requests in flight = %d, cap is 4", p)
 	}
 }
