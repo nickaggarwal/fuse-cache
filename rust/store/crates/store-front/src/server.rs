@@ -277,7 +277,11 @@ impl Server {
     /// Handle one request. `Ok(true)` = the connection can carry another.
     fn handle_request(&self, c: &mut Conn, head: &[u8], req: &RequestHead, backend: &mut Option<Conn>) -> io::Result<bool> {
         let t0 = Instant::now();
-        let path = req.path().to_string();
+        // route_path: nydusd's proxy-form requests (absolute registry URL)
+        // route like the plain /v2/<repo>/blobs/<digest> form, so a blob held
+        // whole and verified here is served natively; a miss still goes to Go
+        // unchanged (its fetch-on-miss fill).
+        let path = req.route_path().to_string();
         let plan = route(&req.method, &path);
 
         // Without the key, nothing is served natively: the request goes to
@@ -751,6 +755,29 @@ mod tests {
         assert_eq!(route("PUT", "/api/files/models/m/r1/w.bin"), Plan::Put { path: "models/m/r1/w.bin".into() });
         assert_eq!(route("POST", "/api/files/a"), Plan::Proxy);
         assert_eq!(route("DELETE", "/api/files/a"), Plan::Proxy);
+    }
+
+    // nydusd sends proxy-form requests (absolute registry URL); they route on
+    // their path like the plain form, so a verified local blob is native.
+    #[test]
+    fn proxy_form_routes_on_path() {
+        let d = "sha256:".to_string() + &"b".repeat(64);
+        let mk = |t: &str| crate::http::RequestHead { method: "GET".into(), target: t.into(), ..Default::default() };
+        let r = mk(&format!("http://myacr.azurecr.io/v2/models/q/blobs/{d}"));
+        assert_eq!(r.route_path(), format!("/v2/models/q/blobs/{d}"));
+        assert_eq!(route("GET", r.route_path()), Plan::Blob { digest: d.clone() });
+        // query string dropped, as for path()
+        let r = mk(&format!("http://myacr.azurecr.io/v2/m/blobs/{d}?x=1"));
+        assert_eq!(route("GET", r.route_path()), Plan::Blob { digest: d.clone() });
+        // the redirect target nydusd also proxies (blob storage) is not a blob
+        // route: it stays Proxy and Go answers it (503 -> nydusd goes direct).
+        let r = mk("http://acct.blob.core.windows.net//docker/registry/v2/blobs/sha256/bb/x/data?sig=y");
+        assert_eq!(route("GET", r.route_path()), Plan::Proxy);
+        // plain and origin-form paths are unchanged
+        assert_eq!(mk("/v2/").route_path(), "/v2/");
+        assert_eq!(mk("/api/peer/read?path=/a").route_path(), "/api/peer/read");
+        // https:// absolute form (never sent by nydusd with use_http) is not reduced
+        assert_eq!(mk("https://h/v2/").route_path(), "https://h/v2/");
     }
 
     #[test]
