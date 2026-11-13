@@ -199,6 +199,21 @@ impl RequestHead {
         self.target.split_once('?').map(|(p, _)| p).unwrap_or(&self.target)
     }
 
+    /// The path to route on. nydusd talks to this node as an HTTP proxy, so
+    /// its requests carry the absolute registry URL
+    /// (`GET http://<registry>/v2/<repo>/blobs/sha256:<hex>`); route those on
+    /// the path part, the same way Go's mux does. Only the plain `http://`
+    /// absolute form is reduced; anything else is the path as received.
+    pub fn route_path(&self) -> &str {
+        let p = self.path();
+        if let Some(rest) = p.strip_prefix("http://") {
+            if let Some(i) = rest.find('/') {
+                return &rest[i..];
+            }
+        }
+        p
+    }
+
     pub fn query(&self) -> &str {
         self.target.split_once('?').map(|(_, q)| q).unwrap_or("")
     }
