@@ -92,6 +92,28 @@ client:
   # Static fallback labels, same "k=v,k=v" form. Node-derived keys win.
   peerLabels: ""
 
+# Rust store-front (rust/store/STORE.md), a second container in the client
+# pod that owns the public port and serves bytes already on local disk with
+# sendfile; Go keeps every decision. Off by default. Measured: same
+# throughput as Go at the store NIC cap (~1.45 GB/s), about half the CPU;
+# 2.4x faster on small random blob ranges and warm peer serves. Worth it on
+# store nodes and nodes that serve many peers, not needed on a plain model
+# node. Image built by CI (images.yml) from rust/store.
+storeFront:
+  enabled: false
+  image:
+    repository: stargzrepo.azurecr.io/fusedata-store-front  # built by CI from rust/store (images.yml)
+    tag: latest
+  # Port the Go client moves to (pod-local) when store-front is on.
+  backendPort: 8091
+  maxInflight: 64
+  resources:
+    requests:
+      cpu: 500m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
+
 # node-init discovers the best local disk on every node (NVMe > SSD >
 # ephemeral > HDD by media class, free space, and a micro-benchmark),
 # prepares <mount>/<cacheSubdir> on it, and hands the path + byte budget to

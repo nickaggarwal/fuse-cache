@@ -202,7 +202,15 @@ spec:
             - "-coordinator"
             - "$(COORDINATOR_ADDR)"
             - "-port"
+            {{- if .Values.storeFront.enabled }}
+            # store-front owns the public port; Go listens pod-local and
+            # registers the public one with the coordinator.
+            - "{{ .Values.storeFront.backendPort }}"
+            - "-advertise-port"
             - "{{ .Values.client.httpPort }}"
+            {{- else }}
+            - "{{ .Values.client.httpPort }}"
+            {{- end }}
             - "-chunk-size"
             - "$(CHUNK_SIZE_MB)"
             - "-cloud-provider"
@@ -273,6 +281,7 @@ spec:
             - name: FUSE_PEER_READ_MBPS
               value: {{ .Values.config.peerReadMBps | quote }}
           ports:
+            {{- if not .Values.storeFront.enabled }}
             - containerPort: {{ .Values.client.httpPort }}
               name: http
               {{- if .Values.client.hostPort }}
@@ -281,6 +290,7 @@ spec:
               # backend" in the README.
               hostPort: {{ .Values.client.hostPort }}
               {{- end }}
+            {{- end }}
             - containerPort: {{ .Values.client.grpcPort }}
               name: grpc
           securityContext:
@@ -317,17 +327,66 @@ spec:
           livenessProbe:
             httpGet:
               path: /api/health
-              port: {{ .Values.client.httpPort }}
+              port: {{ if .Values.storeFront.enabled }}{{ .Values.storeFront.backendPort }}{{ else }}{{ .Values.client.httpPort }}{{ end }}
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /api/health
-              port: {{ .Values.client.httpPort }}
+              port: {{ if .Values.storeFront.enabled }}{{ .Values.storeFront.backendPort }}{{ else }}{{ .Values.client.httpPort }}{{ end }}
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
             {{- toYaml .Values.client.resources | nindent 12 }}
+        {{- if .Values.storeFront.enabled }}
+        # Rust store-front (rust/store/STORE.md): owns the public port and
+        # serves local, verified bytes (peer reads, OCI blob ranges, PUT
+        # staging) with sendfile; everything else, and every request that is
+        # not an exact local hit, goes to the Go client unchanged.
+        - name: front
+          image: "{{ .Values.storeFront.image.repository }}:{{ .Values.storeFront.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--listen=0.0.0.0:{{ .Values.client.httpPort }}"
+            - "--backend=127.0.0.1:{{ .Values.storeFront.backendPort }}"
+            {{- if .Values.nodeInit.enabled }}
+            - "--node-init-config={{ .Values.nodeInit.configPath }}"
+            - "--host-root={{ .Values.nodeInit.hostRootContainerPath }}"
+            {{- else }}
+            - "--cache-dir=$(NVME_CACHE_PATH)"
+            {{- end }}
+            - "--coordinator=$(COORDINATOR_ADDR)"
+            - "--max-inflight={{ .Values.storeFront.maxInflight }}"
+          envFrom:
+            - configMapRef:
+                name: fuse-config
+          ports:
+            - containerPort: {{ .Values.client.httpPort }}
+              name: http
+              {{- if .Values.client.hostPort }}
+              hostPort: {{ .Values.client.hostPort }}
+              {{- end }}
+          volumeMounts:
+            - name: nvme-storage
+              mountPath: /mnt/nvme
+              readOnly: true
+            {{- if .Values.nodeInit.enabled }}
+            - name: host-root
+              mountPath: {{ .Values.nodeInit.hostRootContainerPath }}
+              readOnly: true
+            - name: agent-socket
+              mountPath: /var/run/fuse-client
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet: {path: /rust/healthz, port: {{ .Values.client.httpPort }}}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /rust/readyz, port: {{ .Values.client.httpPort }}}
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.storeFront.resources | nindent 12 }}
+        {{- end }}
       volumes:
         - name: fuse-device
           hostPath:
