@@ -27,6 +27,10 @@ request.
 Removing store-front means deleting the front container and the client's
 `-port=8091 -advertise-port=8081` args; nothing in Go depends on it.
 
+The Helm chart wires it with one value: `storeFront.enabled: true` adds the
+front container to the client pod, moves Go to `storeFront.backendPort`
+(8091, pod-local) and registers the public port with `-advertise-port`.
+
 ## Working on it
 
 - Toolchain: pinned in `rust/store/rust-toolchain.toml` (rustup picks it
