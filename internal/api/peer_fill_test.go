@@ -253,3 +253,26 @@ func TestPeerFillSkipsLocalBlob(t *testing.T) {
 		t.Fatalf("fills started = %d on a node holding the blob", s.Started)
 	}
 }
+
+// Blob reads are profiled by the path that answered them.
+func TestBlobReadProfile(t *testing.T) {
+	SetFillUnitBytes(1 << 20)
+	defer SetFillUnitBytes(defaultFillUnit)
+	body, dg := patterned(4 << 20)
+	c := newPeerFillCache(OCIBlobPrefix+dg, body)
+	h, addr := peerFillHandler(t, c, nil)
+	rangeGet(t, addr, "reg.example", dg, 0, 99)
+	_, missDg := patterned(5 << 20)
+	rangeGet(t, addr, "reg.example", missDg, 0, 99)
+	if n := h.blobReads.paths[readFill].count.Load(); n != 1 {
+		t.Fatalf("fill reads = %d, want 1", n)
+	}
+	if n := h.blobReads.paths[readMiss].count.Load(); n != 1 {
+		t.Fatalf("miss reads = %d, want 1", n)
+	}
+	var buf bytes.Buffer
+	h.blobReads.write(&buf)
+	if !bytes.Contains(buf.Bytes(), []byte(`fuse_blob_read_seconds_count{path="fill"} 1`)) {
+		t.Fatalf("metrics missing fill count:\n%s", buf.String())
+	}
+}

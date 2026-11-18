@@ -82,6 +82,8 @@ type Handler struct {
 	// peerFill pulls a blob other nodes hold onto this node in parallel
 	// ranges (peer_fill.go).
 	peerFill peerFiller
+	// blobReads profiles blob proxy reads by serving path.
+	blobReads blobReadStats
 }
 
 // SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
@@ -1216,6 +1218,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_registry_fill_served_bytes_total %d\n", rf.ServedBytes)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_miss_total %d\n", rf.ServeMiss)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_wait_seconds_total %.3f\n", rf.ServeWaitSec)
+	h.blobReads.write(w)
 	pf := h.peerFillStats()
 	fmt.Fprintf(w, "fuse_peer_fill_started_total %d\n", pf.Started)
 	fmt.Fprintf(w, "fuse_peer_fill_completed_total %d\n", pf.Completed)
