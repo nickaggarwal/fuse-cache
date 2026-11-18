@@ -1697,6 +1697,12 @@ func (cm *DefaultCacheManager) CreateWriteFile(ctx context.Context, filePath str
 // chunked metadata, but chunk bytes are served from the whole local file when
 // requested and are persisted to cloud asynchronously.
 func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time) error {
+	return cm.putFromFile(ctx, filePath, stagedPath, size, lastAccessed, true)
+}
+
+// putFromFile is PutFromFile; persist=false skips the cloud upload (and its
+// durability journal) for a copy of a file another holder persists.
+func (cm *DefaultCacheManager) putFromFile(ctx context.Context, filePath string, stagedPath string, size int64, lastAccessed time.Time, persist bool) error {
 	if strings.TrimSpace(filePath) == "" {
 		return errors.New("empty file path")
 	}
@@ -1765,6 +1771,10 @@ func (cm *DefaultCacheManager) PutFromFile(ctx context.Context, filePath string,
 	cm.mu.Unlock()
 	cm.metrics.RecordWrite(size)
 
+	if !persist {
+		cm.goBackground(func() { cm.publishFileLocation(context.Background(), entry, TierNVMe) })
+		return nil
+	}
 	// Journalled before PutFromFile returns (and so before FUSE Flush acks),
 	// so a crash after the ack resumes the upload instead of forgetting it.
 	gen := cm.durability.begin(filePath, persistShape{

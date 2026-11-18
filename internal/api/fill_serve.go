@@ -52,6 +52,9 @@ const (
 	fillUnitAttempts    = 3
 	fillWaitTimeout     = 60 * time.Second
 	fillServeMaxPending = 64
+	// fillReadAheadUnits are fetched right after the units a waiting read
+	// needs (2 x 8 MiB).
+	fillReadAheadUnits = 2
 )
 
 // fillNodeParallel caps registry range GETs in flight on this node, across
@@ -88,6 +91,7 @@ type liveFill struct {
 	done     []bool // unit landed
 	failed   []bool // unit gave up
 	queued   []bool // unit is in the queue or being fetched
+	fetching []bool // unit is being fetched now
 	queue    []int64
 	finished bool  // every unit landed (or the fill stopped)
 	err      error // fill-level failure
@@ -96,7 +100,7 @@ type liveFill struct {
 func newLiveFill(digest string, size, unit int64, f *os.File, path string) *liveFill {
 	n := (size + unit - 1) / unit
 	lf := &liveFill{digest: digest, size: size, unit: unit, file: f, path: path,
-		done: make([]bool, n), failed: make([]bool, n), queued: make([]bool, n)}
+		done: make([]bool, n), failed: make([]bool, n), queued: make([]bool, n), fetching: make([]bool, n)}
 	lf.cond = sync.NewCond(&lf.mu)
 	for i := int64(0); i < n; i++ {
 		lf.queue = append(lf.queue, i)
@@ -114,7 +118,8 @@ func (lf *liveFill) next() int64 {
 	for len(lf.queue) > 0 {
 		u := lf.queue[0]
 		lf.queue = lf.queue[1:]
-		if !lf.done[u] && !lf.failed[u] {
+		if !lf.done[u] && !lf.failed[u] && !lf.fetching[u] {
+			lf.fetching[u] = true
 			return u
 		}
 	}
@@ -127,7 +132,9 @@ func (lf *liveFill) prioritize(a, b int64) {
 	defer lf.mu.Unlock()
 	var front []int64
 	for u := a; u <= b && u < lf.units(); u++ {
-		if !lf.done[u] && !lf.failed[u] {
+		// A unit already being fetched is not queued again: a second
+		// download of it would only race the first.
+		if !lf.done[u] && !lf.failed[u] && !lf.fetching[u] {
 			front = append(front, u)
 		}
 	}
@@ -149,6 +156,7 @@ func (lf *liveFill) prioritize(a, b int64) {
 
 func (lf *liveFill) markDone(u int64, ok bool) {
 	lf.mu.Lock()
+	lf.fetching[u] = false
 	if ok {
 		lf.done[u] = true
 	} else {
@@ -170,7 +178,9 @@ func (lf *liveFill) finish(err error) {
 // returns an error when one of them failed, the fill stopped, or ctx ends.
 func (lf *liveFill) waitRange(ctx context.Context, start, end int64) error {
 	a, b := start/lf.unit, end/lf.unit
-	lf.prioritize(a, b)
+	// The read's own units first, then the next few: nydusd reads a blob
+	// mostly forward, so its next request usually finds them landed.
+	lf.prioritize(a, b+fillReadAheadUnits)
 	stop := context.AfterFunc(ctx, func() {
 		lf.mu.Lock()
 		lf.cond.Broadcast()

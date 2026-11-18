@@ -124,6 +124,14 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 		h.writeWholeBlob(w, ctx, rp, entry, m[2][:12])
 		return
 	}
+	// A fill of this blob in progress on this node, or one this read starts
+	// from the holders (peer_fill.go), answers the read once its units land.
+	if lf := h.liveFills.get(m[2]); lf != nil && h.serveFromLiveFill(w, r, lf, r.Header.Get("Range")) {
+		return
+	}
+	if lf := h.maybeStartPeerFill(r, entry, m[2]); lf != nil && h.serveFromLiveFill(w, r, lf, r.Header.Get("Range")) {
+		return
+	}
 	start, end, err := parseByteRange(r.Header.Get("Range"), size)
 	if err != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
