@@ -35,8 +35,10 @@ type Store interface {
 	// Deleting rows that do not exist is not an error.
 	DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error
 	// DeletePeerTierLocation drops filePath's rows owned by peerID in one
-	// storage tier only (eviction retracts "nvme" and keeps "cloud").
-	DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error
+	// storage tier only (eviction retracts "nvme" and keeps "cloud"). A
+	// non-zero generation drops only rows at or below it, so a delayed
+	// retraction cannot remove a newer admission (holder_lease.go).
+	DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string, generation uint64) error
 
 	Snapshot(ctx context.Context) (State, error)
 	Restore(ctx context.Context, state State) error
@@ -172,6 +174,9 @@ func (s *InMemoryStore) PutFileLocation(_ context.Context, loc *FileLocation) er
 	locs := s.fileLocations[loc.FilePath]
 	for i, existing := range locs {
 		if existing.PeerID == loc.PeerID && existing.StorageTier == loc.StorageTier {
+			if staleAdmission(existing, loc) {
+				return nil
+			}
 			lc := *loc
 			locs[i] = &lc
 			s.fileLocations[loc.FilePath] = locs
@@ -183,7 +188,7 @@ func (s *InMemoryStore) PutFileLocation(_ context.Context, loc *FileLocation) er
 	return nil
 }
 
-func (s *InMemoryStore) DeletePeerTierLocation(_ context.Context, filePath, peerID, tier string) error {
+func (s *InMemoryStore) DeletePeerTierLocation(_ context.Context, filePath, peerID, tier string, generation uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	locs, ok := s.fileLocations[filePath]
@@ -192,7 +197,7 @@ func (s *InMemoryStore) DeletePeerTierLocation(_ context.Context, filePath, peer
 	}
 	kept := locs[:0]
 	for _, loc := range locs {
-		if loc.PeerID != peerID || loc.StorageTier != tier {
+		if !(loc.PeerID == peerID && loc.StorageTier == tier && retractCovers(loc, generation)) {
 			kept = append(kept, loc)
 		}
 	}

@@ -254,6 +254,11 @@ type CacheConfig struct {
 	// ScrubInterval re-checks local copies against their sidecar or chunk
 	// manifest (scrub.go). 0 = default (6h), < 0 disables.
 	ScrubInterval time.Duration
+	// HolderLeaseTTL is how long a published holder row counts without
+	// renewal; HolderRenewInterval spaces renewal passes (negative disables).
+	// Both apply only against a coordinator advertising "holder-lease".
+	HolderLeaseTTL      time.Duration
+	HolderRenewInterval time.Duration
 	// DownOutInterval is how long a holder may be missing from the live
 	// peer list before its copies stop counting toward the replica target
 	// (rebalance.go). 0 = default (10m).
@@ -478,6 +483,9 @@ type DefaultCacheManager struct {
 	// evictRetract queues evicted paths whose "nvme" location row this node
 	// still advertises (evict_retract.go).
 	evictRetract evictRetractor
+	// holders tracks generations and leases of published holder rows
+	// (holder_lease.go).
+	holders holderLeases
 	// persisted remembers durable local files across restarts
 	// (persisted_ledger.go); nil when the NVMe dir is unset.
 	persisted      *persistedLedger
@@ -775,6 +783,7 @@ func NewCacheManager(config *CacheConfig) (*DefaultCacheManager, error) {
 	// Retract this node's location rows for files eviction removed, so
 	// "holder" in coordinator metadata means "holds now".
 	cm.startEvictRetractor()
+	cm.startHolderRenewer()
 	cm.startScrubber()
 
 	// Background GC for hybridHints — prevents unbounded growth.
@@ -2744,6 +2753,7 @@ func (cm *DefaultCacheManager) publishFileLocation(ctx context.Context, entry *C
 	if entry.IsChunked {
 		location.ChunkSize = cm.effectiveChunkSize(entry)
 	}
+	cm.stampHolderRow(location)
 	if err := cm.config.Coordinator.UpdateFileLocation(ctx, location); err != nil {
 		cm.logger.Printf("Failed to publish metadata for %s: %v", entry.FilePath, err)
 	}

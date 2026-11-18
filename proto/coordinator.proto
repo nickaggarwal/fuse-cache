@@ -78,6 +78,16 @@ message FileLocation {
   // Stride the file was written with. 0 = unknown (pre-field metadata);
   // readers fall back to their configured chunk size.
   int64 chunk_size = 9;
+  // Holder lifecycle (holder_lease.go). generation orders one peer's
+  // admissions of this path: a retraction removes only rows at or below the
+  // generation it names, so a late eviction notice cannot remove a newer
+  // admission. 0 = unknown (older clients).
+  uint64 generation = 10;
+  // Lease: the row stops counting after expires_at unless renewed. Unset =
+  // no lease (older clients, cloud rows).
+  google.protobuf.Timestamp expires_at = 11;
+  // partial: the peer holds some chunks of the file, not all of it.
+  bool partial = 12;
 }
 
 message RegisterPeerRequest {
@@ -128,6 +138,8 @@ message DeleteFileLocationRequest {
   // rows in this tier ("nvme"): an evicted local copy must not take the
   // peer's cloud-durability row with it.
   string storage_tier = 4;
+  // generation, when set, retracts only rows at or below it.
+  uint64 generation = 5;
 }
 
 message DeleteFileLocationResponse {}

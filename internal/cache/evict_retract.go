@@ -90,6 +90,16 @@ func (cm *DefaultCacheManager) queueEvictRetraction(filePath string) {
 	if parent, isChunk := parentFilePathFromChunkPath(filePath); isChunk {
 		filePath = parent
 	}
+	if cm.holders.enabled.Load() {
+		// One chunk going does not end the admission while others remain;
+		// the renewal pass republishes it as partial.
+		if cm.holdsLocally(filePath) {
+			return
+		}
+		gen := cm.holders.evicted(filePath)
+		cm.goBackground(func() { cm.retractHolder(cm.shutdownCtx, filePath, gen) })
+		return
+	}
 	if !cm.evictRetract.add(filePath) {
 		cm.metrics.EvictRetractDropped.Add(1)
 	}
@@ -98,16 +108,19 @@ func (cm *DefaultCacheManager) queueEvictRetraction(filePath string) {
 // SetCoordinatorCapabilities records the features the coordinator advertises
 // in GET /api/health; the client calls it on every coordinator instance.
 func (cm *DefaultCacheManager) SetCoordinatorCapabilities(caps []string) {
-	has, reports := false, false
+	has, reports, leases := false, false, false
 	for _, c := range caps {
 		switch c {
 		case "tier-retract":
 			has = true
 		case "failure-report":
 			reports = true
+		case "holder-lease":
+			leases = true
 		}
 	}
 	cm.evictRetract.enabled.Store(has)
+	cm.holders.enabled.Store(leases)
 	if ps, ok := cm.peerStorage.(*PeerStorage); ok {
 		ps.EnableFailureReports(reports)
 	}

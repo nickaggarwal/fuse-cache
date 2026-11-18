@@ -98,6 +98,14 @@ type FileLocation struct {
 	// (metadata published before this field existed); readers then fall back
 	// to their own configured chunk size.
 	ChunkSize int64 `json:"chunk_size,omitempty"`
+	// Generation orders one peer's admissions of this path
+	// (holder_lease.go); 0 = unknown (older clients).
+	Generation uint64 `json:"generation,omitempty"`
+	// ExpiresAt is the holder lease: past it the row no longer counts as a
+	// holder unless renewed. Zero = no lease (older clients, cloud rows).
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// Partial: the peer holds some chunks of the file, not all of it.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // Ensure CoordinatorService implements the Coordinator interface
@@ -108,6 +116,8 @@ var _ Coordinator = (*CoordinatorService)(nil)
 type CoordinatorService struct {
 	store  Store
 	logger *log.Logger
+	// leases counts the expired-holder sweep (holder_lease.go).
+	leases leaseSweeper
 	// global, when set, mirrors a subset of this cluster's location table
 	// into a global control plane. Held as a narrow interface rather than
 	// a *globalsync.Agent so the coordinator keeps no dependency on the
@@ -287,12 +297,29 @@ func (cs *CoordinatorService) UpdatePeerStatusWithNetwork(ctx context.Context, p
 
 // GetFileLocation returns the locations of a file
 func (cs *CoordinatorService) GetFileLocation(ctx context.Context, filePath string) ([]*FileLocation, error) {
-	return cs.store.GetFileLocations(ctx, filePath)
+	locs, err := cs.store.GetFileLocations(ctx, filePath)
+	if err != nil {
+		return nil, err
+	}
+	return liveLocations(locs, time.Now()), nil
 }
 
 // ListFileLocations returns one metadata location per file path, filtered by prefix.
 func (cs *CoordinatorService) ListFileLocations(ctx context.Context, prefix string) ([]*FileLocation, error) {
-	return cs.store.ListFileLocations(ctx, prefix)
+	m, err := cs.store.RangeFileLocations(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]*FileLocation, 0, len(m))
+	for _, locs := range m {
+		live := liveLocations(locs, now)
+		if len(live) == 0 {
+			continue
+		}
+		out = append(out, representativeLocation(live))
+	}
+	return out, nil
 }
 
 // RangeFileLocations returns every replica row grouped by path, filtered by a
@@ -300,7 +327,11 @@ func (cs *CoordinatorService) ListFileLocations(ctx context.Context, prefix stri
 // needs to know whether ANY row for a path is cloud-tier -- ListFileLocations
 // returns only the first row per path, which may be an NVMe replica.
 func (cs *CoordinatorService) RangeFileLocations(ctx context.Context, prefix string) (map[string][]*FileLocation, error) {
-	return cs.store.RangeFileLocations(ctx, prefix)
+	m, err := cs.store.RangeFileLocations(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	return liveLocationMap(m, time.Now()), nil
 }
 
 // UpdateFileLocation updates the location of a file
@@ -327,7 +358,7 @@ func (cs *CoordinatorService) UpdateFileLocation(ctx context.Context, location *
 // when a node evicts its local copy: other holders, and this peer's cloud
 // row, are untouched.
 func (cs *CoordinatorService) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
-	return cs.store.DeletePeerTierLocation(ctx, filePath, peerID, tier)
+	return cs.store.DeletePeerTierLocation(ctx, filePath, peerID, tier, 0)
 }
 
 func (cs *CoordinatorService) DeleteFileLocation(ctx context.Context, filePath, peerID string, wholePath bool) error {
@@ -438,7 +469,7 @@ func (cs *CoordinatorService) GetWorldView(ctx context.Context, prefix string) (
 		}
 	}
 
-	fileMap, err := cs.store.RangeFileLocations(ctx, prefix)
+	fileMap, err := cs.RangeFileLocations(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -532,7 +563,7 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 	}
 	sort.Strings(activeIDs)
 
-	locCopies, err := cs.store.GetFileLocations(callCtx, filePath)
+	locCopies, err := cs.GetFileLocation(callCtx, filePath)
 	if err != nil {
 		return nil, fmt.Errorf("get file locations: %w", err)
 	}
@@ -625,6 +656,7 @@ func (cs *CoordinatorService) SeedPathToPeers(ctx context.Context, req SeedCache
 // distributed stores (etcd) those are no-ops: etcd is the source of truth and
 // loading a stale local JSON would clobber live cluster state.
 func (cs *CoordinatorService) Start(ctx context.Context) {
+	go cs.runLeaseSweeper(ctx, 30*time.Second)
 	if _, inMemory := cs.store.(*InMemoryStore); !inMemory {
 		cs.logger.Printf("Coordinator service started (distributed store; skipping disk persistence)")
 		return

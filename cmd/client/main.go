@@ -107,6 +107,8 @@ func main() {
 		registryFill          = flag.Bool("registry-fill", true, "On the first miss of an OCI blob nydusd asks for, download the whole blob from the registry it named (with nydusd's own token), verify it against its digest and keep it, so later reads and other nodes are served from the cluster instead of the registry")
 		registryFillUnitMB    = flag.Int("registry-fill-unit-mb", 8, "Fetch unit in MiB for registry fills: a read waiting on a fill in progress needs only its units, so smaller units answer sooner; independent of -chunk-size")
 		registryFillParallel  = flag.Int("registry-fill-parallel", 16, "Registry range requests in flight on this node across all fills and image pre-warms (measured: 1 stream 80 MB/s, 16 streams 237 MB/s from ACR, flat beyond)")
+		holderLeaseSec        = flag.Int("holder-lease-sec", 900, "Holder lease: a published local-copy row stops counting this long after its last renewal (needs a coordinator advertising holder-lease)")
+		holderRenewSec        = flag.Int("holder-renew-sec", 300, "Renew held rows and retract stale ones every this many seconds (jittered); negative disables")
 		peerFill              = flag.Bool("peer-fill", true, "On the first read of an OCI blob other nodes hold and this node does not, pull the whole blob from them in parallel ranges (read-ahead, units from the registry if a holder is slow), verify it and keep it, instead of one peer round trip per nydusd read")
 		registryFillHosts     = flag.String("registry-fill-hosts", "", "Comma-separated registry hosts fetch-on-miss may download from (exact match); empty allows any host nydusd names")
 		scrubHours            = flag.Int("scrub-hours", 6, "Re-check local copies against their .sha256 sidecar or chunk manifest every N hours (each copy at most weekly; bad ones are moved aside and refetched); 0 disables")
@@ -294,6 +296,8 @@ func main() {
 		PeerRawTransport:           *peerRawTransport,
 		APIKey:                     *apiKey,
 		PeerServeMaxInflight:       *peerServeMaxIn,
+		HolderLeaseTTL:             time.Duration(*holderLeaseSec) * time.Second,
+		HolderRenewInterval:        time.Duration(*holderRenewSec) * time.Second,
 		PeerReplicationStagger:     time.Duration(*peerReplStaggerMS) * time.Millisecond,
 		FetchLeaseEnabled:          *fetchLeaseEnabled,
 		VerifyRemoteChunks:         *verifyRemoteChunks,

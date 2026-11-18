@@ -1086,6 +1086,17 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_evict_retract_failed_total %d\n", cmx.EvictRetractFailed.Load())
 	fmt.Fprintf(w, "fuse_evict_retract_skipped_relanded_total %d\n", cmx.EvictRetractSkippedRelanded.Load())
 	fmt.Fprintf(w, "fuse_evict_retract_dropped_total %d\n", cmx.EvictRetractDropped.Load())
+	hl := dcm.HolderLeaseStats()
+	hle := 0
+	if hl.Enabled {
+		hle = 1
+	}
+	fmt.Fprintf(w, "fuse_holder_lease_enabled %d\n", hle)
+	fmt.Fprintf(w, "fuse_holder_rows_published %d\n", hl.Published)
+	fmt.Fprintf(w, "fuse_holder_renewed_total %d\n", hl.Renewed)
+	fmt.Fprintf(w, "fuse_holder_renew_passes_total %d\n", hl.RenewPasses)
+	fmt.Fprintf(w, "fuse_holder_retract_retries_total %d\n", hl.RetractRetried)
+	fmt.Fprintf(w, "fuse_holder_reconcile_retracted_total %d\n", hl.ReconcileRetracted)
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
