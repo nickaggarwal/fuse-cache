@@ -2,6 +2,8 @@ package cache
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +63,7 @@ type holderLeases struct {
 	enabled atomic.Bool       // coordinator advertises "holder-lease"
 
 	renewed, retractRetried, reconcileRetracted, renewPasses atomic.Int64
+	vanished                                                 atomic.Int64 // index entries whose file was gone
 }
 
 // admit returns the generation of path's current admission, starting a new
@@ -281,6 +284,11 @@ func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 
 // localHolderPaths returns parent paths this node holds on local NVMe, whole
 // or as chunks, with an entry describing the file.
+//
+// The in-memory index is checked against the disk: an entry whose file is
+// gone (deleted outside this process, a disk wiped or replaced under a
+// running client) is dropped from the index, so its row is retracted below
+// instead of being renewed for a copy that no longer exists.
 func (cm *DefaultCacheManager) localHolderPaths() map[string]*CacheEntry {
 	cm.mu.RLock()
 	snap := cm.entries.snapshot()
@@ -288,6 +296,10 @@ func (cm *DefaultCacheManager) localHolderPaths() map[string]*CacheEntry {
 	out := map[string]*CacheEntry{}
 	for _, e := range snap {
 		if e == nil || e.Tier != TierNVMe {
+			continue
+		}
+		if !cm.onDisk(e.FilePath) {
+			cm.forgetVanished(e.FilePath)
 			continue
 		}
 		if p, ok := parentFilePathFromChunkPath(e.FilePath); ok {
@@ -310,6 +322,23 @@ func (cm *DefaultCacheManager) localHolderPaths() map[string]*CacheEntry {
 	return out
 }
 
+// onDisk reports whether path's local file exists (size checked by readers).
+func (cm *DefaultCacheManager) onDisk(path string) bool {
+	_, err := os.Stat(filepath.Join(cm.config.NVMePath, strings.TrimPrefix(path, "/")))
+	return err == nil
+}
+
+// forgetVanished drops an index entry whose file is gone from disk.
+func (cm *DefaultCacheManager) forgetVanished(path string) {
+	cm.mu.Lock()
+	if e, ok := cm.entries.get(path); ok && e != nil && e.Tier == TierNVMe && !cm.onDisk(path) {
+		cm.entries.del(path)
+		cm.unaccountNVMeLocked(path)
+		cm.holders.vanished.Add(1)
+	}
+	cm.mu.Unlock()
+}
+
 func (cm *DefaultCacheManager) holdsAnyChunk(path string) bool {
 	cm.mu.RLock()
 	keys := cm.entries.chunkKeys(path)
@@ -327,6 +356,7 @@ type HolderLeaseStats struct {
 	Enabled                                                  bool
 	Published                                                int
 	Renewed, RetractRetried, ReconcileRetracted, RenewPasses int64
+	Vanished                                                 int64
 }
 
 // HolderLeaseStats returns renewal counters.
@@ -338,5 +368,6 @@ func (cm *DefaultCacheManager) HolderLeaseStats() HolderLeaseStats {
 		Enabled: cm.holders.enabled.Load(), Published: n,
 		Renewed: cm.holders.renewed.Load(), RetractRetried: cm.holders.retractRetried.Load(),
 		ReconcileRetracted: cm.holders.reconcileRetracted.Load(), RenewPasses: cm.holders.renewPasses.Load(),
+		Vanished: cm.holders.vanished.Load(),
 	}
 }

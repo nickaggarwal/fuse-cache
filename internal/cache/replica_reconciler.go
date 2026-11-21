@@ -159,7 +159,17 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 			continue
 		}
 
+		// Cluster-wide cap (replication_slots.go): when many holders vanish
+		// at once (a partition, a zone, mass lease expiry), every node finds
+		// deficits in the same pass; without a shared cap the fleet copies
+		// all of them at once.
+		release, ok := cm.acquireReplicationSlot(ctx)
+		if !ok {
+			cm.herdStats.reconcileSkippedSlots.Add(1)
+			return
+		}
 		written, err := ps.ReplicateTo(ctx, cand.path, entry.Data, holders, deficit)
+		release()
 		if written > 0 {
 			_ = cm.sched.charge(ctx, ioReplicate, int64(written)*int64(len(entry.Data)))
 		}

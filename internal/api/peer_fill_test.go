@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 
 	"sync"
 	"sync/atomic"
@@ -105,6 +106,9 @@ func patterned(n int) ([]byte, string) {
 
 func peerFillHandler(t *testing.T, c *peerFillCache, fr *fakeRegistry) (*Handler, string) {
 	t.Helper()
+	prevQuiet := peerFillQuietNanos.Load()
+	peerFillQuietNanos.Store(int64(300 * time.Millisecond))
+	t.Cleanup(func() { peerFillQuietNanos.Store(prevQuiet) })
 	h := NewHandler(c, nil, "p", "")
 	if fr != nil {
 		h.EnableRegistryFill(RegistryFillConfig{Enabled: true, HTTPClient: fr.srv.Client()})
@@ -157,13 +161,13 @@ func TestPeerFillServesAndCommits(t *testing.T) {
 	if !c.verified[OCIBlobPrefix+dg] {
 		t.Fatal("peer-filled blob not marked verified")
 	}
-	if n := c.peerReads.Load(); n != 24 { // no unit fetched twice
+	if n := c.peerReads.Load(); n != 24 { // demand + background, no unit fetched twice
 		t.Fatalf("peer range reads = %d, want 24 (one per unit)", n)
 	}
 	if m := c.maxInfl.Load(); m < 4 {
 		t.Fatalf("max parallel peer reads = %d, want parallel ranges", m)
 	}
-	if s := h.peerFillStats(); s.Completed != 1 || s.UnitsPeer != 24 || s.UnitsHedged != 0 {
+	if s := h.peerFillStats(); s.Completed != 1 || s.UnitsPeer != 24 || s.UnitsHedged != 0 || s.UnitsDemand == 0 || s.UnitsBackground == 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 }
@@ -274,5 +278,59 @@ func TestBlobReadProfile(t *testing.T) {
 	h.blobReads.write(&buf)
 	if !bytes.Contains(buf.Bytes(), []byte(`fuse_blob_read_seconds_count{path="fill"} 1`)) {
 		t.Fatalf("metrics missing fill count:\n%s", buf.String())
+	}
+}
+
+// A demand fill fetches only what reads ask for (plus read-ahead) while
+// reads keep coming, and the rest only after reads go quiet.
+func TestPeerFillDemandThenBackground(t *testing.T) {
+	SetFillUnitBytes(1 << 20)
+	defer SetFillUnitBytes(defaultFillUnit)
+	body, dg := patterned(40 << 20) // 40 units
+	c := newPeerFillCache(OCIBlobPrefix+dg, body)
+	h, addr := peerFillHandler(t, c, nil)
+
+	code, got := rangeGet(t, addr, "reg.example", dg, 0, 4095)
+	if code != http.StatusPartialContent || !bytes.Equal(got, body[:4096]) {
+		t.Fatalf("status %d", code)
+	}
+	time.Sleep(150 * time.Millisecond) // inside the (test) quiet period
+	if n := c.peerReads.Load(); n > 1+peerFillReadAhead {
+		t.Fatalf("peer reads during demand phase = %d, want <= %d (read + read-ahead)", n, 1+peerFillReadAhead)
+	}
+	if c.has(OCIBlobPrefix + dg) {
+		t.Fatal("whole blob committed before reads went quiet")
+	}
+	if s := h.peerFillStats(); s.UnitsBackground != 0 {
+		t.Fatalf("background units %d before quiet", s.UnitsBackground)
+	}
+}
+
+// The quiet switch: with no reads, the remaining units are queued and the
+// blob completes and commits.
+func TestLiveFillEnqueueRemaining(t *testing.T) {
+	f, _ := os.CreateTemp("", "lf-*")
+	defer os.Remove(f.Name())
+	lf := newDemandFill("d", 10<<20, 1<<20, f, f.Name(), 2)
+	if u := lf.next(); u != -1 {
+		t.Fatalf("demand fill queued %d with no reads", u)
+	}
+	lf.prioritize(3, 3+lf.readAhead)
+	var got []int64
+	for u := lf.next(); u >= 0; u = lf.next() {
+		got = append(got, u)
+		lf.markDone(u, true)
+	}
+	if len(got) != 3 || got[0] != 3 {
+		t.Fatalf("demand units = %v, want [3 4 5]", got)
+	}
+	lf.enqueueRemaining()
+	n := 0
+	for u := lf.next(); u >= 0; u = lf.next() {
+		n++
+		lf.markDone(u, true)
+	}
+	if n != 7 || !lf.complete() {
+		t.Fatalf("background fetched %d, complete=%v; want 7 and complete", n, lf.complete())
 	}
 }

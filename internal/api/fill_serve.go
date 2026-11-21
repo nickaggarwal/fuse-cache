@@ -95,11 +95,18 @@ type liveFill struct {
 	queue    []int64
 	finished bool  // every unit landed (or the fill stopped)
 	err      error // fill-level failure
+
+	// Demand mode (peer fill): the queue starts empty and holds only units
+	// a waiting read asked for plus readAhead after them; lastDemand is when
+	// a read last asked. The rest is queued by enqueueRemaining once reads
+	// go quiet.
+	readAhead  int64
+	lastDemand time.Time
 }
 
 func newLiveFill(digest string, size, unit int64, f *os.File, path string) *liveFill {
 	n := (size + unit - 1) / unit
-	lf := &liveFill{digest: digest, size: size, unit: unit, file: f, path: path,
+	lf := &liveFill{digest: digest, size: size, unit: unit, file: f, path: path, readAhead: fillReadAheadUnits,
 		done: make([]bool, n), failed: make([]bool, n), queued: make([]bool, n), fetching: make([]bool, n)}
 	lf.cond = sync.NewCond(&lf.mu)
 	for i := int64(0); i < n; i++ {
@@ -107,6 +114,63 @@ func newLiveFill(digest string, size, unit int64, f *os.File, path string) *live
 		lf.queued[i] = true
 	}
 	return lf
+}
+
+// newDemandFill is a liveFill that fetches only what reads ask for (plus
+// readAhead units after each read) until enqueueRemaining is called.
+func newDemandFill(digest string, size, unit int64, f *os.File, path string, readAhead int64) *liveFill {
+	n := (size + unit - 1) / unit
+	lf := &liveFill{digest: digest, size: size, unit: unit, file: f, path: path, readAhead: readAhead,
+		done: make([]bool, n), failed: make([]bool, n), queued: make([]bool, n), fetching: make([]bool, n),
+		lastDemand: time.Now()}
+	lf.cond = sync.NewCond(&lf.mu)
+	return lf
+}
+
+// enqueueRemaining queues every unit not landed, failed or queued.
+func (lf *liveFill) enqueueRemaining() {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	in := map[int64]bool{}
+	for _, u := range lf.queue {
+		in[u] = true
+	}
+	for u := int64(0); u < lf.units(); u++ {
+		if !lf.done[u] && !lf.failed[u] && !lf.fetching[u] && !in[u] {
+			lf.queue = append(lf.queue, u)
+		}
+	}
+}
+
+// complete reports whether every unit has landed.
+func (lf *liveFill) complete() bool {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	for _, d := range lf.done {
+		if !d {
+			return false
+		}
+	}
+	return true
+}
+
+// idleFor reports how long since a read last asked this fill for a unit.
+func (lf *liveFill) idleFor() time.Duration {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	return time.Since(lf.lastDemand)
+}
+
+// anyFailed reports whether some unit gave up.
+func (lf *liveFill) anyFailed() bool {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	for _, f := range lf.failed {
+		if f {
+			return true
+		}
+	}
+	return false
 }
 
 func (lf *liveFill) units() int64 { return int64(len(lf.done)) }
@@ -180,7 +244,11 @@ func (lf *liveFill) waitRange(ctx context.Context, start, end int64) error {
 	a, b := start/lf.unit, end/lf.unit
 	// The read's own units first, then the next few: nydusd reads a blob
 	// mostly forward, so its next request usually finds them landed.
-	lf.prioritize(a, b+fillReadAheadUnits)
+	lf.mu.Lock()
+	lf.lastDemand = time.Now()
+	ra := lf.readAhead
+	lf.mu.Unlock()
+	lf.prioritize(a, b+ra)
 	stop := context.AfterFunc(ctx, func() {
 		lf.mu.Lock()
 		lf.cond.Broadcast()

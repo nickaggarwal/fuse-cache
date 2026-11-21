@@ -355,6 +355,9 @@ type CacheConfig struct {
 	// ReplicaReconcileMaxPerRun caps replication operations per reconciler
 	// pass so reconciliation itself cannot stampede. <=0 uses a default.
 	ReplicaReconcileMaxPerRun int
+	// ReplicationSlots caps replications in flight cluster-wide (coordinator
+	// fetch leases, replication_slots.go). 0 = default 16; negative disables.
+	ReplicationSlots int
 
 	// ReplicaReconcileMaxTarget caps the heat-boosted per-file replica target
 	// (see reader_heat.go). <=0 uses a default of 8.
@@ -486,6 +489,9 @@ type DefaultCacheManager struct {
 	// holders tracks generations and leases of published holder rows
 	// (holder_lease.go).
 	holders holderLeases
+	// slotsHeld are the cluster-wide replication slots this node holds
+	// (replication_slots.go).
+	slotsHeld heldSlots
 	// persisted remembers durable local files across restarts
 	// (persisted_ledger.go); nil when the NVMe dir is unset.
 	persisted      *persistedLedger

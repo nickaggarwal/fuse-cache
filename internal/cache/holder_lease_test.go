@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -199,5 +201,33 @@ func TestRenewHoldersReconciles(t *testing.T) {
 	}
 	if coord.row("/m/lost.bin") != nil {
 		t.Fatal("stale row for lost.bin not retracted")
+	}
+}
+
+// A file deleted from disk behind the client's back is dropped from the
+// index on the next renewal and its row retracted, not renewed.
+func TestRenewHoldersDropsVanishedFile(t *testing.T) {
+	cm, coord := leaseTestManager(t)
+	ctx := context.Background()
+	seedNVMe(t, cm, "/m/gone.bin", 100, true, time.Minute)
+	cm.publishFileLocation(ctx, &CacheEntry{FilePath: "/m/gone.bin", Size: 100}, TierNVMe)
+	if err := os.Remove(filepath.Join(cm.config.NVMePath, "m/gone.bin")); err != nil {
+		t.Fatal(err)
+	}
+	renewed, retracted := cm.RenewHolders(ctx)
+	if renewed != 0 || retracted != 1 {
+		t.Fatalf("renewed %d retracted %d, want 0 and 1", renewed, retracted)
+	}
+	if coord.row("/m/gone.bin") != nil {
+		t.Fatal("row for a vanished file still published")
+	}
+	if cm.holders.vanished.Load() != 1 {
+		t.Fatalf("vanished = %d", cm.holders.vanished.Load())
+	}
+	cm.mu.RLock()
+	_, still := cm.entries.get("/m/gone.bin")
+	cm.mu.RUnlock()
+	if still {
+		t.Fatal("vanished entry kept in the index")
 	}
 }
