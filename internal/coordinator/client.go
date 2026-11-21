@@ -233,6 +233,32 @@ type TierLocationDeleter interface {
 	DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error
 }
 
+// GenLocationDeleter retracts one peer's rows in one tier at or below a
+// generation (holder_lease.go), so a delayed retraction cannot remove a newer
+// admission. Use only against a coordinator advertising "holder-lease".
+type GenLocationDeleter interface {
+	DeletePeerTierLocationGen(ctx context.Context, filePath, peerID, tier string, generation uint64) error
+}
+
+func (cc *CoordinatorClient) DeletePeerTierLocationGen(ctx context.Context, filePath, peerID, tier string, generation uint64) error {
+	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s&storage_tier=%s&generation=%d", cc.addr,
+		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID), neturl.QueryEscape(tier), generation)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := cc.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete tier location failed: %s", string(b))
+	}
+	return nil
+}
+
 func (cc *CoordinatorClient) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
 	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s&storage_tier=%s", cc.addr,
 		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID), neturl.QueryEscape(tier))

@@ -140,7 +140,7 @@ func TestStoreDeletePeerTierLocation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.DeletePeerTierLocation(ctx, "/f", "peer-a", "nvme"); err != nil {
+	if err := s.DeletePeerTierLocation(ctx, "/f", "peer-a", "nvme", 0); err != nil {
 		t.Fatal(err)
 	}
 	locs, err := s.GetFileLocations(ctx, "/f")

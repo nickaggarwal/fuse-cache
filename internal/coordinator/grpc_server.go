@@ -70,7 +70,7 @@ func (s *GRPCServer) UpdateFileLocation(ctx context.Context, req *pb.UpdateFileL
 
 func (s *GRPCServer) DeleteFileLocation(ctx context.Context, req *pb.DeleteFileLocationRequest) (*pb.DeleteFileLocationResponse, error) {
 	if req.StorageTier != "" && !req.WholePath {
-		if err := s.service.DeletePeerTierLocation(ctx, req.FilePath, req.PeerId, req.StorageTier); err != nil {
+		if err := s.service.DeletePeerTierLocationGen(ctx, req.FilePath, req.PeerId, req.StorageTier, req.Generation); err != nil {
 			return nil, err
 		}
 		return &pb.DeleteFileLocationResponse{}, nil
@@ -152,6 +152,9 @@ func fileLocationToProto(fl *FileLocation) *pb.FileLocation {
 		IsChunked:    fl.IsChunked,
 		Chunks:       chunks,
 		ChunkSize:    fl.ChunkSize,
+		Generation:   fl.Generation,
+		ExpiresAt:    expiresToProto(fl.ExpiresAt),
+		Partial:      fl.Partial,
 	}
 }
 
@@ -178,7 +181,24 @@ func fileLocationFromProto(fl *pb.FileLocation) *FileLocation {
 		IsChunked:    fl.IsChunked,
 		Chunks:       chunks,
 		ChunkSize:    fl.ChunkSize,
+		Generation:   fl.Generation,
+		ExpiresAt:    expiresFromProto(fl.ExpiresAt),
+		Partial:      fl.Partial,
 	}
+}
+
+func expiresToProto(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(t)
+}
+
+func expiresFromProto(t *timestamppb.Timestamp) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return t.AsTime()
 }
 
 func toInt64(v interface{}) int64 {

@@ -169,6 +169,7 @@ func (cm *DefaultCacheManager) advertiseHolder(ctx context.Context, filePath str
 		// must address chunks the same way the rest of the swarm does.
 		location.ChunkSize = cm.effectiveChunkSize(parentEntry)
 	}
+	cm.stampHolderRow(location)
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := cm.config.Coordinator.UpdateFileLocation(callCtx, location); err != nil {

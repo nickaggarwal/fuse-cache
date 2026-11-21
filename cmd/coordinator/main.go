@@ -713,7 +713,8 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			}
 
 			if tier := r.URL.Query().Get("storage_tier"); tier != "" && !wholePath {
-				if err := coordinatorService.DeletePeerTierLocation(r.Context(), filePath, peerID, tier); err != nil {
+				gen, _ := strconv.ParseUint(r.URL.Query().Get("generation"), 10, 64)
+				if err := coordinatorService.DeletePeerTierLocationGen(r.Context(), filePath, peerID, tier, gen); err != nil {
 					http.Error(w, "Failed to delete file location", http.StatusInternalServerError)
 					return
 				}
@@ -990,6 +991,10 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 	})
 
 	// Health check endpoint
+	// Holder-lease sweep counters (holder_lease.go).
+	mux.HandleFunc("/api/leases", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, coordinatorService.LeaseStats())
+	})
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		health := map[string]interface{}{
 			"status":    "healthy",
@@ -1006,7 +1011,10 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			// storage_tier; an older coordinator would treat the request as
 			// a per-peer delete and drop the cloud row too.
 			// "failure-report": POST /api/peers/report-failure exists.
-			"capabilities": []string{"tier-retract", "failure-report"},
+			// "holder-lease": location rows keep generation/expires_at/
+			// partial, retractions honour generation, expired rows are
+			// hidden (holder_lease.go); clients renew and reconcile.
+			"capabilities": []string{"tier-retract", "failure-report", "holder-lease"},
 			// Active cluster flags (e.g. "norebalance" during a rollout).
 			"flags": coordinatorService.Flags(r.Context()),
 		}

@@ -238,6 +238,9 @@ func (s *EtcdStore) PutFileLocation(ctx context.Context, loc *FileLocation) erro
 		replaced := false
 		for i, existing := range locs {
 			if existing.PeerID == loc.PeerID && existing.StorageTier == loc.StorageTier {
+				if staleAdmission(existing, loc) {
+					return nil
+				}
 				lc := *loc
 				locs[i] = &lc
 				replaced = true
@@ -315,9 +318,9 @@ func (s *EtcdStore) DeleteFileLocation(ctx context.Context, filePath, peerID str
 // DeletePeerTierLocation drops filePath's rows owned by peerID in one storage
 // tier, keeping its rows in other tiers (an evicted NVMe copy must not
 // retract the same peer's cloud-durability row).
-func (s *EtcdStore) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string) error {
+func (s *EtcdStore) DeletePeerTierLocation(ctx context.Context, filePath, peerID, tier string, generation uint64) error {
 	return s.dropLocations(ctx, s.fileKey(filePath), func(loc *FileLocation) bool {
-		return loc.PeerID == peerID && loc.StorageTier == tier
+		return loc.PeerID == peerID && loc.StorageTier == tier && retractCovers(loc, generation)
 	})
 }
 

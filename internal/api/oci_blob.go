@@ -65,10 +65,26 @@ func (h *Handler) handleRegistryBlob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing int) {
+	if r.Method != http.MethodGet {
+		h.serveOCIBlobPath(w, r, missing)
+		return
+	}
+	rec := &statusRecorder{ResponseWriter: w}
+	t0 := time.Now()
+	p := h.serveOCIBlobPath(rec, r, missing)
+	if rec.status >= 400 || rec.status == 0 {
+		p = readMiss
+	}
+	h.blobReads.record(p, time.Since(t0), rec.n)
+}
+
+// serveOCIBlobPath serves one blob request and reports the path that
+// answered it.
+func (h *Handler) serveOCIBlobPath(w http.ResponseWriter, r *http.Request, missing int) blobReadPath {
 	m := ociDigestHex.FindStringSubmatch(mux.Vars(r)["digest"])
 	if m == nil {
 		http.Error(w, "blob id must be a sha256 hex digest", http.StatusBadRequest)
-		return
+		return readMiss
 	}
 	filePath := OCIBlobPrefix + m[2]
 	ctx := r.Context()
@@ -94,13 +110,13 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 			}
 		}
 		if served {
-			return
+			return readFill
 		}
 		// A small blob can finish filling (and leave liveFills) between the
 		// start and the lookup above: it is committed now, so look again.
 		if entry, ok = h.ociBlobEntry(ctx, filePath); !ok {
 			http.Error(w, "blob not found", missing)
-			return
+			return readMiss
 		}
 	}
 	size := entry.Size
@@ -110,7 +126,7 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
-		return
+		return readLocal
 	}
 
 	if r.Header.Get("Range") == "" {
@@ -119,66 +135,79 @@ func (h *Handler) serveOCIBlob(w http.ResponseWriter, r *http.Request, missing i
 		rp, ok := h.cacheManager.(rangePlanner)
 		if !ok {
 			http.Error(w, "whole-blob reads not supported", http.StatusNotImplemented)
-			return
+			return readMiss
 		}
 		h.writeWholeBlob(w, ctx, rp, entry, m[2][:12])
-		return
+		return readRemote
+	}
+	// A fill of this blob in progress on this node, or one this read starts
+	// from the holders (peer_fill.go), answers the read once its units land.
+	if lf := h.liveFills.get(m[2]); lf != nil && h.serveFromLiveFill(w, r, lf, r.Header.Get("Range")) {
+		return readFill
+	}
+	if lf := h.maybeStartPeerFill(r, entry, m[2]); lf != nil && h.serveFromLiveFill(w, r, lf, r.Header.Get("Range")) {
+		return readFill
 	}
 	start, end, err := parseByteRange(r.Header.Get("Range"), size)
 	if err != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
 		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-		return
+		return readMiss
 	}
 	if end-start+1 > ociBlobMaxRange {
 		end = start + ociBlobMaxRange - 1 // Content-Range tells the client
 	}
 
 	if rp, ok := h.cacheManager.(rangePlanner); ok {
-		h.writePlannedRange(w, r.Context(), rp, entry, start, end, m[2][:12])
-		return
+		return h.writePlannedRange(w, r.Context(), rp, entry, start, end, m[2][:12])
 	}
 	rr, ok := h.cacheManager.(rangeReader)
 	if !ok {
 		http.Error(w, "range reads not supported", http.StatusNotImplemented)
-		return
+		return readMiss
 	}
 	data, err := rr.ReadRange(ctx, filePath, start, int(end-start+1))
 	if err != nil {
 		h.logger.Printf("oci blob %s range %d-%d: %v", m[2][:12], start, end, err)
 		http.Error(w, "read failed", http.StatusBadGateway) // 5xx: nydusd falls back
-		return
+		return readMiss
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+int64(len(data))-1, size))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(data)
+	return readRemote
 }
 
 // writePlannedRange serves a range through PlanRange: local chunk files go to
 // the socket with sendfile, missing chunks are fetched once (store/peer
 // first, no read-ahead). Every piece is resolved before the status line, so
 // a failed fetch still answers 502 and nydusd falls back.
-func (h *Handler) writePlannedRange(w http.ResponseWriter, ctx context.Context, rp rangePlanner, entry *cache.CacheEntry, start, end int64, id string) {
+func (h *Handler) writePlannedRange(w http.ResponseWriter, ctx context.Context, rp rangePlanner, entry *cache.CacheEntry, start, end int64, id string) blobReadPath {
 	pieces, release, err := rp.PlanRange(ctx, entry, start, end-start+1)
 	defer release()
 	if err != nil {
 		h.logger.Printf("oci blob %s range %d-%d: %v", id, start, end, err)
 		http.Error(w, "read failed", http.StatusBadGateway) // 5xx: nydusd falls back
-		return
+		return readMiss
 	}
 	var n int64
+	path := readLocal
 	for _, p := range pieces {
 		n += p.Len()
+		if p.Tier != cache.TierNVMe {
+			path = readRemote
+		}
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+n-1, entry.Size))
 	w.WriteHeader(http.StatusPartialContent)
 	for _, p := range pieces {
 		if _, err := p.WriteTo(w); err != nil {
-			return // client went away; the status is already sent
+			return path // client went away; the status is already sent
 		}
 	}
+	return path
 }
 
 // writeWholeBlob streams the whole blob with 200, ociBlobMaxRange at a time

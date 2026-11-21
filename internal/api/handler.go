@@ -79,6 +79,11 @@ type Handler struct {
 	// liveFills are fills in progress that reads can be served from
 	// (fill_serve.go).
 	liveFills liveFills
+	// peerFill pulls a blob other nodes hold onto this node in parallel
+	// ranges (peer_fill.go).
+	peerFill peerFiller
+	// blobReads profiles blob proxy reads by serving path.
+	blobReads blobReadStats
 }
 
 // SetMountHealth installs a probe for FUSE mount liveness. A node whose serve
@@ -1081,6 +1086,17 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_evict_retract_failed_total %d\n", cmx.EvictRetractFailed.Load())
 	fmt.Fprintf(w, "fuse_evict_retract_skipped_relanded_total %d\n", cmx.EvictRetractSkippedRelanded.Load())
 	fmt.Fprintf(w, "fuse_evict_retract_dropped_total %d\n", cmx.EvictRetractDropped.Load())
+	hl := dcm.HolderLeaseStats()
+	hle := 0
+	if hl.Enabled {
+		hle = 1
+	}
+	fmt.Fprintf(w, "fuse_holder_lease_enabled %d\n", hle)
+	fmt.Fprintf(w, "fuse_holder_rows_published %d\n", hl.Published)
+	fmt.Fprintf(w, "fuse_holder_renewed_total %d\n", hl.Renewed)
+	fmt.Fprintf(w, "fuse_holder_renew_passes_total %d\n", hl.RenewPasses)
+	fmt.Fprintf(w, "fuse_holder_retract_retries_total %d\n", hl.RetractRetried)
+	fmt.Fprintf(w, "fuse_holder_reconcile_retracted_total %d\n", hl.ReconcileRetracted)
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
@@ -1213,6 +1229,17 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_registry_fill_served_bytes_total %d\n", rf.ServedBytes)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_miss_total %d\n", rf.ServeMiss)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_wait_seconds_total %.3f\n", rf.ServeWaitSec)
+	h.blobReads.write(w)
+	pf := h.peerFillStats()
+	fmt.Fprintf(w, "fuse_peer_fill_started_total %d\n", pf.Started)
+	fmt.Fprintf(w, "fuse_peer_fill_completed_total %d\n", pf.Completed)
+	fmt.Fprintf(w, "fuse_peer_fill_failed_total %d\n", pf.Failed)
+	fmt.Fprintf(w, "fuse_peer_fill_rejected_total %d\n", pf.Rejected)
+	fmt.Fprintf(w, "fuse_peer_fill_bytes_total %d\n", pf.Bytes)
+	fmt.Fprintf(w, "fuse_peer_fill_inflight %d\n", pf.Inflight)
+	fmt.Fprintf(w, "fuse_peer_fill_units_total{source=\"peer\"} %d\n", pf.UnitsPeer)
+	fmt.Fprintf(w, "fuse_peer_fill_units_total{source=\"registry\"} %d\n", pf.UnitsHedged)
+	fmt.Fprintf(w, "fuse_peer_fill_peer_unit_errors_total %d\n", pf.PeerUnitErrors)
 	for _, st := range dcm.IOClassStats() {
 		fmt.Fprintf(w, "fuse_io_class_bytes_total{class=%q} %d\n", st.Class, st.Bytes)
 		fmt.Fprintf(w, "fuse_io_class_throttled_seconds_total{class=%q} %.3f\n", st.Class, st.ThrottledSec)

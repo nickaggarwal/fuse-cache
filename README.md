@@ -388,6 +388,30 @@ container reads a file in the image
   (coordinator fetch lease), in the warm I/O class. `-registry-fill=false`
   restores 503-only; `-registry-fill-hosts` limits which registries are
   allowed. Metrics: `fuse_registry_fill_*`.
+- **Other nodes pull the whole blob, not read by read.** The first read of a
+  blob the cluster holds and this node does not starts one fill of the whole
+  blob from its holders, the same way: parallel range reads of the fill
+  unit into one staged file, the waiting read's units (and the next two,
+  read-ahead) first, answered as they land, then hashed, committed and
+  published. It is not uploaded again; its holder persists it. A unit the
+  holders fail to deliver, or take over 10 s on, comes from the registry the
+  request named, so a slow or lost holder costs at most one timeout per
+  unit. `-peer-fill=false` restores one peer round trip per nydusd read.
+  Metrics: `fuse_peer_fill_*`, with units by source (peer / registry).
+- **Holder rows say who holds a file now.** Against a coordinator that
+  advertises `holder-lease`, every local-copy row carries a generation, a
+  lease and whether the node holds the whole file or only some chunks
+  (`partial`). Eviction retracts only the generation it evicted, retried
+  with backoff, so a late notice cannot remove a copy admitted again.
+  Every `-holder-renew-sec` (300) a node renews what it holds and retracts
+  what it no longer does; a node that stops renewing (crash, partition) has
+  its rows hidden once the lease (`-holder-lease-sec`, 900) lapses and swept
+  2 minutes later. Rows from older clients never expire. Metrics:
+  `fuse_holder_*`; coordinator `GET /api/leases`.
+- **Every blob read is profiled.** `fuse_blob_read_seconds{path}` times each
+  nydusd read by the path that answered it: `local` (a whole local copy or
+  local chunks), `fill` (a fill in progress), `remote` (per-chunk store,
+  peer or cloud reads) or `miss` (not answered; nydusd falls back).
 - **Filling the store.** A blob gets to the store through a PUT ahead of
   the launch (sky-control's skywarm does this from the source registry).
   Model nodes fill from the store and from each other as they read.
