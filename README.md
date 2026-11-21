@@ -396,7 +396,11 @@ container reads a file in the image
   published. It is not uploaded again; its holder persists it. A unit the
   holders fail to deliver, or take over 10 s on, comes from the registry the
   request named, so a slow or lost holder costs at most one timeout per
-  unit. `-peer-fill=false` restores one peer round trip per nydusd read.
+  unit. Off by default (`-peer-fill`): it moves the whole blob, so it wins
+  only when a start reads most of the image. On cpu-w3 (13.5 GB image) the
+  second node was ~3 s faster with it; on Nebius H200 (30.6 GB image, a
+  start reads far less) it was ~60-80 s slower (294 s vs 213-235 s Ready),
+  because the per-read peer path (4 ms a read) moved only what was read.
   Metrics: `fuse_peer_fill_*`, with units by source (peer / registry).
 - **Holder rows say who holds a file now.** Against a coordinator that
   advertises `holder-lease`, every local-copy row carries a generation, a
