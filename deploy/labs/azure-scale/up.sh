@@ -73,12 +73,13 @@ pools() {
     fi
     extra=()
     [[ $spot == yes ]] && extra=(--priority Spot --eviction-policy Delete --spot-max-price -1)
-    echo "+ pool $name: $count x $vm${spot/yes/ (spot)}"
+    label=""; [[ $spot == yes ]] && label=" (spot)"
+    echo "+ pool $name: $count x $vm$label"
     # Ephemeral OS disk on the VM's local disk; label model nodes so the
     # fuse client, nydus snapshotter and bench pods select them.
     $AZ aks nodepool add -g "$RG" --cluster-name "$CL" -n "$name" --node-vm-size "$vm" --node-count "$count" \
-      --os-disk-type Ephemeral --labels agentpool=$name fc-scale/role=model fc-scale/family=$name \
-      --tags $TAGS "${extra[@]}" -o none &
+      --node-osdisk-type Ephemeral --labels agentpool=$name fc-scale/role=model fc-scale/family=$name \
+      --tags $TAGS ${extra[@]+"${extra[@]}"} -o none &
   done <<< "$POOLS"
   wait
 }
