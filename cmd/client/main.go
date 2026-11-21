@@ -997,7 +997,7 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 	defer t.Stop()
 	last := ""
 	for {
-		inst, caps := coordinatorHealth(ctx, addr)
+		inst, caps, durable := coordinatorHealthDurable(ctx, addr)
 		if inst != "" {
 			// Flags change at any time (an operator sets norebalance before
 			// a rollout), so they apply on every poll, not only on a new
@@ -1009,11 +1009,18 @@ func watchCoordinatorInstance(ctx context.Context, addr string, cm cache.CacheMa
 			}
 		}
 		if inst != "" && inst != last {
-			logger.Printf("Coordinator instance %q -> %q: republishing local objects (capabilities %v)", last, inst, caps)
 			if cs, ok := cm.(interface{ SetCoordinatorCapabilities([]string) }); ok {
 				cs.SetCoordinatorCapabilities(caps)
 			}
-			rp.RepublishLocal(ctx)
+			// Only an in-memory coordinator loses rows when it restarts.
+			// With a durable store (etcd), a new instance ID is just another
+			// replica behind the same Service answering this poll: the rows
+			// are intact, and republishing on every alternation (seen on
+			// cpu-w3 every 30-120 s with 2 replicas) is pure load.
+			if !durable || last == "" {
+				logger.Printf("Coordinator instance %q -> %q: republishing local objects (capabilities %v)", last, inst, caps)
+				rp.RepublishLocal(ctx)
+			}
 			last = inst
 		}
 		select {
@@ -1077,30 +1084,38 @@ func coordinatorInstance(ctx context.Context, addr string) string {
 // coordinatorHealth returns the instance ID and advertised capabilities from
 // GET /api/health ("" and nil when unreachable or too old).
 func coordinatorHealth(ctx context.Context, addr string) (string, []string) {
+	inst, caps, _ := coordinatorHealthDurable(ctx, addr)
+	return inst, caps
+}
+
+// coordinatorHealthDurable is coordinatorHealth plus whether the coordinator
+// keeps its state in a durable store (etcd).
+func coordinatorHealthDurable(ctx context.Context, addr string) (string, []string, bool) {
 	if addr == "" {
-		return "", nil
+		return "", nil, false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, "http://"+addr+"/api/health", nil)
 	if err != nil {
-		return "", nil
+		return "", nil, false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", nil
+		return "", nil, false
 	}
 	defer resp.Body.Close()
 	var h struct {
 		Instance     string   `json:"instance"`
+		Durable      bool     `json:"durable"`
 		Capabilities []string `json:"capabilities"`
 		Flags        []string `json:"flags"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&h) != nil {
-		return "", nil
+		return "", nil, false
 	}
 	lastCoordinatorFlags.Store(&h.Flags)
-	return h.Instance, h.Capabilities
+	return h.Instance, h.Capabilities, h.Durable
 }
 
 // lastCoordinatorFlags holds the cluster flags from the latest health poll.
