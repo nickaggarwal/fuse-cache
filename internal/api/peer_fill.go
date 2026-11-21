@@ -30,13 +30,22 @@ import (
 // node was ~25 s behind the first for the same reason.
 //
 // Now the first read of a blob the cluster holds but this node does not
-// starts one fill of the whole blob from its holders, with the same machinery
-// as a registry fill (fill_serve.go): fillWorkers range reads of
-// fillUnitBytes in parallel into one staged file, the units a waiting read
-// needs (and the next few, read-ahead) fetched first, and that read answered
-// from the staged file as soon as they land. When every unit is in, the file
-// is hashed against its digest, committed and published, so this node serves
-// the blob locally (and the Rust store-front can serve it natively).
+// starts one fill of the blob from its holders into a staged file, in two
+// phases:
+//
+//   - demand: only the units a waiting read needs, plus peerFillReadAhead
+//     after them, fetched by fillWorkers in parallel and answered as they
+//     land. A start reads far less than a large image (the Nebius H200
+//     image is 30.6 GB): copying it all during the start, as the first
+//     version did, made the second node slower than per-read peer reads
+//     (294 s vs 213-235 s to Ready).
+//   - background: once no read has asked for 15 s (peerFillQuietNanos), the rest is
+//     queued and fetched by peerFillBackgroundWorkers in the warm I/O class,
+//     so the node becomes a whole holder without competing with the start.
+//
+// When every unit is in, the file is hashed against its digest, committed
+// and published, so this node serves the blob locally (and the Rust
+// store-front can serve it natively).
 //
 // Hedging: a unit the holders cannot deliver within peerUnitTimeout, or at
 // all (busy, gone, a holder that lost the copy), is fetched from the registry
@@ -60,7 +69,18 @@ const (
 	// peerFillMinBytes: smaller blobs are read whole by the planned range
 	// path in one request anyway.
 	peerFillMinBytes = 4 << 20
+	// peerFillReadAhead units are fetched after each waiting read's own.
+	peerFillReadAhead = 4
+	// peerFillBackgroundWorkers fetch the rest once reads go quiet.
+	peerFillBackgroundWorkers = 4
 )
+
+// peerFillQuietNanos: after this long with no read asking, the rest of the
+// blob is filled in the background by peerFillBackgroundWorkers. Atomic so
+// tests can shorten it while fills from earlier tests still run.
+var peerFillQuietNanos atomic.Int64
+
+func init() { peerFillQuietNanos.Store(int64(15 * time.Second)) }
 
 // peerBlobSource is the cache side of a peer fill.
 type peerBlobSource interface {
@@ -87,6 +107,9 @@ type peerFiller struct {
 	unitsPeer    atomic.Int64
 	unitsHedged  atomic.Int64 // units the registry served after the holders failed
 	peerUnitErrs atomic.Int64
+	// Units fetched because a read waited on them (or read-ahead), vs in
+	// the background after reads went quiet.
+	unitsDemand, unitsBackground, backgroundFills atomic.Int64
 }
 
 // EnablePeerFill turns whole-blob peer fills on or off.
@@ -107,6 +130,7 @@ func (f *peerFiller) init() {
 type PeerFillStats struct {
 	Started, Completed, Failed, Rejected, Bytes int64
 	UnitsPeer, UnitsHedged, PeerUnitErrors      int64
+	UnitsDemand, UnitsBackground                int64
 	Inflight                                    int
 }
 
@@ -119,6 +143,7 @@ func (h *Handler) peerFillStats() PeerFillStats {
 		Started: f.started.Load(), Completed: f.completed.Load(), Failed: f.failed.Load(),
 		Rejected: f.rejected.Load(), Bytes: f.bytes.Load(), Inflight: n,
 		UnitsPeer: f.unitsPeer.Load(), UnitsHedged: f.unitsHedged.Load(), PeerUnitErrors: f.peerUnitErrs.Load(),
+		UnitsDemand: f.unitsDemand.Load(), UnitsBackground: f.unitsBackground.Load(),
 	}
 }
 
@@ -227,25 +252,56 @@ func (h *Handler) runPeerFill(src peerBlobSource, entry *cache.CacheEntry, hexDi
 		ready <- nil
 		return err
 	}
-	lf := newLiveFill(hexDigest, size, fillUnitBytes, out, staged)
+	lf := newDemandFill(hexDigest, size, fillUnitBytes, out, staged, peerFillReadAhead)
 	h.liveFills.put(lf)
 	defer h.liveFills.del(hexDigest)
 	ready <- lf
 
+	// Phase 1, demand: workers fetch only units a read waits on plus the
+	// read-ahead after it, so the start gets the network and disk. Phase 2,
+	// background: once no read has asked for 15 s (peerFillQuietNanos), the rest is
+	// queued and fetched by fewer workers in the warm I/O class, so this
+	// node ends up a whole, verified holder without slowing the start.
 	var wg sync.WaitGroup
 	var firstErr error
 	var errMu sync.Mutex
+	var background atomic.Bool
+	charger, _ := h.cacheManager.(fillCharger)
 	for w := 0; w < fillWorkers; w++ {
 		wg.Add(1)
-		go func() {
+		go func(w int) {
 			defer wg.Done()
-			for {
+			for ctx.Err() == nil {
+				if background.Load() && w >= peerFillBackgroundWorkers {
+					return
+				}
 				u := lf.next()
 				if u < 0 {
-					return
+					if lf.complete() || lf.anyFailed() {
+						return
+					}
+					if !background.Load() && lf.idleFor() >= time.Duration(peerFillQuietNanos.Load()) {
+						if background.CompareAndSwap(false, true) {
+							lf.enqueueRemaining()
+							f.backgroundFills.Add(1)
+						}
+						continue
+					}
+					time.Sleep(10 * time.Millisecond)
+					continue
 				}
 				uerr := h.fetchPeerUnit(ctx, src, entry, lf, u, reg, auth)
 				lf.markDone(u, uerr == nil)
+				if uerr == nil {
+					if background.Load() {
+						f.unitsBackground.Add(1)
+						if charger != nil {
+							_ = charger.ChargeWarmIO(ctx, lf.unit)
+						}
+					} else {
+						f.unitsDemand.Add(1)
+					}
+				}
 				if uerr != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -254,9 +310,12 @@ func (h *Handler) runPeerFill(src peerBlobSource, entry *cache.CacheEntry, hexDi
 					errMu.Unlock()
 				}
 			}
-		}()
+		}(w)
 	}
 	wg.Wait()
+	if firstErr == nil && ctx.Err() != nil {
+		firstErr = ctx.Err()
+	}
 	if firstErr != nil {
 		lf.finish(firstErr)
 		out.Close()

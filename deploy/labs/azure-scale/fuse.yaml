@@ -1,0 +1,111 @@
+# fuse-cache for the scale lab. etcd + coordinator on the system pool; the
+# client DaemonSet (Go client on 8092, Rust store-front on 8091 = the peer
+# and nydusd proxy port) on every node labelled fc-scale/role=model.
+apiVersion: v1
+kind: Service
+metadata: {name: etcd, namespace: fc-scale}
+spec:
+  clusterIP: None
+  selector: {app: etcd}
+  ports: [{name: client, port: 2379}, {name: peer, port: 2380}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: etcd, namespace: fc-scale}
+spec:
+  serviceName: etcd
+  replicas: 1
+  selector: {matchLabels: {app: etcd}}
+  template:
+    metadata: {labels: {app: etcd}}
+    spec:
+      nodeSelector: {agentpool: system}
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.13
+          command: [etcd, --name=etcd-0, --listen-peer-urls=http://0.0.0.0:2380, --listen-client-urls=http://0.0.0.0:2379,
+                    --advertise-client-urls=http://etcd-0.etcd:2379, --initial-advertise-peer-urls=http://etcd-0.etcd:2380,
+                    --initial-cluster=etcd-0=http://etcd-0.etcd:2380, --initial-cluster-state=new, --data-dir=/var/lib/etcd,
+                    --auto-compaction-mode=periodic, --auto-compaction-retention=1h, --quota-backend-bytes=2147483648]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 2Gi}}
+          volumeMounts: [{name: data, mountPath: /var/lib/etcd}]
+      volumes: [{name: data, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: coordinator, namespace: fc-scale}
+spec:
+  selector: {app: coordinator}
+  ports: [{name: http, port: 8080}, {name: grpc, port: 9080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: coordinator, namespace: fc-scale}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: coordinator}}
+  template:
+    metadata: {labels: {app: coordinator}}
+    spec:
+      nodeSelector: {agentpool: system}
+      containers:
+        - name: coordinator
+          image: __IMG__
+          command: [coordinator]
+          args: [-port, "8080", -grpc-port, "9080", -etcd-endpoints, "http://etcd-0.etcd.fc-scale.svc.cluster.local:2379",
+                 -etcd-prefix, /fuse, -etcd-peer-lease-ttl, "90"]
+          ports: [{containerPort: 8080}, {containerPort: 9080}]
+          readinessProbe: {httpGet: {path: /api/health, port: 8080}, periodSeconds: 5}
+          resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {memory: 1Gi}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: fuse-client, namespace: fc-scale}
+spec:
+  selector: {matchLabels: {app: fuse-client}}
+  updateStrategy: {rollingUpdate: {maxUnavailable: 3}}
+  template:
+    metadata: {labels: {app: fuse-client}}
+    spec:
+      nodeSelector: {fc-scale/role: model}
+      hostPID: true
+      initContainers:
+        - name: prepare
+          image: __IMG__
+          command: [/bin/sh, -c, "fusermount3 -u -z /host/mnt 2>/dev/null; umount -l /host/mnt 2>/dev/null; mkdir -p /host/mnt /host/cache && chmod 0777 /host/mnt"]
+          securityContext: {privileged: true}
+          volumeMounts: [{name: host, mountPath: /host, mountPropagation: Bidirectional}]
+      containers:
+        - name: client
+          image: __IMG__
+          command: [client]
+          args: [-mount=/host/mnt, -nvme=/host/cache, -nvme-max-gb=60, -chunk-size=16,
+                 -coordinator=coordinator.fc-scale.svc.cluster.local:8080, -coordinator-grpc=coordinator.fc-scale.svc.cluster.local:9080,
+                 -cloud-provider=azure, "-azure-container=$(AZURE_CONTAINER_NAME)", -cloud-key-prefix=fcscale,
+                 -enable-agent-server=false, -port=8092, -advertise-port=8091, -grpc-port=9091, "-peer-id=$(NODE_NAME)",
+                 -bg-busy-mbps=200, -peer-fill=false]
+          env:
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: NODE_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+            - {name: FUSE_GOFUSE_DIRECT_MOUNT, value: "1"}
+            - {name: FUSE_MAX_UPLOAD_GB, value: "20"}
+            - {name: FUSE_GOFUSE_ENABLE_PASSTHROUGH, value: "1"}
+          envFrom: [{secretRef: {name: fc-azure}}]
+          ports: [{containerPort: 8092, name: api}, {containerPort: 9091, name: grpc}]
+          readinessProbe: {httpGet: {path: /api/health, port: 8092}, periodSeconds: 10}
+          resources: {requests: {cpu: "2", memory: 1Gi}, limits: {memory: 8Gi}}
+          securityContext: {privileged: true}
+          volumeMounts:
+            - {name: host, mountPath: /host, mountPropagation: Bidirectional}
+            - {name: devfuse, mountPath: /dev/fuse}
+        - name: front
+          image: __FRONT__
+          args: [--listen=0.0.0.0:8091, --backend=127.0.0.1:8092, --cache-dir=/host/cache, --coordinator=coordinator.fc-scale.svc.cluster.local:8080]
+          ports: [{containerPort: 8091, name: front}]
+          readinessProbe: {httpGet: {path: /rust/readyz, port: 8091}, periodSeconds: 5}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 1Gi}}
+          volumeMounts: [{name: host, mountPath: /host, readOnly: true, mountPropagation: HostToContainer}]
+      volumes:
+        - {name: host, hostPath: {path: /mnt/fcscale, type: DirectoryOrCreate}}
+        - {name: devfuse, hostPath: {path: /dev/fuse}}

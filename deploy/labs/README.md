@@ -35,3 +35,11 @@ One AKS cluster with one pool per VM family, for 15–20 node tests.
   - the quota per region and family;
   - which quota increases a 16- or 20-node run needs;
   - the test matrix.
+
+Azure lab, running a test:
+1. `./up.sh`.
+2. `./deploy.sh <fuse-client image>`.
+3. `./scale-bench.sh family|fanout|stagger`.
+4. `./down.sh`.
+
+`kill-switch.sh` with `DEADLINE=<epoch>` tears down at the deadline. `RESULTS.md` has the first 6-node run.

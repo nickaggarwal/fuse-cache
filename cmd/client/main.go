@@ -122,6 +122,7 @@ func main() {
 		reconcileIntervalSec  = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
 		reconcileTarget       = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
 		reconcileMaxPerRun    = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
+		replicationSlots      = flag.Int("replication-slots", 16, "Max replications in flight across the whole cluster (coordinator fetch leases), so a mass holder loss does not start a replication storm; negative disables")
 		reconcileMaxTarget    = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
 		warmReconcileSec      = flag.Int("warm-reconcile-interval-sec", 0, "How often declared CSI warmup intents are re-asserted against actual residency; 0 uses the default (120s), negative disables re-assertion (first pass at mount still runs)")
 		peerLabelsFlag        = flag.String("peer-labels", "", "Comma-separated key=value labels registered with the coordinator (e.g. pool=gpu,zone=a); FUSE_PEER_LABELS env overrides")
@@ -313,6 +314,7 @@ func main() {
 		ReplicaReconcileInterval:  time.Duration(*reconcileIntervalSec) * time.Second,
 		ReplicaReconcileTarget:    *reconcileTarget,
 		ReplicaReconcileMaxPerRun: *reconcileMaxPerRun,
+		ReplicationSlots:          *replicationSlots,
 		ReplicaReconcileMaxTarget: *reconcileMaxTarget,
 		// Negative disables the loop; 0 leaves the cache default in place.
 		// Separating "off" from "unset" matters because the zero value has to
