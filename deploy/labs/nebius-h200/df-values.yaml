@@ -1,0 +1,60 @@
+# Benchmark-only Dragonfly (chart 1.8.5 / 2.5.2 / client 1.5.5), Nebius lab.
+# Namespace df-lab, NO dfinit (containerd untouched), managerless like
+# sky-control's lazypull setup. Node peers on every GPU node with
+# hostNetwork, so nydusd reaches the local dfdaemon at 127.0.0.1:4001 (the
+# same address the AKS fleet used). Registry is the Nebius one.
+global:
+  imageRegistry: __REG__
+  imagePullSecrets: [{name: nebius-cr}]
+manager: {enable: false}
+mysql: {enable: false}
+redis: {enable: false}
+scheduler:
+  enable: true
+  replicas: 1
+  image: {registry: __REG__, repository: __RID__/df-scheduler, tag: test}
+  initContainer:
+    image: {registry: __REG__, repository: __RID__/busybox, tag: test}
+  nodeSelector: {agentpool: system}
+  resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
+  dynconfig:
+    seedPeerClusterConfig: {loadLimit: 2000}
+    schedulerClusterConfig: {candidateParentLimit: 4, filterParentLimit: 15}
+    schedulerClusterClientConfig: {loadLimit: 200}
+seedClient:
+  enable: true
+  replicas: 1
+  image: {registry: __REG__, repository: __RID__/df-client, tag: test}
+  initContainer:
+    image: {registry: __REG__, repository: __RID__/busybox, tag: test}
+  nodeSelector: {agentpool: system}
+  persistence: {enable: false}
+  resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 4Gi}}
+  config:
+    proxy:
+      server: {requestRateLimit: 4000}
+      prefetch: false
+      rules:
+      - {regex: 'blobs/sha256.*', useTLS: true}
+      - {regex: 'manifests/sha256.*', useTLS: true}
+client:
+  enable: true
+  image: {registry: __REG__, repository: __RID__/df-client, tag: test}
+  hostNetwork: true
+  initContainer:
+    image: {registry: __REG__, repository: __RID__/busybox, tag: test}
+  nodeSelector: {agentpool: model}
+  tolerations:
+  - {key: skyimage.io/lazy, operator: Exists, effect: NoSchedule}
+  resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {memory: 4Gi}}
+  config:
+    download:
+      server: {requestRateLimit: 400}
+    proxy:
+      server: {port: 4001, requestRateLimit: 4000}
+      prefetch: false
+      rules:
+      - {regex: 'blobs/sha256.*', useTLS: true}
+      - {regex: 'manifests/sha256.*', useTLS: true}
+    storage: {dir: /var/lib/dragonfly/}
+  dfinit: {enable: false}

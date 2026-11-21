@@ -1,0 +1,283 @@
+# nydus-snapshotter v0.16.1 + nydusd v2.4.5 on dedicated AKS lazy-pull pools
+# (label skyimage.io/lazy=true, taint skyimage.io/lazy:NoSchedule).
+#
+# Why nydus first on AKS: it reads ACR credentials through the node's own
+# kubelet credential provider (acr-credential-provider + /etc/kubernetes/
+# azure.json), so no kubelet flag changes and no imagePullSecrets. stargz
+# needs kubelet --image-service-endpoint for both DiffID verification and
+# ACR credentials, which AKS does not expose (see ../stargz/README.md).
+#
+# What it changes on the host (and only on lazy pools):
+#   - installs nydusd/nydus-image/containerd-nydus-grpc under /opt/nydus/bin
+#   - adds [proxy_plugins.nydus] to /etc/containerd/config.toml and makes it
+#     the CRI snapshotter, with disable_snapshot_annotations=false and
+#     discard_unpacked_layers=false; restarts containerd once
+#   - runs containerd-nydus-grpc as a host systemd unit, so it survives this
+#     pod's restarts and containerd's restarts
+# AKS does not persist host edits across reimage/upgrade/scale: the init
+# container re-applies them on every boot (idempotent). The node keeps the
+# taint until /run/skyimage/lazy-ready exists; see node-ready.yaml.
+#
+# Plain OCI images still work on these nodes: nydus-snapshotter unpacks them
+# natively (overlay). Nydus (RAFS) images are lazily fetched by nydusd
+# through the local Dragonfly dfdaemon (proxy mode, fallback to ACR).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nydus-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nydus-config
+  namespace: nydus-system
+data:
+  config.toml: |
+    version = 1
+    root = "/var/lib/containerd/io.containerd.snapshotter.v1.nydus"
+    address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+    daemon_mode = "dedicated"
+    cleanup_on_close = false
+
+    [system]
+    enable = true
+    address = "/run/containerd-nydus/system.sock"
+
+    [daemon]
+    nydusd_config = "/etc/nydus/nydusd-config.fusedev.json"
+    nydusd_path = "/opt/nydus/bin/nydusd"
+    nydusimage_path = "/opt/nydus/bin/nydus-image"
+    fs_driver = "fusedev"
+    recover_policy = "failover"
+    failover_policy = "resend"
+    threads_number = 4
+
+    [cgroup]
+    enable = true
+    memory_limit = "4Gi"
+
+    [log]
+    log_to_stdout = true
+    level = "info"
+
+    [metrics]
+    address = ":9110"
+
+    [remote.auth]
+    # Nebius: no kubelet credential provider. The snapshotter reads the
+    # image pull secret through the CRI keychain (kubelet passes it).
+    enable_kubelet_credential_providers = false
+    enable_kubeconfig_keychain = false
+    enable_cri_keychain = true
+
+    [snapshot]
+    enable_nydus_overlayfs = false
+    sync_remove = false
+
+    [cache_manager]
+    disable = false
+    gc_period = "24h"
+    cache_dir = "/var/lib/nydus/cache"
+
+  # nydusd fetches RAFS blobs through the local dfdaemon as an HTTP proxy.
+  # (The older backend "mirrors" block was removed in nydusd v2.3.6.) If
+  # dfdaemon's ping fails or it returns 5xx, nydusd goes straight to ACR.
+  #
+  # use_http=true: nydusd sends plain HTTP to 127.0.0.1:4001 and dfdaemon
+  # upgrades the upstream request to HTTPS (proxy rule useTLS=true). With
+  # use_http=false nydusd sends CONNECT and dfdaemon intercepts TLS with a
+  # self-signed cert, which nydusd rejects -> every request silently falls
+  # back to ACR and P2P never happens (seen in the 2026-10-18 pilot). The
+  # plaintext hop never leaves the node; TLS to ACR is kept by dfdaemon.
+  nydusd-config.fusedev.json: |
+    {
+      "device": {
+        "backend": {
+          "type": "registry",
+          "config": {
+            "timeout": 30,
+            "connect_timeout": 10,
+            "retry_limit": 3,
+            "proxy": {
+              "url": "http://127.0.0.1:4001",
+              "ping_url": "http://127.0.0.1:4003/healthy",
+              "check_pause_elapsed": 300,
+              "fallback": true,
+              "check_interval": 5,
+              "use_http": true
+            }
+          }
+        },
+        "cache": {
+          "type": "blobcache",
+          "config": {"work_dir": "/var/lib/nydus/cache"}
+        }
+      },
+      "mode": "direct",
+      "digest_validate": false,
+      "iostats_files": false,
+      "enable_xattr": true,
+      "amplify_io": 1048576,
+      "fs_prefetch": {
+        "enable": true,
+        "threads_count": 4,
+        "merging_size": 1048576,
+        "bandwidth_rate": 0,
+        "prefetch_all": false
+      }
+    }
+
+  containerd-nydus-grpc.service: |
+    [Unit]
+    Description=nydus snapshotter (skyimage lazy pool)
+    After=network.target local-fs.target
+    Before=containerd.service
+
+    [Service]
+    Type=simple
+    ExecStart=/opt/nydus/bin/containerd-nydus-grpc --config /etc/nydus/config.toml
+    Restart=always
+    RestartSec=2
+    LimitNOFILE=1048576
+    Delegate=yes
+    KillMode=process
+
+    [Install]
+    WantedBy=multi-user.target
+
+  # Idempotent host setup: run on every pod start (= every boot / reimage).
+  install.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    H=/host
+    BIN=$H/opt/nydus/bin
+    mkdir -p $BIN $H/etc/nydus $H/var/lib/nydus/cache $H/run/skyimage
+    # Binaries ship in this image (built from pinned release tarballs whose
+    # sha256 is checked at image build time; see Dockerfile).
+    for b in nydusd nydus-image containerd-nydus-grpc; do
+      if ! cmp -s /opt/nydus/bin/$b $BIN/$b; then install -m 0755 /opt/nydus/bin/$b $BIN/$b; fi
+    done
+    cp /config/config.toml $H/etc/nydus/config.toml
+    cp /config/nydusd-config.fusedev.json $H/etc/nydus/nydusd-config.fusedev.json
+    cp /config/containerd-nydus-grpc.service $H/etc/systemd/system/containerd-nydus-grpc.service
+
+    CFG=$H/etc/containerd/config.toml
+    changed=0
+    if ! grep -q '^\[proxy_plugins.nydus\]' $CFG; then
+      cp $CFG $CFG.pre-nydus
+      printf '\n[proxy_plugins.nydus]\n  type = "snapshot"\n  address = "/run/containerd-nydus/containerd-nydus-grpc.sock"\n' >> $CFG
+      changed=1
+    fi
+    # Image plugin settings (containerd 2.x on AKS: version=2 file with the
+    # io.containerd.cri.v1.images plugin id; 1.7: grpc.v1.cri.containerd).
+    python3 /config/edit-containerd.py $CFG && changed=1 || true
+
+    chroot $H systemctl daemon-reload
+    chroot $H systemctl enable --now containerd-nydus-grpc.service
+    for i in $(seq 1 30); do [ -S $H/run/containerd-nydus/containerd-nydus-grpc.sock ] && break; sleep 1; done
+    [ -S $H/run/containerd-nydus/containerd-nydus-grpc.sock ] || { echo "nydus socket missing"; exit 1; }
+    if [ $changed = 1 ]; then chroot $H systemctl restart containerd; fi
+    for i in $(seq 1 60); do chroot $H ctr --address /run/containerd/containerd.sock plugins ls 2>/dev/null | grep -q 'nydus.*ok' && break; sleep 1; done
+    chroot $H ctr plugins ls | grep -E 'nydus' || { echo "containerd does not report the nydus snapshotter"; exit 1; }
+    touch $H/run/skyimage/lazy-ready
+    echo "nydus lazy pool ready"
+
+  # Sets the CRI snapshotter and the two annotations flags, whichever
+  # plugin layout the node's containerd config uses. Exit 0 = changed.
+  edit-containerd.py: |
+    import re, sys
+    p = sys.argv[1]
+    s = open(p).read()
+    want = {"snapshotter": '"nydus"', "disable_snapshot_annotations": "false", "discard_unpacked_layers": "false"}
+    if '[plugins."io.containerd.cri.v1.images"]' in s:
+        sec = '[plugins."io.containerd.cri.v1.images"]'
+    else:
+        sec = '[plugins."io.containerd.grpc.v1.cri".containerd]'
+        if sec not in s:
+            s += "\n" + sec + "\n"
+    start = s.index(sec) + len(sec)
+    m = re.search(r'^\s*\[', s[start:], re.M)
+    end = start + (m.start() if m else len(s) - start)
+    body = s[start:end]
+    orig = body
+    for k, v in want.items():
+        if re.search(rf'^\s*{k}\s*=', body, re.M):
+            body = re.sub(rf'^(\s*){k}\s*=.*$', rf'\g<1>{k} = {v}', body, flags=re.M)
+        else:
+            body = body.rstrip("\n") + f"\n  {k} = {v}\n"
+    if body == orig:
+        sys.exit(1)
+    open(p, "w").write(s[:start] + body + s[end:])
+    sys.exit(0)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nydus-node
+  namespace: nydus-system
+spec:
+  selector: {matchLabels: {app: nydus-node}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: nydus-node}
+    spec:
+      nodeSelector: {agentpool: model}
+      tolerations:
+      - {key: skyimage.io/lazy, operator: Exists, effect: NoSchedule}
+      hostPID: true
+      priorityClassName: system-node-critical
+      initContainers:
+      - name: install
+        image: __NYDUS_NODE__
+        command: [/bin/bash, /config/install.sh]
+        securityContext: {privileged: true}
+        volumeMounts:
+        - {name: host, mountPath: /host, mountPropagation: Bidirectional}
+        - {name: config, mountPath: /config, readOnly: true}
+      containers:
+      # Keeps the DaemonSet pod alive and reports readiness from the host
+      # unit; the snapshotter itself runs under systemd on the host.
+      #
+      # It also restarts a nydusd that can no longer read: one whose backend
+      # reads have all failed over the last 30 s (at least 20 reads, none
+      # served). Such a daemon keeps its mount and returns EIO for every new
+      # container of that image, and nothing else restarts it (a daemon whose
+      # first reads predated the store fill failed 1,446 of 1,446 on
+      # cpu-w3). Killing it makes the snapshotter's failover respawn it with
+      # fresh backend state; containers that already run keep their files.
+      - name: health
+        image: __NYDUS_NODE__
+        command: [/bin/bash, -c]
+        args:
+        - |
+          S=/host/var/lib/containerd/io.containerd.snapshotter.v1.nydus/socket
+          declare -A prev_r prev_e
+          while true; do
+            if chroot /host systemctl is-active --quiet containerd-nydus-grpc && [ -S /host/run/containerd-nydus/containerd-nydus-grpc.sock ]; then
+              touch /tmp/ready; else rm -f /tmp/ready; fi
+            for sock in $S/*/api.sock; do
+              [ -S "$sock" ] || continue
+              id=$(basename $(dirname $sock))
+              m=$(curl -s -m 3 --unix-socket "$sock" http://localhost/api/v1/metrics/backend) || continue
+              r=$(echo "$m" | sed -n 's/.*"read_count":\([0-9]*\).*/\1/p'); e=$(echo "$m" | sed -n 's/.*"read_errors":\([0-9]*\).*/\1/p')
+              [ -n "$r" ] && [ -n "$e" ] || continue
+              dr=$(( r - ${prev_r[$id]:-$r} )); de=$(( e - ${prev_e[$id]:-$e} ))
+              if [ $dr -ge 20 ] && [ $de -ge $dr ]; then
+                pid=$(chroot /host pgrep -f "nydusd fuse.*--id $id" | head -1)
+                echo "$(date -u +%FT%TZ) nydusd $id: $de of $dr backend reads failed in 30s; restarting pid $pid"
+                [ -n "$pid" ] && chroot /host kill $pid
+                unset prev_r[$id] prev_e[$id]; continue
+              fi
+              prev_r[$id]=$r; prev_e[$id]=$e
+            done
+            sleep 30
+          done
+        readinessProbe: {exec: {command: [test, -f, /tmp/ready]}, periodSeconds: 10}
+        securityContext: {privileged: true}
+        resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 64Mi}}
+        volumeMounts:
+        - {name: host, mountPath: /host}
+      volumes:
+      - {name: host, hostPath: {path: /}}
+      - {name: config, configMap: {name: nydus-config}}
