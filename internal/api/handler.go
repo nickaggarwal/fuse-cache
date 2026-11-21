@@ -1146,6 +1146,10 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_slots_total %d\n", hc.ReconcileSkippedSlotsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_pulls_total %d\n", hc.ReconcilePullsTotal)
+	rs := dcm.RingStats()
+	fmt.Fprintf(w, "fuse_ring_replicas %d\n", rs.Replicas)
+	fmt.Fprintf(w, "fuse_ring_members %d\n", rs.Members)
+	fmt.Fprintf(w, "fuse_ring_owner_fills_queued_total %d\n", rs.FillsQueued)
 	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)
 	// Declarative warmup reconciliation. rewarms/files_warmed climbing in

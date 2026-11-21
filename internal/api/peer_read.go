@@ -91,7 +91,17 @@ func (h *Handler) handlePeerRead(w http.ResponseWriter, r *http.Request) {
 		h.serveFileRange(w, localPath, offset, length)
 		return
 	}
+	// A chunk this node owns on the ring but does not hold yet: queue it so
+	// the next reader finds it here (ring.go). Answer miss either way.
+	if o, ok := h.cacheManager.(ownedMissNoter); ok {
+		o.NoteOwnedMiss(clean)
+	}
 	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// ownedMissNoter is the cache side of ring owner fills.
+type ownedMissNoter interface {
+	NoteOwnedMiss(chunkPath string)
 }
 
 // serveFileRange streams [offset, offset+length) of localPath to w. length < 0

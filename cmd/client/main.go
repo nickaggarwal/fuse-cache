@@ -122,6 +122,7 @@ func main() {
 		reconcileIntervalSec  = flag.Int("replica-reconcile-interval-sec", 0, "Replica reconciler pass interval in seconds; 0 disables (thundering-herd Phase 3; opt-in)")
 		reconcileTarget       = flag.Int("replica-reconcile-target", 0, "Desired replica count for hot objects; 0 uses the min-peer-replica default (3)")
 		reconcileMaxPerRun    = flag.Int("replica-reconcile-max-per-run", 8, "Max replication operations per reconciler pass (throttle)")
+		ringReplicas          = flag.Int("ring-replicas", 0, "Rendezvous-hash ring placement: each chunk has this many owners computed from the live peer list; reads try owners first, owners fill chunks readers ask them for, replicas go to owners. 0 disables")
 		replicationSlots      = flag.Int("replication-slots", 16, "Max replications in flight across the whole cluster (coordinator fetch leases), so a mass holder loss does not start a replication storm; negative disables")
 		reconcileMaxTarget    = flag.Int("replica-reconcile-max-target", 0, "Ceiling for the heat-boosted per-file replica target; 0 uses the default (8)")
 		warmReconcileSec      = flag.Int("warm-reconcile-interval-sec", 0, "How often declared CSI warmup intents are re-asserted against actual residency; 0 uses the default (120s), negative disables re-assertion (first pass at mount still runs)")
@@ -719,6 +720,8 @@ func main() {
 		api.SetFillParallel(*registryFillParallel)
 		apiHandler.EnableRegistryFill(api.RegistryFillConfig{Enabled: *registryFill, AllowedHosts: hosts})
 		apiHandler.EnablePeerFill(*peerFill)
+		cacheManager.SetRingReplicas(*ringReplicas)
+		logger.Printf("Ring placement: %d owners per chunk (0 = off)", *ringReplicas)
 		logger.Printf("Registry fill (fetch-on-miss): %s hosts=%v", enabledState(*registryFill), hosts)
 	}
 
