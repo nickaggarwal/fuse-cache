@@ -325,17 +325,23 @@ func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 		if renewed%holderRenewBatch == 0 {
 			select {
 			case <-ctx.Done():
-				return renewed, 0
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}
 	retracted := 0
 	for path := range cm.holders.snapshot() {
-		if _, ok := held[path]; ok || ctx.Err() != nil {
+		if _, ok := held[path]; ok {
 			continue
 		}
+		// No longer held: end the admission whatever happens next. A pass
+		// cut short (cancelled, coordinator unreachable) keeps the
+		// retraction pending for the next pass instead of forgetting it.
 		gen := cm.holders.evicted(path)
+		if ctx.Err() != nil {
+			cm.holders.keepPending(path, gen)
+			continue
+		}
 		if cm.retractHolder(ctx, path, gen) {
 			retracted++
 			cm.holders.reconcileRetracted.Add(1)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 )
 
 // holderRenewer is the cache side of POST /api/holders/renew.
@@ -21,7 +22,12 @@ func (h *Handler) handleHolderRenew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "holder renewal not supported", http.StatusNotImplemented)
 		return
 	}
-	renewed, retracted := hr.RenewHolders(r.Context())
+	// Run detached from the request (bounded): a client that hangs up, or
+	// a coordinator slow enough to outlast the request, must not cut the
+	// pass short.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+	renewed, retracted := hr.RenewHolders(ctx)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]int{"renewed": renewed, "retracted": retracted})
 }

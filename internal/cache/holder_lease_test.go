@@ -268,3 +268,25 @@ func TestPendingRetractionSkipsRelanded(t *testing.T) {
 		t.Fatal("pending entry kept for a re-landed file")
 	}
 }
+
+// A renewal pass cancelled before its retraction step keeps the retraction
+// pending (it used to skip the path and forget it).
+func TestCancelledPassKeepsRetraction(t *testing.T) {
+	cm, coord := leaseTestManager(t)
+	ctx := context.Background()
+	seedNVMe(t, cm, "/m/c.bin", 100, true, time.Minute)
+	cm.publishFileLocation(ctx, &CacheEntry{FilePath: "/m/c.bin", Size: 100}, TierNVMe)
+	cm.mu.Lock()
+	cm.entries.del("/m/c.bin")
+	cm.mu.Unlock()
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	cm.RenewHolders(cctx)
+	if n := cm.HolderLeaseStats().PendingRetractions; n != 1 {
+		t.Fatalf("pending = %d after a cancelled pass, want 1", n)
+	}
+	cm.RenewHolders(ctx)
+	if coord.row("/m/c.bin") != nil {
+		t.Fatal("retraction not sent on the next pass")
+	}
+}
