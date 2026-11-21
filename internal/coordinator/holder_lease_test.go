@@ -22,8 +22,8 @@ func TestLateRetractionKeepsNewerAdmission(t *testing.T) {
 	ctx := context.Background()
 	cs := leaseService()
 	exp := time.Now().Add(time.Hour)
-	_ = cs.UpdateFileLocation(ctx, nvmeRow("/m", "a", 5, exp)) // admission 5
-	_ = cs.UpdateFileLocation(ctx, nvmeRow("/m", "a", 7, exp)) // evicted, re-admitted as 7
+	_ = cs.UpdateFileLocation(ctx, nvmeRow("/m", "a", 5, exp))                      // admission 5
+	_ = cs.UpdateFileLocation(ctx, nvmeRow("/m", "a", 7, exp))                      // evicted, re-admitted as 7
 	if err := cs.DeletePeerTierLocationGen(ctx, "/m", "a", "nvme", 5); err != nil { // late notice for 5
 		t.Fatal(err)
 	}
