@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,6 +154,10 @@ func (h *Handler) maybeStartPeerFill(r *http.Request, entry *cache.CacheEntry, h
 	if h.regFill.enabled.Load() {
 		if u, ok := registryFillSource(r, hexDigest); ok && h.regFill.hostAllowed(u.Host) {
 			reg, auth = u, r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") {
+				// Resolved lazily on the first hedged unit (fetchPeerUnit).
+				auth = "unresolved:" + auth
+			}
 		}
 	}
 
@@ -329,6 +334,9 @@ func (h *Handler) fetchPeerUnit(ctx context.Context, src peerBlobSource, entry *
 	}
 	if reg == nil {
 		return lastErr
+	}
+	if raw, ok := strings.CutPrefix(auth, "unresolved:"); ok {
+		auth = h.regFill.resolveFillAuth(ctx, reg, raw)
 	}
 	if err := h.regFill.fetchUnit(ctx, reg, auth, lf, u, nil); err != nil {
 		return fmt.Errorf("unit %d: peers: %v; registry: %w", u, lastErr, err)
