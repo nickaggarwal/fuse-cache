@@ -74,7 +74,9 @@ type node struct {
 	alive   bool
 	readers int // concurrent peer readers right now (contention)
 	nextGen int
-	running map[int]bool // deployments running (pins their layers)
+	running map[int]bool    // deployments running (pins their layers)
+	owned   map[string]bool // ring: chunks this node owns and has filled
+	ownedMB float64
 }
 
 type cluster struct {
@@ -106,6 +108,9 @@ type config struct {
 	hours, startsPerHour, leaseSec, renewSec   float64
 	reconcileSec, failAt, failFrac, partition  float64
 	capMB, maxReplicateMB                      float64
+	ring                                       bool    // rendezvous-hash chunk placement
+	ringR                                      int     // owners per chunk
+	chunkMB                                    float64 // ring placement unit
 	pinRunning, leases                         bool
 	scenario                                   string
 	seed                                       int64
@@ -123,6 +128,9 @@ func main() {
 	flag.Float64Var(&c.leaseSec, "lease-sec", 900, "holder lease")
 	flag.Float64Var(&c.renewSec, "renew-sec", 300, "holder renewal interval")
 	flag.Float64Var(&c.reconcileSec, "reconcile-sec", 20, "replica reconcile interval")
+	flag.BoolVar(&c.ring, "ring", false, "rendezvous-hash placement: each chunk has ringR owners computed from the live node set; reads go to owners first, owners fill and keep their chunks")
+	flag.IntVar(&c.ringR, "ring-r", 2, "owners per chunk with -ring")
+	flag.Float64Var(&c.chunkMB, "chunk-mb", 16, "placement unit with -ring")
 	flag.Float64Var(&c.maxReplicateMB, "max-replicate-mb", 64, "largest object the reconciler copies (the client's reconcileMaxObjectBytes); larger layers spread only by being read")
 	flag.Float64Var(&c.failAt, "fail-at-hour", 3, "hour at which a group of nodes fails (negative: never)")
 	flag.Float64Var(&c.failFrac, "fail-frac", 0.25, "fraction of nodes that fail")
@@ -160,6 +168,11 @@ func runScenarios(base config, out string) {
 		{"burst-4x", func(c *config) { c.startsPerHour *= 4 }},
 		{"fail-50pct", func(c *config) { c.failFrac = 0.5 }},
 		{"replicate-all", func(c *config) { c.maxReplicateMB = 1 << 30 }},
+		{"ring-r2", func(c *config) { c.ring = true; c.ringR = 2 }},
+		{"ring-r3", func(c *config) { c.ring = true; c.ringR = 3 }},
+		{"ring-r2-tight", func(c *config) { c.ring = true; c.ringR = 2; c.capMB = 30 }},
+		{"ring-r2-fail50", func(c *config) { c.ring = true; c.ringR = 2; c.failFrac = 0.5 }},
+		{"ring-r2-burst4x", func(c *config) { c.ring = true; c.ringR = 2; c.startsPerHour *= 4 }},
 	}
 	fmt.Printf("%-16s %6s %6s %6s %6s %7s %7s %6s %6s %7s %7s %6s\n", "scenario", "starts", "local", "peer", "reg", "p50 s", "p95 s", "evict", "evMiss", "copies", "peakCp", "stale")
 	for _, s := range scs {
@@ -196,7 +209,7 @@ func newCluster(c config) *cluster {
 		if f == "L8s_v4" {
 			capMB *= 4 // 1.75 TiB NVMe vs 440 GiB
 		}
-		cl.nodes = append(cl.nodes, &node{id: i, family: f, capMB: capMB, lru: map[string]float64{}, alive: true, running: map[int]bool{}})
+		cl.nodes = append(cl.nodes, &node{id: i, family: f, capMB: capMB, lru: map[string]float64{}, alive: true, running: map[int]bool{}, owned: map[string]bool{}})
 	}
 	return cl
 }
@@ -355,6 +368,11 @@ func (cl *cluster) start(n *node, m int) startRec {
 		if cl.stats["evicted:"+l.id] > 0 {
 			rec.missEvicted = true
 		}
+		if cl.cfg.ring {
+			secs += cl.ringRead(n, l, &rec, srcs)
+			cl.admit(n, l)
+			continue
+		}
 		if h := cl.liveHolder(l.id, n.id); h != nil {
 			h.readers++
 			rate := peerMBps / (1 + contentionStep*float64(h.readers-1))
@@ -385,6 +403,96 @@ func (cl *cluster) start(n *node, m int) startRec {
 		rec.src = "peer"
 	}
 	return rec
+}
+
+// Ring placement (rendezvous hashing).
+//
+// Each chunk of a layer has ringR owners: the live nodes with the highest
+// hash(node, chunk) weighted by NVMe size. A reader fetches each chunk from
+// its owners in parallel across chunks, so one layer is served by many
+// nodes instead of the one that happened to fetch it first. An owner that
+// lacks its chunk fills it from the registry (once: owners keep owned chunks
+// in a reserved share of NVMe, outside the LRU working set).
+
+func (cl *cluster) owners(layerID string, chunk int) []*node {
+	type sc struct {
+		n *node
+		s float64
+	}
+	var all []sc
+	for _, n := range cl.nodes {
+		if !n.alive {
+			continue
+		}
+		h := fnv64(fmt.Sprintf("%d|%s|%d", n.id, layerID, chunk))
+		u := (float64(h>>11) + 0.5) / float64(1<<53)
+		all = append(all, sc{n, -n.capMB / math.Log(u)}) // weighted rendezvous
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].s > all[j].s })
+	out := []*node{}
+	for i := 0; i < len(all) && i < cl.cfg.ringR; i++ {
+		out = append(out, all[i].n)
+	}
+	return out
+}
+
+// ringRead reads layer l for a start on n and returns the seconds it took.
+// Chunks are fetched in parallel (16 streams), each from its least-loaded
+// owner; the layer takes as long as the busiest source's share.
+func (cl *cluster) ringRead(n *node, l *layer, rec *startRec, srcs map[string]bool) float64 {
+	chunks := int(math.Ceil(l.sizeMB / cl.cfg.chunkMB))
+	perSource := map[int]float64{} // node id (-1 = registry) -> MB
+	for c := 0; c < chunks; c++ {
+		mb := math.Min(cl.cfg.chunkMB, l.sizeMB-float64(c)*cl.cfg.chunkMB)
+		key := fmt.Sprintf("%s#%d", l.id, c)
+		var src *node
+		for _, o := range cl.owners(l.id, c) {
+			if o.id == n.id {
+				continue
+			}
+			if src == nil || o.readers < src.readers {
+				src = o
+			}
+		}
+		if src != nil && !src.owned[key] {
+			// owner fills its chunk first (from the registry), then serves
+			perSource[-1] += mb
+			src.owned[key] = true
+			src.ownedMB += mb
+			cl.stats["ring_owner_fills_mb"] += mb
+		}
+		if src == nil {
+			perSource[-1] += mb
+			continue
+		}
+		perSource[src.id] += mb
+	}
+	worst := 0.0
+	for id, mb := range perSource {
+		if id < 0 {
+			rec.bytesReg += mb
+			srcs["registry"] = true
+			worst = math.Max(worst, mb/registryMBps)
+			continue
+		}
+		h := cl.nodes[id]
+		h.readers++
+		rate := peerMBps / (1 + contentionStep*float64(h.readers-1))
+		worst = math.Max(worst, mb/rate+peerReadSec*mb/8)
+		h.readers--
+		rec.bytesPeer += mb
+		srcs["peer"] = true
+	}
+	return worst
+}
+
+func fnv64(s string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 func (cl *cluster) liveHolder(id string, except int) *node {
