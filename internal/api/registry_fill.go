@@ -93,6 +93,10 @@ type registryFiller struct {
 	servedBytes atomic.Int64
 	serveMiss   atomic.Int64
 	waitNanos   atomic.Int64
+	// Token exchange for credentials the registry rejects (registry_auth.go).
+	tokens         registryTokens
+	tokenExchanges atomic.Int64
+	tokenFailures  atomic.Int64
 }
 
 // blobFillCommitter is the cache side of a fill: stage, commit, and mark
@@ -124,6 +128,7 @@ type RegistryFillStats struct {
 	ServedReads, ServedBytes, ServeMiss                    int64
 	ServeWaitSec                                           float64
 	Inflight                                               int
+	TokenExchanges, TokenFailures                          int64
 }
 
 func (h *Handler) registryFillStats() RegistryFillStats {
@@ -135,7 +140,8 @@ func (h *Handler) registryFillStats() RegistryFillStats {
 		Started: f.started.Load(), Completed: f.completed.Load(), Failed: f.failed.Load(),
 		Rejected: f.rejected.Load(), LeaseLost: f.leaseLost.Load(), Bytes: f.bytes.Load(), Inflight: n,
 		ServedReads: f.servedReads.Load(), ServedBytes: f.servedBytes.Load(), ServeMiss: f.serveMiss.Load(),
-		ServeWaitSec: time.Duration(f.waitNanos.Load()).Seconds(),
+		ServeWaitSec:   time.Duration(f.waitNanos.Load()).Seconds(),
+		TokenExchanges: f.tokenExchanges.Load(), TokenFailures: f.tokenFailures.Load(),
 	}
 }
 
@@ -268,6 +274,7 @@ func (h *Handler) runRegistryFill(src *url.URL, auth, hexDigest string) error {
 	if !ok {
 		return errors.New("cache cannot stage files")
 	}
+	auth = f.resolveFillAuth(ctx, src, auth)
 	size, err := f.blobSize(ctx, src, auth)
 	if err != nil {
 		return fmt.Errorf("registry size: %w", err)

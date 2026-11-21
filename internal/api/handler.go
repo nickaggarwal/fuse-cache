@@ -1229,6 +1229,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_registry_fill_served_bytes_total %d\n", rf.ServedBytes)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_miss_total %d\n", rf.ServeMiss)
 	fmt.Fprintf(w, "fuse_registry_fill_serve_wait_seconds_total %.3f\n", rf.ServeWaitSec)
+	fmt.Fprintf(w, "fuse_registry_fill_token_exchanges_total %d\n", rf.TokenExchanges)
+	fmt.Fprintf(w, "fuse_registry_fill_token_failures_total %d\n", rf.TokenFailures)
 	h.blobReads.write(w)
 	pf := h.peerFillStats()
 	fmt.Fprintf(w, "fuse_peer_fill_started_total %d\n", pf.Started)
