@@ -1101,6 +1101,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_holder_vanished_total %d\n", hl.Vanished)
 	fmt.Fprintf(w, "fuse_holder_retractions_pending %d\n", hl.PendingRetractions)
 	fmt.Fprintf(w, "fuse_holder_retractions_pending_landed_total %d\n", hl.PendingRetried)
+	fmt.Fprintf(w, "fuse_holder_audit_removed_total %d\n", hl.AuditRemoved)
+	fmt.Fprintf(w, "fuse_holder_audit_failed_total %d\n", hl.AuditFailed)
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)
@@ -1143,6 +1145,7 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_replica_reconcile_heat_boosts_total %d\n", hc.ReconcileHeatBoostsTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_busy_total %d\n", hc.ReconcileSkippedBusyTotal)
 	fmt.Fprintf(w, "fuse_replica_reconcile_skipped_slots_total %d\n", hc.ReconcileSkippedSlotsTotal)
+	fmt.Fprintf(w, "fuse_replica_reconcile_pulls_total %d\n", hc.ReconcilePullsTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retries_total %d\n", hc.BusyChunkRetriesTotal)
 	fmt.Fprintf(w, "fuse_busy_chunk_retry_hits_total %d\n", hc.BusyChunkRetryHitsTotal)
 	// Declarative warmup reconciliation. rewarms/files_warmed climbing in

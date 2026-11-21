@@ -117,6 +117,8 @@ func (cm *DefaultCacheManager) SetCoordinatorCapabilities(caps []string) {
 			reports = true
 		case "holder-lease":
 			leases = true
+		case "holder-audit":
+			cm.holders.audit.Store(true)
 		}
 	}
 	cm.evictRetract.enabled.Store(has)

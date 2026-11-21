@@ -290,3 +290,18 @@ func TestCancelledPassKeepsRetraction(t *testing.T) {
 		t.Fatal("retraction not sent on the next pass")
 	}
 }
+
+// Partial holders do not count toward the replica target.
+func TestReplicaHoldersSkipPartial(t *testing.T) {
+	cm, coord := leaseTestManager(t)
+	coord.seed(&coordinator.FileLocation{FilePath: "/m/w.bin", PeerID: "whole", StorageTier: "nvme"})
+	coord.seed(&coordinator.FileLocation{FilePath: "/m/w.bin", PeerID: "part", StorageTier: "nvme", Partial: true})
+	coord.seed(&coordinator.FileLocation{FilePath: "/m/w.bin", PeerID: "durable", StorageTier: "cloud"})
+	h, err := cm.replicaHolders(context.Background(), "/m/w.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h["whole"]; !ok || len(h) != 1 {
+		t.Fatalf("holders = %v, want only the whole copy", h)
+	}
+}

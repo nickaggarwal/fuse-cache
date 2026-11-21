@@ -240,6 +240,43 @@ type GenLocationDeleter interface {
 	DeletePeerTierLocationGen(ctx context.Context, filePath, peerID, tier string, generation uint64) error
 }
 
+// HolderAuditor sends a node's inventory to the coordinator's holder audit.
+type HolderAuditor interface {
+	AuditHolder(ctx context.Context, req HolderAuditRequest) (HolderAuditResult, error)
+}
+
+func (cc *CoordinatorClient) AuditHolder(ctx context.Context, req HolderAuditRequest) (HolderAuditResult, error) {
+	return auditHolderHTTP(ctx, cc.client, cc.addr, req)
+}
+
+// AuditHolder rides the HTTP fallback path, like fetch leases.
+func (c *GRPCCoordinatorClient) AuditHolder(ctx context.Context, req HolderAuditRequest) (HolderAuditResult, error) {
+	return auditHolderHTTP(ctx, c.httpClient, c.httpAddr, req)
+}
+
+func auditHolderHTTP(ctx context.Context, client *http.Client, addr string, req HolderAuditRequest) (HolderAuditResult, error) {
+	var res HolderAuditResult
+	body, err := json.Marshal(req)
+	if err != nil {
+		return res, err
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://%s/api/holders/audit", addr), bytes.NewReader(body))
+	if err != nil {
+		return res, err
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(hreq)
+	if err != nil {
+		return res, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+		return res, fmt.Errorf("holder audit: http %d: %s", resp.StatusCode, b)
+	}
+	return res, json.NewDecoder(resp.Body).Decode(&res)
+}
+
 func (cc *CoordinatorClient) DeletePeerTierLocationGen(ctx context.Context, filePath, peerID, tier string, generation uint64) error {
 	url := fmt.Sprintf("http://%s/api/files/location?path=%s&peer_id=%s&storage_tier=%s&generation=%d", cc.addr,
 		neturl.QueryEscape(filePath), neturl.QueryEscape(peerID), neturl.QueryEscape(tier), generation)
