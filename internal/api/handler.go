@@ -237,6 +237,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/intents", h.handleWarmIntentList).Methods("GET")
 	router.HandleFunc("/api/cache/intents", h.handleWarmIntentCreate).Methods("POST")
 	router.HandleFunc("/api/cache/intents/reconcile", h.handleWarmIntentReconcile).Methods("POST")
+	router.HandleFunc("/api/holders/renew", h.handleHolderRenew).Methods("POST")
 	router.HandleFunc("/api/cache/intents/{volumeID}", h.handleWarmIntentDelete).Methods("DELETE")
 	h.registerModelKVRoutes(router)
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")
@@ -1098,6 +1099,8 @@ func (h *Handler) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "fuse_holder_retract_retries_total %d\n", hl.RetractRetried)
 	fmt.Fprintf(w, "fuse_holder_reconcile_retracted_total %d\n", hl.ReconcileRetracted)
 	fmt.Fprintf(w, "fuse_holder_vanished_total %d\n", hl.Vanished)
+	fmt.Fprintf(w, "fuse_holder_retractions_pending %d\n", hl.PendingRetractions)
+	fmt.Fprintf(w, "fuse_holder_retractions_pending_landed_total %d\n", hl.PendingRetried)
 
 	tp := dcm.TierPerfSnapshot()
 	fmt.Fprintf(w, "fuse_tier_peer_read_latency_ms %.3f\n", tp.PeerLatencyMs)

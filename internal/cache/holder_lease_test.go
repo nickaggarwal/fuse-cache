@@ -231,3 +231,40 @@ func TestRenewHoldersDropsVanishedFile(t *testing.T) {
 		t.Fatal("vanished entry kept in the index")
 	}
 }
+
+// A retraction that fails every attempt is kept and lands on a later
+// renewal pass once the coordinator is back, not dropped.
+func TestFailedRetractionRetriedNextPass(t *testing.T) {
+	cm, coord := leaseTestManager(t)
+	coord.seed(&coordinator.FileLocation{FilePath: "/m/p.bin", PeerID: "peer-a", StorageTier: "nvme", Generation: 9})
+	coord.failFirst.Store(1 << 20) // coordinator down
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // no backoff waits: one attempt, then give up
+	cm.retractHolder(ctx, "/m/p.bin", 9)
+	if n := cm.HolderLeaseStats().PendingRetractions; n != 1 {
+		t.Fatalf("pending = %d, want 1 after a failed retraction", n)
+	}
+	coord.failFirst.Store(0) // coordinator back
+	cm.RenewHolders(context.Background())
+	if coord.row("/m/p.bin") != nil {
+		t.Fatal("pending retraction not sent on the next pass")
+	}
+	if s := cm.HolderLeaseStats(); s.PendingRetractions != 0 || s.PendingRetried != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+// A pending retraction for a path held again is dropped, not sent.
+func TestPendingRetractionSkipsRelanded(t *testing.T) {
+	cm, coord := leaseTestManager(t)
+	cm.holders.keepPending("/m/back.bin", 3)
+	seedNVMe(t, cm, "/m/back.bin", 100, true, time.Minute)
+	coord.seed(&coordinator.FileLocation{FilePath: "/m/back.bin", PeerID: "peer-a", StorageTier: "nvme", Generation: 4})
+	cm.retryPendingRetractions(context.Background())
+	if coord.row("/m/back.bin") == nil {
+		t.Fatal("retracted the row of a file held again")
+	}
+	if cm.HolderLeaseStats().PendingRetractions != 0 {
+		t.Fatal("pending entry kept for a re-landed file")
+	}
+}
