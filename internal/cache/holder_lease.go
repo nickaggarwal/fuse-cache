@@ -62,8 +62,14 @@ type holderLeases struct {
 	pub     map[string]bool   // path -> a row is published for it
 	enabled atomic.Bool       // coordinator advertises "holder-lease"
 
+	// pendingRetract holds retractions that failed every attempt (the
+	// coordinator was unreachable): path -> generation. Each renewal pass
+	// retries them, so a retraction is never dropped while the node runs.
+	pendingRetract map[string]uint64
+
 	renewed, retractRetried, reconcileRetracted, renewPasses atomic.Int64
 	vanished                                                 atomic.Int64 // index entries whose file was gone
+	pendingRetried                                           atomic.Int64 // retractions that landed on a later pass
 }
 
 // admit returns the generation of path's current admission, starting a new
@@ -185,6 +191,7 @@ func (cm *DefaultCacheManager) retractHolder(ctx context.Context, path string, g
 			cm.holders.retractRetried.Add(1)
 			select {
 			case <-ctx.Done():
+				cm.holders.keepPending(path, gen) // not sent: retry next pass
 				return false
 			case <-time.After(jitteredDuration(backoff)):
 			}
@@ -208,7 +215,61 @@ func (cm *DefaultCacheManager) retractHolder(ctx context.Context, path string, g
 		}
 	}
 	cm.metrics.EvictRetractFailed.Add(1)
+	cm.holders.keepPending(path, gen)
 	return false
+}
+
+// keepPending records a retraction to retry; a newer generation for the
+// same path replaces an older one.
+func (h *holderLeases) keepPending(path string, gen uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingRetract == nil {
+		h.pendingRetract = map[string]uint64{}
+	}
+	if old, ok := h.pendingRetract[path]; !ok || gen > old {
+		h.pendingRetract[path] = gen
+	}
+}
+
+// takePending returns and clears the pending retractions.
+func (h *holderLeases) takePending() map[string]uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := h.pendingRetract
+	h.pendingRetract = nil
+	return out
+}
+
+// retryPendingRetractions sends every retraction that failed before, one
+// attempt each; a failure goes back to pending for the next pass. A path
+// held again since is dropped: its newer row is true.
+func (cm *DefaultCacheManager) retryPendingRetractions(ctx context.Context) int {
+	gd, okGen := cm.config.Coordinator.(coordinator.GenLocationDeleter)
+	if !okGen {
+		return 0
+	}
+	n := 0
+	for path, gen := range cm.holders.takePending() {
+		if ctx.Err() != nil {
+			cm.holders.keepPending(path, gen)
+			continue
+		}
+		if cm.holdsLocally(path) {
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(ctx, retractCallTimeout)
+		err := gd.DeletePeerTierLocationGen(callCtx, path, cm.config.LocalPeerID, "nvme", gen)
+		cancel()
+		if err != nil {
+			cm.holders.keepPending(path, gen)
+			continue
+		}
+		cm.metrics.EvictRetracted.Add(1)
+		cm.holders.pendingRetried.Add(1)
+		n++
+	}
+	return n
 }
 
 // startHolderRenewer runs the renewal and reconcile loop.
@@ -242,6 +303,7 @@ func (cm *DefaultCacheManager) startHolderRenewer() {
 // longer holds. Returns (renewed, retracted).
 func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 	cm.holders.renewPasses.Add(1)
+	cm.retryPendingRetractions(ctx)
 	held := cm.localHolderPaths()
 	renewed := 0
 	for path, e := range held {
@@ -263,17 +325,23 @@ func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 		if renewed%holderRenewBatch == 0 {
 			select {
 			case <-ctx.Done():
-				return renewed, 0
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}
 	retracted := 0
 	for path := range cm.holders.snapshot() {
-		if _, ok := held[path]; ok || ctx.Err() != nil {
+		if _, ok := held[path]; ok {
 			continue
 		}
+		// No longer held: end the admission whatever happens next. A pass
+		// cut short (cancelled, coordinator unreachable) keeps the
+		// retraction pending for the next pass instead of forgetting it.
 		gen := cm.holders.evicted(path)
+		if ctx.Err() != nil {
+			cm.holders.keepPending(path, gen)
+			continue
+		}
 		if cm.retractHolder(ctx, path, gen) {
 			retracted++
 			cm.holders.reconcileRetracted.Add(1)
@@ -357,17 +425,20 @@ type HolderLeaseStats struct {
 	Published                                                int
 	Renewed, RetractRetried, ReconcileRetracted, RenewPasses int64
 	Vanished                                                 int64
+	PendingRetractions                                       int
+	PendingRetried                                           int64
 }
 
 // HolderLeaseStats returns renewal counters.
 func (cm *DefaultCacheManager) HolderLeaseStats() HolderLeaseStats {
 	cm.holders.mu.Lock()
 	n := len(cm.holders.pub)
+	np := len(cm.holders.pendingRetract)
 	cm.holders.mu.Unlock()
 	return HolderLeaseStats{
 		Enabled: cm.holders.enabled.Load(), Published: n,
 		Renewed: cm.holders.renewed.Load(), RetractRetried: cm.holders.retractRetried.Load(),
 		ReconcileRetracted: cm.holders.reconcileRetracted.Load(), RenewPasses: cm.holders.renewPasses.Load(),
-		Vanished: cm.holders.vanished.Load(),
+		Vanished: cm.holders.vanished.Load(), PendingRetractions: np, PendingRetried: cm.holders.pendingRetried.Load(),
 	}
 }

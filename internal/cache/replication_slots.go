@@ -31,7 +31,11 @@ const (
 	// defaultReplicationSlots caps simultaneous replications cluster-wide.
 	defaultReplicationSlots = 16
 	// replicationSlotTTL bounds a slot held by a node that dies mid-copy.
-	replicationSlotTTL = 2 * time.Minute
+	// The coordinator caps fetch leases at 60 s, so a longer copy renews
+	// its slot every replicationSlotRenew (re-acquiring one's own lease
+	// extends it).
+	replicationSlotTTL   = 60 * time.Second
+	replicationSlotRenew = 20 * time.Second
 )
 
 func (cm *DefaultCacheManager) replicationSlots() int {
@@ -67,14 +71,32 @@ func (cm *DefaultCacheManager) acquireReplicationSlot(ctx context.Context) (rele
 		if !cm.slotsHeld.claim(slot) {
 			continue
 		}
-		granted, rel := cm.TryOriginLease(ctx, fmt.Sprintf("replication-slot/%d", slot), replicationSlotTTL)
+		key := fmt.Sprintf("replication-slot/%d", slot)
+		granted, rel := cm.TryOriginLease(ctx, key, replicationSlotTTL)
 		if !granted {
 			cm.slotsHeld.drop(slot)
 			continue
 		}
+		stop := make(chan struct{})
+		go func() {
+			t := time.NewTicker(replicationSlotRenew)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					cm.TryOriginLease(ctx, key, replicationSlotTTL) // own lease: renews
+				}
+			}
+		}()
+		var once sync.Once
 		return func() {
-			rel()
-			cm.slotsHeld.drop(slot)
+			once.Do(func() {
+				close(stop)
+				rel()
+				cm.slotsHeld.drop(slot)
+			})
 		}, true
 	}
 	return nil, false

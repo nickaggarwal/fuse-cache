@@ -89,3 +89,23 @@ func TestReplicationSlotsDisabled(t *testing.T) {
 		}
 	}
 }
+
+// Release is idempotent and frees the slot for others.
+func TestReplicationSlotReleaseIdempotent(t *testing.T) {
+	coord := &slotCoordinator{deleteCoordinator: newDeleteCoordinator()}
+	cm := evictTestManager(t, 10_000)
+	cm.config.Coordinator = coord
+	cm.config.LocalPeerID = "a"
+	cm.config.ReplicationSlots = 1
+	rel, ok := cm.acquireReplicationSlot(context.Background())
+	if !ok {
+		t.Fatal("no slot")
+	}
+	rel()
+	rel()
+	if rel2, ok := cm.acquireReplicationSlot(context.Background()); !ok {
+		t.Fatal("slot not freed")
+	} else {
+		rel2()
+	}
+}

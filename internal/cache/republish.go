@@ -61,6 +61,12 @@ func (cm *DefaultCacheManager) RepublishLocal(ctx context.Context) int {
 		if e == nil || e.Size <= 0 || e.Tier != TierNVMe || strings.Contains(e.FilePath, "_chunk_") {
 			continue
 		}
+		// The index can outlive the bytes (deleted outside the process):
+		// never announce a copy that is not on disk.
+		if !cm.onDisk(e.FilePath) {
+			cm.forgetVanished(e.FilePath)
+			continue
+		}
 		if blobDigestFromPath(e.FilePath) != "" {
 			full := filepath.Join(cm.config.NVMePath, strings.TrimPrefix(e.FilePath, "/"))
 			if cm.blobLocalVerdict(ctx, e.FilePath, full, false) != blobGood {
