@@ -398,6 +398,16 @@ container reads a file in the image
   request named, so a slow or lost holder costs at most one timeout per
   unit. `-peer-fill=false` restores one peer round trip per nydusd read.
   Metrics: `fuse_peer_fill_*`, with units by source (peer / registry).
+- **Holder rows say who holds a file now.** Against a coordinator that
+  advertises `holder-lease`, every local-copy row carries a generation, a
+  lease and whether the node holds the whole file or only some chunks
+  (`partial`). Eviction retracts only the generation it evicted, retried
+  with backoff, so a late notice cannot remove a copy admitted again.
+  Every `-holder-renew-sec` (300) a node renews what it holds and retracts
+  what it no longer does; a node that stops renewing (crash, partition) has
+  its rows hidden once the lease (`-holder-lease-sec`, 900) lapses and swept
+  2 minutes later. Rows from older clients never expire. Metrics:
+  `fuse_holder_*`; coordinator `GET /api/leases`.
 - **Every blob read is profiled.** `fuse_blob_read_seconds{path}` times each
   nydusd read by the path that answered it: `local` (a whole local copy or
   local chunks), `fill` (a fill in progress), `remote` (per-chunk store,
