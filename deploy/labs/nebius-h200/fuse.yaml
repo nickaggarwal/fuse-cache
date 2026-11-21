@@ -1,0 +1,133 @@
+# Fuse cache on one Nebius cluster (namespace skyfuse): coordinator + store on
+# the CPU node, fuse client on the H200 node with kernel passthrough, both
+# backed by the Nebius S3 bucket. Rendered by stack.sh:
+#   __FUSE__ (fuse-client image), __PREFIX__ (bucket key prefix, per cluster),
+#   __BUCKET__, __S3_ENDPOINT__, __REGION__.
+#
+# No local NVMe on these presets: the cache is the node's boot disk
+# (network_ssd_non_replicated, 1023 GiB), at /var/lib/skyfuse on the host.
+apiVersion: v1
+kind: Namespace
+metadata: {name: skyfuse}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: coordinator, namespace: skyfuse, labels: {app: coordinator}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: coordinator}}
+  template:
+    metadata: {labels: {app: coordinator}}
+    spec:
+      nodeSelector: {agentpool: system}
+      containers:
+        - name: coordinator
+          image: __FUSE__
+          command: [coordinator]
+          args: [-port, "8080", -grpc-port, "9080"]
+          ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 9080}]
+          readinessProbe: {httpGet: {path: /api/health, port: 8080}, periodSeconds: 5}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 1Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: coordinator, namespace: skyfuse}
+spec:
+  selector: {app: coordinator}
+  ports: [{name: http, port: 8080}, {name: grpc, port: 9080}]
+---
+# Shared client args: S3 backend, coordinator by ClusterIP (host-network pods
+# have no cluster DNS, so stack.sh fills __COORD__ with the service IP).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: fuse-store, namespace: skyfuse}
+spec:
+  selector: {matchLabels: {app: fuse-store}}
+  template:
+    metadata: {labels: {app: fuse-store}}
+    spec:
+      nodeSelector: {agentpool: system}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: client
+          image: __FUSE__
+          command: [client]
+          args: [-mount=/host/fusemnt, -nvme=/host/cache, -nvme-max-gb=380, -chunk-size=16, -max-upload-gb=32,
+                 -coordinator=__COORD__:8080, -coordinator-grpc=__COORD__:9080,
+                 -cloud-provider=s3, -s3-bucket=__BUCKET__, -s3-region=__REGION__, -s3-endpoint=__S3_ENDPOINT__,
+                 -s3-force-path-style, -global-read, -enable-agent-server=false, -port=8081, -grpc-port=9081,
+                 "-peer-id=$(NODE_NAME)", "-peer-labels=fuse.skycontrol.io/role=store"]
+          env:
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: NODE_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+            - {name: FUSE_CLOUD_KEY_PREFIX, value: "__PREFIX__"}
+            - {name: FUSE_BACKEND, value: gofuse}
+            - {name: FUSE_GOFUSE_DIRECT_MOUNT, value: "1"}
+          envFrom: [{secretRef: {name: s3}}]
+          securityContext: {privileged: true}
+          resources: {requests: {cpu: "1", memory: 2Gi}, limits: {memory: 16Gi}}
+          readinessProbe: {httpGet: {path: /api/health, port: 8081}, periodSeconds: 10}
+          volumeMounts:
+            - {name: host, mountPath: /host, mountPropagation: Bidirectional}
+            - {name: devfuse, mountPath: /dev/fuse}
+      volumes:
+        - {name: host, hostPath: {path: /var/lib/skyfuse-store, type: DirectoryOrCreate}}
+        - {name: devfuse, hostPath: {path: /dev/fuse}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: fuse-gpu, namespace: skyfuse}
+spec:
+  selector: {matchLabels: {app: fuse-gpu}}
+  template:
+    metadata: {labels: {app: fuse-gpu}}
+    spec:
+      nodeSelector: {agentpool: model}
+      tolerations: [{operator: Exists}]
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: client
+          image: __FUSE__
+          command: [client]
+          # Port 18081 on the host (hostNetwork): nydusd's registry proxy is
+          # http://127.0.0.1:18081, served by the Rust store-front below;
+          # the Go client listens pod-local on 18082.
+          args: [-mount=/host/fusemnt, -nvme=/host/cache, -nvme-max-gb=380, -chunk-size=16, -max-upload-gb=32,
+                 -coordinator=__COORD__:8080, -coordinator-grpc=__COORD__:9080,
+                 -cloud-provider=s3, -s3-bucket=__BUCKET__, -s3-region=__REGION__, -s3-endpoint=__S3_ENDPOINT__,
+                 -s3-force-path-style, -global-read, -enable-agent-server=false,
+                 -port=18082, -advertise-port=18081, -grpc-port=9081,
+                 "-peer-id=$(NODE_NAME)"]
+          env:
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: NODE_IP, valueFrom: {fieldRef: {fieldPath: status.hostIP}}}
+            - {name: FUSE_CLOUD_KEY_PREFIX, value: "__PREFIX__"}
+            # go-fuse backend: passthrough exists only there (the default
+            # backend is bazil, which has none). Kernel passthrough for reads
+            # of whole local copies (kernel 6.11 >= 6.9).
+            - {name: FUSE_BACKEND, value: gofuse}
+            - {name: FUSE_GOFUSE_ENABLE_PASSTHROUGH, value: "1"}
+            - {name: FUSE_GOFUSE_DIRECT_MOUNT, value: "1"}
+          envFrom: [{secretRef: {name: s3}}]
+          securityContext: {privileged: true}
+          resources: {requests: {cpu: "2", memory: 1Gi}, limits: {memory: 8Gi}}
+          readinessProbe: {httpGet: {path: /api/health, port: 18082}, periodSeconds: 10}
+          volumeMounts:
+            - {name: host, mountPath: /host, mountPropagation: Bidirectional}
+            - {name: devfuse, mountPath: /dev/fuse}
+        - name: front
+          image: __FRONT__
+          args: [--listen=0.0.0.0:18081, --backend=127.0.0.1:18082, --cache-dir=/host/cache,
+                 "--coordinator=__COORD__:8080"]
+          volumeMounts:
+            - {name: host, mountPath: /host, readOnly: true, mountPropagation: HostToContainer}
+          livenessProbe: {httpGet: {path: /rust/healthz, port: 18081}, periodSeconds: 10}
+          readinessProbe: {httpGet: {path: /rust/readyz, port: 18081}, periodSeconds: 5}
+          resources: {requests: {cpu: 500m, memory: 128Mi}, limits: {memory: 1Gi}}
+      volumes:
+        - {name: host, hostPath: {path: /var/lib/skyfuse, type: DirectoryOrCreate}}
+        - {name: devfuse, hostPath: {path: /dev/fuse}}
