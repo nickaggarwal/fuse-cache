@@ -42,6 +42,7 @@ type herdControlStats struct {
 	reconcileReplications atomic.Int64
 	reconcileSkippedBusy  atomic.Int64
 	reconcileSkippedSlots atomic.Int64 // cluster-wide replication slots full
+	reconcilePulls        atomic.Int64 // large objects peers were asked to pull
 	reconcileHeatBoosts   atomic.Int64
 	// Declarative warmup reconciliation (warm_reconciler.go): passes run,
 	// passes that had to move bytes, files re-warmed, passes cut short by
@@ -69,6 +70,7 @@ type HerdControlSnapshot struct {
 	ReconcileReplicationsTotal int64
 	ReconcileSkippedBusyTotal  int64
 	ReconcileSkippedSlotsTotal int64
+	ReconcilePullsTotal        int64
 	ReconcileHeatBoostsTotal   int64
 	BusyChunkRetriesTotal      int64
 	BusyChunkRetryHitsTotal    int64
@@ -92,6 +94,7 @@ func (cm *DefaultCacheManager) HerdControlSnapshot() HerdControlSnapshot {
 		ReconcileReplicationsTotal: cm.herdStats.reconcileReplications.Load(),
 		ReconcileSkippedBusyTotal:  cm.herdStats.reconcileSkippedBusy.Load(),
 		ReconcileSkippedSlotsTotal: cm.herdStats.reconcileSkippedSlots.Load(),
+		ReconcilePullsTotal:        cm.herdStats.reconcilePulls.Load(),
 		ReconcileHeatBoostsTotal:   cm.herdStats.reconcileHeatBoosts.Load(),
 		BusyChunkRetriesTotal:      cm.herdStats.busyChunkRetries.Load(),
 		BusyChunkRetryHitsTotal:    cm.herdStats.busyChunkRetryHits.Load(),

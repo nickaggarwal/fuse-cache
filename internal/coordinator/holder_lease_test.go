@@ -121,3 +121,33 @@ func TestLeaseFieldsRoundTripProto(t *testing.T) {
 		t.Fatalf("zero lease became %v", z.ExpiresAt)
 	}
 }
+
+// The audit removes the node's rows for paths it does not report, keeps the
+// rows it does, and never touches other nodes' or cloud rows.
+func TestAuditHolderRemovesUnbackedRows(t *testing.T) {
+	ctx := context.Background()
+	cs := leaseService()
+	exp := time.Now().Add(time.Hour)
+	_ = cs.UpdateFileLocation(ctx, nvmeRow("/keep", "a", 1, exp))
+	_ = cs.UpdateFileLocation(ctx, nvmeRow("/lost", "a", 2, exp))
+	_ = cs.UpdateFileLocation(ctx, nvmeRow("/lost", "b", 3, exp))
+	_ = cs.UpdateFileLocation(ctx, &FileLocation{FilePath: "/lost", PeerID: "a", StorageTier: "cloud", FileSize: 10})
+	res, err := cs.AuditHolder(ctx, HolderAuditRequest{PeerID: "a", Paths: []string{"/keep"}})
+	if err != nil || res.Removed != 1 || res.Checked != 2 {
+		t.Fatalf("audit = %+v, %v; want 1 removed of 2 checked", res, err)
+	}
+	locs, _ := cs.GetFileLocation(ctx, "/lost")
+	tiers := map[string]bool{}
+	for _, l := range locs {
+		tiers[l.PeerID+"/"+l.StorageTier] = true
+	}
+	if tiers["a/nvme"] || !tiers["b/nvme"] || !tiers["a/cloud"] {
+		t.Fatalf("rows after audit = %v", tiers)
+	}
+	if l, _ := cs.GetFileLocation(ctx, "/keep"); len(l) != 1 {
+		t.Fatal("a reported row was removed")
+	}
+	if _, err := cs.AuditHolder(ctx, HolderAuditRequest{}); err == nil {
+		t.Fatal("audit without peer_id accepted")
+	}
+}

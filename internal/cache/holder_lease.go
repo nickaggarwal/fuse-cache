@@ -61,6 +61,9 @@ type holderLeases struct {
 	gen     map[string]uint64 // path -> generation of the current admission
 	pub     map[string]bool   // path -> a row is published for it
 	enabled atomic.Bool       // coordinator advertises "holder-lease"
+	audit   atomic.Bool       // coordinator advertises "holder-audit"
+
+	auditRemoved, auditFailed atomic.Int64
 
 	// pendingRetract holds retractions that failed every attempt (the
 	// coordinator was unreachable): path -> generation. Each renewal pass
@@ -330,6 +333,14 @@ func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 		}
 	}
 	retracted := 0
+	defer func() {
+		// Last: hand the coordinator this node's whole inventory, so it can
+		// drop rows the node no longer backs whose retraction was lost
+		// (coordinator/holder_lease.go, AuditHolder).
+		if ctx.Err() == nil {
+			cm.auditHolders(ctx, held)
+		}
+	}()
 	for path := range cm.holders.snapshot() {
 		if _, ok := held[path]; ok {
 			continue
@@ -348,6 +359,27 @@ func (cm *DefaultCacheManager) RenewHolders(ctx context.Context) (int, int) {
 		}
 	}
 	return renewed, retracted
+}
+
+// auditHolders sends the inventory to a coordinator advertising
+// "holder-audit".
+func (cm *DefaultCacheManager) auditHolders(ctx context.Context, held map[string]*CacheEntry) {
+	au, ok := cm.config.Coordinator.(coordinator.HolderAuditor)
+	if !ok || !cm.holders.audit.Load() {
+		return
+	}
+	paths := make([]string, 0, len(held))
+	for p := range held {
+		paths = append(paths, p)
+	}
+	actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res, err := au.AuditHolder(actx, coordinator.HolderAuditRequest{PeerID: cm.config.LocalPeerID, Paths: paths})
+	if err != nil {
+		cm.holders.auditFailed.Add(1)
+		return
+	}
+	cm.holders.auditRemoved.Add(int64(res.Removed))
 }
 
 // localHolderPaths returns parent paths this node holds on local NVMe, whole
@@ -427,6 +459,7 @@ type HolderLeaseStats struct {
 	Vanished                                                 int64
 	PendingRetractions                                       int
 	PendingRetried                                           int64
+	AuditRemoved, AuditFailed                                int64
 }
 
 // HolderLeaseStats returns renewal counters.
@@ -440,5 +473,6 @@ func (cm *DefaultCacheManager) HolderLeaseStats() HolderLeaseStats {
 		Renewed: cm.holders.renewed.Load(), RetractRetried: cm.holders.retractRetried.Load(),
 		ReconcileRetracted: cm.holders.reconcileRetracted.Load(), RenewPasses: cm.holders.renewPasses.Load(),
 		Vanished: cm.holders.vanished.Load(), PendingRetractions: np, PendingRetried: cm.holders.pendingRetried.Load(),
+		AuditRemoved: cm.holders.auditRemoved.Load(), AuditFailed: cm.holders.auditFailed.Load(),
 	}
 }

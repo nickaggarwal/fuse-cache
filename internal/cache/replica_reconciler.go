@@ -83,7 +83,12 @@ func (cm *DefaultCacheManager) hotLocalObjects(now time.Time) []reconcileCandida
 		if _, isChunk := parentFilePathFromChunkPath(path); isChunk {
 			return true
 		}
-		if entry.Size <= 0 || entry.Size > reconcileMaxObjectBytes {
+		if entry.Size <= 0 || entry.Size > replicatePullMaxBytes {
+			return true
+		}
+		// Large objects are pulled by the target, not pushed; only a whole
+		// local copy is a source worth asking others to pull from.
+		if entry.Size > reconcileMaxObjectBytes && !cm.holdsWhole(path) {
 			return true
 		}
 		out = append(out, reconcileCandidate{path: path, size: entry.Size, lastAccessed: entry.LastAccessed})
@@ -154,6 +159,27 @@ func (cm *DefaultCacheManager) reconcileReplicasOnce(ctx context.Context) {
 			deficit = budget
 		}
 
+		if cand.size > reconcileMaxObjectBytes {
+			// Too large to push: ask peers to pull it (replicate_pull.go).
+			release, ok := cm.acquireReplicationSlot(ctx)
+			if !ok {
+				cm.herdStats.reconcileSkippedSlots.Add(1)
+				return
+			}
+			n, perr := ps.requestPull(ctx, cand.path, holders, deficit)
+			release()
+			if n > 0 {
+				budget -= n
+				cm.herdStats.reconcilePulls.Add(int64(n))
+				cm.logger.Printf("Reconciler asked %d peer(s) to pull %s (%d bytes; holders %d, target %d)",
+					n, cand.path, cand.size, len(holders), target)
+			} else if perr != nil && isPeerBusy(perr) {
+				cm.herdStats.reconcileSkippedBusy.Add(1)
+				return
+			}
+			continue
+		}
+
 		entry, err := cm.GetLocal(ctx, cand.path)
 		if err != nil || len(entry.Data) == 0 {
 			continue
@@ -202,6 +228,13 @@ func (cm *DefaultCacheManager) replicaHolders(ctx context.Context, path string) 
 			continue
 		}
 		if loc.StorageTier == "cloud" {
+			continue
+		}
+		// A node holding only some chunks serves reads of those chunks but
+		// is not a copy of the file: counting it let one surviving chunk
+		// make a file look fully replicated, so its real copies were
+		// never topped up.
+		if loc.Partial {
 			continue
 		}
 		holders[loc.PeerID] = struct{}{}

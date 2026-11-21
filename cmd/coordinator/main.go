@@ -992,6 +992,25 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 
 	// Health check endpoint
 	// Holder-lease sweep counters (holder_lease.go).
+	// Holder audit (holder_lease.go): a node's inventory; its rows for paths
+	// it no longer holds are removed.
+	mux.HandleFunc("/api/holders/audit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req coordinator.HolderAuditRequest
+		if err := parseJSONRequest(r, &req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		res, err := coordinatorService.AuditHolder(r.Context(), req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSONResponse(w, res)
+	})
 	mux.HandleFunc("/api/leases", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONResponse(w, coordinatorService.LeaseStats())
 	})
@@ -1014,7 +1033,7 @@ func setupRoutes(mux *http.ServeMux, coordinatorService *coordinator.Coordinator
 			// "holder-lease": location rows keep generation/expires_at/
 			// partial, retractions honour generation, expired rows are
 			// hidden (holder_lease.go); clients renew and reconcile.
-			"capabilities": []string{"tier-retract", "failure-report", "holder-lease"},
+			"capabilities": []string{"tier-retract", "failure-report", "holder-lease", "holder-audit"},
 			// Active cluster flags (e.g. "norebalance" during a rollout).
 			"flags": coordinatorService.Flags(r.Context()),
 		}

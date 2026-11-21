@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"time"
 )
@@ -91,11 +92,11 @@ func (cs *CoordinatorService) DeletePeerTierLocationGen(ctx context.Context, fil
 
 // LeaseStats is exported on the coordinator's /metrics.
 type LeaseStats struct {
-	Swept, SweepPasses, SweepCapped int64
+	Swept, SweepPasses, SweepCapped, AuditRemoved int64
 }
 
 type leaseSweeper struct {
-	swept, passes, capped atomic.Int64
+	swept, passes, capped, audited atomic.Int64
 }
 
 // SweepExpiredLocations removes rows whose lease lapsed more than
@@ -129,7 +130,7 @@ func (cs *CoordinatorService) SweepExpiredLocations(ctx context.Context) int {
 
 // LeaseStats returns sweep counters.
 func (cs *CoordinatorService) LeaseStats() LeaseStats {
-	return LeaseStats{Swept: cs.leases.swept.Load(), SweepPasses: cs.leases.passes.Load(), SweepCapped: cs.leases.capped.Load()}
+	return LeaseStats{Swept: cs.leases.swept.Load(), SweepPasses: cs.leases.passes.Load(), SweepCapped: cs.leases.capped.Load(), AuditRemoved: cs.leases.audited.Load()}
 }
 
 // runLeaseSweeper sweeps expired rows every interval until ctx ends.
@@ -147,3 +148,72 @@ func (cs *CoordinatorService) runLeaseSweeper(ctx context.Context, interval time
 		}
 	}
 }
+
+// Holder audit: the coordinator compares a node's rows with the node's own
+// inventory.
+//
+// Leases bound how long a wrong row can live, but only from the node's side:
+// a node that renews keeps every row it once published alive, including
+// rows for files it no longer has whose retraction was lost and is no longer
+// pending (a restart drops the pending set). The renewal pass now ends with
+// the node's full inventory (POST /api/holders/audit): the coordinator
+// removes this node's nvme rows for paths not in it, at or below the row's
+// own generation, so the node's newest view always wins.
+
+// HolderAuditRequest is a node's inventory: every parent path it holds on
+// local NVMe (whole or partial).
+type HolderAuditRequest struct {
+	PeerID string   `json:"peer_id"`
+	Paths  []string `json:"paths"`
+}
+
+// HolderAuditResult reports what the audit removed.
+type HolderAuditResult struct {
+	Checked int      `json:"checked"`
+	Removed int      `json:"removed"`
+	Paths   []string `json:"paths,omitempty"`
+}
+
+// auditMaxPaths bounds one request (a node with more objects sends its
+// inventory but the audit only trusts it up to this size).
+const auditMaxPaths = 200000
+
+// AuditHolder removes peerID's nvme rows for paths not in held.
+func (cs *CoordinatorService) AuditHolder(ctx context.Context, req HolderAuditRequest) (HolderAuditResult, error) {
+	var res HolderAuditResult
+	if req.PeerID == "" || len(req.Paths) > auditMaxPaths {
+		return res, errAuditRequest
+	}
+	held := make(map[string]struct{}, len(req.Paths))
+	for _, p := range req.Paths {
+		held[p] = struct{}{}
+	}
+	all, err := cs.store.RangeFileLocations(ctx, "")
+	if err != nil {
+		return res, err
+	}
+	for path, locs := range all {
+		for _, l := range locs {
+			if l == nil || l.PeerID != req.PeerID || l.StorageTier != "nvme" {
+				continue
+			}
+			res.Checked++
+			if _, ok := held[path]; ok {
+				continue
+			}
+			if err := cs.store.DeletePeerTierLocation(ctx, path, req.PeerID, "nvme", l.Generation); err == nil {
+				res.Removed++
+				if len(res.Paths) < 50 {
+					res.Paths = append(res.Paths, path)
+				}
+			}
+		}
+	}
+	cs.leases.audited.Add(int64(res.Removed))
+	if res.Removed > 0 {
+		cs.logger.Printf("Holder audit %s: removed %d rows the node no longer backs", req.PeerID, res.Removed)
+	}
+	return res, nil
+}
+
+var errAuditRequest = errors.New("audit needs peer_id and at most 200000 paths")
