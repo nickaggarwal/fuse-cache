@@ -56,3 +56,25 @@ Doubling RAM did not help. The E8ds node's cold start was slower, because its re
 - **Quota:** 16 nodes needs the eastus increase in PLAN.md.
 
 Torn down 2026-11-20 23:24; check.sh reports nothing left.
+
+# 16-node ring placement A/B (2026-11-21, eastus)
+
+Setup:
+- 8 × D8ds_v6 + 8 × E4ds_v6;
+- the 70B model's deployment at 1:50 scale, about 3 GB per reader;
+- 15 readers start at once from a node-0 seed;
+- three waves per arm: cold, warm cluster (readers evicted through `/api/cache/evict`), and 2 nodes lost.
+
+| Wave | Ring off: median / max | Ring on (R=2): median / max | Busiest holder, off → on | Reads served, off → on |
+|---|---|---|---|---|
+| cold | 16.6 / 28.3 s | 14.7 / 26.8 s | 16% → 19% | 13,126 → 3,955 |
+| warm cluster | 15.2 / 26.8 s | 17.3 / 28.1 s | 25% → 13% | 7,295 → 4,592 |
+| 2 nodes lost | 12.5 / 27.4 s | 16.0 / 27.3 s | 21% → 37% | 6,533 → 3,452 |
+
+- No bytes came from blob storage in any wave, and no pod crashed or restarted.
+- **Start times:** no consistent change. The ring led cold and trailed warm and node-loss, all by 2–4 s.
+- **The max is set by CPU:** it is always one of the 4-vCPU nodes, at about 27 s.
+- **Fewer reads:** the ring cut reads by 50–70%, because there are fewer failed probes and owners serve whole chunks.
+- **Node loss concentrates load:** with the ring, the departed owners' chunks get new owners who don't hold them yet, so reads pile onto the remaining holders (busiest 37%).
+- **Why no win:** without the ring, readers serve chunks as soon as they finish them. The single-holder bottleneck the ring targets doesn't arise at this size.
+- **Decision:** ring placement stays off by default (`-ring-replicas=0`).
