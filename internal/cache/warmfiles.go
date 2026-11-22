@@ -100,15 +100,18 @@ func (cm *DefaultCacheManager) WarmFiles(ctx context.Context, files []WarmFile, 
 	res.Files = len(files)
 	res.Results = make([]WarmFileResult, len(files))
 	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		snapSeq uint64
+		emitter progressEmitter
 	)
-	snapshotLocked := func() WarmupProgress {
-		return WarmupProgress{
+	snapshotLocked := func() orderedProgress {
+		snapSeq++
+		return orderedProgress{seq: snapSeq, p: WarmupProgress{
 			Files: res.Files, Done: res.Warmed + res.AlreadyLocal + res.Skipped + res.Failed + res.NotFound,
 			Warmed: res.Warmed, AlreadyLocal: res.AlreadyLocal,
 			Skipped: res.Skipped, Failed: res.Failed + res.NotFound, Bytes: res.Bytes,
-		}
+		}}
 	}
 	record := func(i int, r WarmFileResult) {
 		mu.Lock()
@@ -128,9 +131,7 @@ func (cm *DefaultCacheManager) WarmFiles(ctx context.Context, files []WarmFile, 
 		}
 		snap := snapshotLocked()
 		mu.Unlock()
-		if opts.OnProgress != nil {
-			opts.OnProgress(snap)
-		}
+		emitter.emit(opts.OnProgress, snap)
 	}
 
 	sem := make(chan struct{}, fileConcurrency)
