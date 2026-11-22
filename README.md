@@ -412,14 +412,14 @@ container reads a file in the image
   its rows hidden once the lease (`-holder-lease-sec`, 900) lapses and swept
   2 minutes later. Rows from older clients never expire. Metrics:
   `fuse_holder_*`; coordinator `GET /api/leases`.
-- **Ring placement (experimental, off by default).** \`-ring-replicas=R\`
+- **Ring placement (experimental, off by default).** `-ring-replicas=R`
   gives each chunk R owners by weighted rendezvous hashing over the live
   peer list. Reads try owners that already hold the chunk first, then other
   holders; owners not yet holding it get a background nudge and fill it;
   replicas and large-file pulls target owners. On 16 AKS nodes it cut peer
   reads by 50-70% but did not change start times, and losing owners
   concentrated reads, so it stays off (deploy/labs/azure-scale/RESULTS.md).
-  \`POST /api/cache/evict?path=\` evicts one file from a node as LRU would.
+  `POST /api/cache/evict?path=` evicts one file from a node as LRU would.
 - **Every blob read is profiled.** `fuse_blob_read_seconds{path}` times each
   nydusd read by the path that answered it: `local` (a whole local copy or
   local chunks), `fill` (a fill in progress), `remote` (per-chunk store,
