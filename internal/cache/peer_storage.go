@@ -48,6 +48,9 @@ type PeerStorage struct {
 	// ringR is the number of ring owners per chunk tried first on reads
 	// (ring.go); 0 disables ring placement.
 	ringR               atomic.Int32
+	ringNudges          atomic.Int64
+	nudgeMu             sync.Mutex
+	nudged              map[string]struct{}
 	coordinator         coordinator.Coordinator
 	timeout             time.Duration
 	minReplicationCount int
@@ -343,7 +346,9 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	preferred, fallback := ps.partitionPeersForPath(ctx, path, peers)
 	preferred = storeFirst(orderedPeersForPath(preferred, path))
 	fallback = orderedPeersForPath(fallback, path+"#fallback")
-	preferred, fallback = ringOrder(preferred, fallback, path, ps.ringReplicas())
+	var unheld []*coordinator.PeerInfo
+	preferred, fallback, unheld = ringOrder(preferred, fallback, path, ps.ringReplicas())
+	ps.nudgeOwners(path, unheld)
 
 	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
 	ordered = append(ordered, preferred...)
@@ -817,7 +822,12 @@ func (ps *PeerStorage) replicate(ctx context.Context, path string, data []byte, 
 	// With ring placement, copies go to the path's owners first: that is
 	// where readers look (ring.go).
 	if r := ps.ringReplicas(); r > 0 {
-		candidates, _ = ringOrder(candidates, nil, path, r)
+		// Replication targets: owners first, whether or not they hold it.
+		owners := ringOwners(candidates, path)
+		if len(owners) > r {
+			owners = owners[:r]
+		}
+		candidates = ownersFirst(candidates, owners)
 	}
 
 	written := 0
@@ -1367,8 +1377,10 @@ func (ps *PeerStorage) ReadRange(ctx context.Context, path string, off, n int64)
 		// Owners hold most chunks once the cluster has read a blob; try
 		// them first, then the listed holders, then everyone (a miss is
 		// cheap and typed).
-		preferred, rest = ringOrder(preferred, rest, path, r)
+		var unheld []*coordinator.PeerInfo
+		preferred, rest, unheld = ringOrder(preferred, rest, path, r)
 		preferred = append(preferred, rest...)
+		ps.nudgeOwners(path, unheld)
 	}
 	var lastErr error = &peerMissError{addr: "none", path: path}
 	for _, peer := range preferred {

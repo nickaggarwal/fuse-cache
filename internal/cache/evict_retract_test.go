@@ -155,3 +155,21 @@ func TestStoreDeletePeerTierLocation(t *testing.T) {
 		t.Fatalf("rows after tier delete = %v", seen)
 	}
 }
+
+// EvictPath removes a durable local copy without a tombstone (the node can
+// publish it again) and refuses the only copy.
+func TestEvictPath(t *testing.T) {
+	cm, _ := retractTestManager(t)
+	ctx := context.Background()
+	seedNVMe(t, cm, "/m/durable.bin", 100, true, 2*time.Minute)
+	seedNVMe(t, cm, "/m/only.bin", 100, false, time.Minute)
+	if freed, err := cm.EvictPath(ctx, "/m/durable.bin"); err != nil || freed != 100 {
+		t.Fatalf("evict durable: freed %d err %v", freed, err)
+	}
+	if cm.tombstoned("/m/durable.bin") {
+		t.Fatal("eviction left a tombstone")
+	}
+	if _, err := cm.EvictPath(ctx, "/m/only.bin"); err == nil {
+		t.Fatal("evicted the only copy")
+	}
+}

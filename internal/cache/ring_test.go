@@ -3,7 +3,12 @@ package cache
 import (
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"fuse-client/internal/coordinator"
 )
@@ -96,28 +101,77 @@ func TestRingWeightedByCapacity(t *testing.T) {
 	}
 }
 
-// ringOrder puts owners first and keeps holders ahead of non-holders.
+// ringOrder: owners that hold first, then other holders, then owners that
+// do not hold yet (returned for nudging), then the rest.
 func TestRingOrder(t *testing.T) {
 	ps := ringPeers(6, 100)
 	key := "/x_chunk_7"
 	owners := ringOwners(ps, key)[:2]
 	isOwner := map[string]bool{owners[0].ID: true, owners[1].ID: true}
-	var holders, rest []*coordinator.PeerInfo
+	// holders: owner[0] and one non-owner; owner[1] does not hold
+	var nonOwner *coordinator.PeerInfo
 	for _, p := range ps {
-		if !isOwner[p.ID] && len(holders) < 1 {
-			holders = append(holders, p)
-		} else {
+		if !isOwner[p.ID] {
+			nonOwner = p
+			break
+		}
+	}
+	holders := []*coordinator.PeerInfo{nonOwner, owners[0]}
+	var rest []*coordinator.PeerInfo
+	for _, p := range ps {
+		if p.ID != nonOwner.ID && p.ID != owners[0].ID {
 			rest = append(rest, p)
 		}
 	}
-	pref, r := ringOrder(holders, rest, key, 2)
-	if pref[0].ID != owners[0].ID || pref[1].ID != owners[1].ID || pref[2].ID != holders[0].ID {
-		t.Fatalf("order = %v %v %v, want owners then holder", pref[0].ID, pref[1].ID, pref[2].ID)
+	first, second, unheld := ringOrder(holders, rest, key, 2)
+	if first[0].ID != owners[0].ID || first[1].ID != nonOwner.ID {
+		t.Fatalf("first = %s %s, want holding owner then holder", first[0].ID, first[1].ID)
 	}
-	if len(pref)+len(r) != len(ps) {
-		t.Fatalf("lost peers: %d + %d != %d", len(pref), len(r), len(ps))
+	if second[0].ID != owners[1].ID || len(unheld) != 1 || unheld[0].ID != owners[1].ID {
+		t.Fatalf("non-holding owner must lead the second group and be returned for nudging")
 	}
-	if p2, r2 := ringOrder(holders, rest, key, 0); len(p2) != len(holders) || len(r2) != len(rest) {
+	if len(first)+len(second) != len(ps) {
+		t.Fatalf("lost peers: %d + %d != %d", len(first), len(second), len(ps))
+	}
+	if p2, r2, u2 := ringOrder(holders, rest, key, 0); len(p2) != len(holders) || len(r2) != len(rest) || u2 != nil {
 		t.Fatal("r=0 must leave the order unchanged")
+	}
+}
+
+// nudgeOwners sends one background 1-byte read per owner, once per key.
+func TestNudgeOwnersOncePerKey(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Query().Get("path")+"|"+r.URL.Query().Get("len")]++
+		mu.Unlock()
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	ps, err := NewPeerStorage(newDeleteCoordinator(), time.Second, "me", false, false, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := &coordinator.PeerInfo{ID: "o", Address: strings.TrimPrefix(srv.URL, "http://"), Status: "active"}
+	for i := 0; i < 3; i++ {
+		ps.nudgeOwners("/m/w.bin_chunk_4", []*coordinator.PeerInfo{owner})
+	}
+	ps.nudgeOwners("/m/w.bin", []*coordinator.PeerInfo{owner}) // not a chunk: ignored
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := hits["/m/w.bin_chunk_4|1"]
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["/m/w.bin_chunk_4|1"] != 1 || len(hits) != 1 {
+		t.Fatalf("nudges = %v, want exactly one 1-byte read of the chunk", hits)
 	}
 }

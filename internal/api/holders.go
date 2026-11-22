@@ -31,3 +31,30 @@ func (h *Handler) handleHolderRenew(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]int{"renewed": renewed, "retracted": retracted})
 }
+
+// pathEvictor is the cache side of POST /api/cache/evict.
+type pathEvictor interface {
+	EvictPath(ctx context.Context, filePath string) (int64, error)
+}
+
+// handleCacheEvict evicts ?path= (a file or a prefix's files are not
+// expanded: one path) from this node as LRU eviction would.
+func (h *Handler) handleCacheEvict(w http.ResponseWriter, r *http.Request) {
+	ev, ok := h.cacheManager.(pathEvictor)
+	if !ok {
+		http.Error(w, "eviction not supported", http.StatusNotImplemented)
+		return
+	}
+	p, err := sanitizePath(r.URL.Query().Get("path"))
+	if err != nil || p == "/" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+	freed, err := ev.EvictPath(r.Context(), p)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"path": p, "freed": freed})
+}

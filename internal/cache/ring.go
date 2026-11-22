@@ -1,9 +1,11 @@
 package cache
 
 import (
+	"context"
 	"hash/fnv"
 	"math"
 	"sort"
+	"time"
 
 	"fuse-client/internal/coordinator"
 )
@@ -91,12 +93,19 @@ func ringWeight(p *coordinator.PeerInfo) float64 {
 	return gb
 }
 
-// ringOrder puts the first r ring owners of key ahead of the rest, keeping
-// the existing relative order otherwise (holders the coordinator listed
-// stay ahead of non-holders).
-func ringOrder(preferred, rest []*coordinator.PeerInfo, key string, r int) ([]*coordinator.PeerInfo, []*coordinator.PeerInfo) {
+// ringOrder orders read candidates for key: owners the coordinator lists
+// as holders first, then the other holders, then owners not yet holding the
+// chunk, then everyone else. It also returns those not-yet-holding owners,
+// for nudgeOwners.
+//
+// The first version put every owner first. In a cold cluster owners have
+// not filled yet, so each read paid failed probes before reaching a real
+// holder: on the 14-node Azure A/B the cold fan-out went from 2.2 s median
+// without the ring to 3.1 s with it, half the bytes falling through to blob
+// storage. Owners now jump the queue only once they hold the chunk.
+func ringOrder(preferred, rest []*coordinator.PeerInfo, key string, r int) ([]*coordinator.PeerInfo, []*coordinator.PeerInfo, []*coordinator.PeerInfo) {
 	if r <= 0 {
-		return preferred, rest
+		return preferred, rest, nil
 	}
 	all := make([]*coordinator.PeerInfo, 0, len(preferred)+len(rest))
 	all = append(all, preferred...)
@@ -109,19 +118,66 @@ func ringOrder(preferred, rest []*coordinator.PeerInfo, key string, r int) ([]*c
 	for _, o := range owners {
 		isOwner[o.ID] = true
 	}
-	first := append([]*coordinator.PeerInfo{}, owners...)
-	var p2, r2 []*coordinator.PeerInfo
+	isHolder := make(map[string]bool, len(preferred))
+	for _, p := range preferred {
+		isHolder[p.ID] = true
+	}
+	var heldOwners, unheldOwners, holders, others []*coordinator.PeerInfo
+	for _, o := range owners {
+		if isHolder[o.ID] {
+			heldOwners = append(heldOwners, o)
+		} else {
+			unheldOwners = append(unheldOwners, o)
+		}
+	}
 	for _, p := range preferred {
 		if !isOwner[p.ID] {
-			p2 = append(p2, p)
+			holders = append(holders, p)
 		}
 	}
 	for _, p := range rest {
 		if !isOwner[p.ID] {
-			r2 = append(r2, p)
+			others = append(others, p)
 		}
 	}
-	return append(first, p2...), r2
+	first := append(heldOwners, holders...)
+	second := append(append([]*coordinator.PeerInfo{}, unheldOwners...), others...)
+	return first, second, unheldOwners
+}
+
+// nudgeOwners asks each owner that does not hold key yet for one byte of it,
+// in the background, once per key per node: the owner's miss queues the
+// chunk for its deferred fill (NoteOwnedMiss), so later readers find it on
+// its owner. Never on the read's critical path.
+func (ps *PeerStorage) nudgeOwners(key string, owners []*coordinator.PeerInfo) {
+	if len(owners) == 0 || !ps.rawTransport || ps.httpClient == nil {
+		return
+	}
+	if _, isChunk := parentFilePathFromChunkPath(key); !isChunk {
+		return
+	}
+	ps.nudgeMu.Lock()
+	if ps.nudged == nil || len(ps.nudged) > 100000 {
+		ps.nudged = make(map[string]struct{})
+	}
+	if _, done := ps.nudged[key]; done {
+		ps.nudgeMu.Unlock()
+		return
+	}
+	ps.nudged[key] = struct{}{}
+	ps.nudgeMu.Unlock()
+	for _, o := range owners {
+		if o == nil || o.Address == "" || o.ID == ps.localPeerID {
+			continue
+		}
+		addr := o.Address
+		ps.ringNudges.Add(1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = ps.readRangeFromPeerRaw(ctx, addr, key, 0, 1)
+		}()
+	}
 }
 
 // SetRingReplicas turns ring placement on (r owners per chunk) or off (0).
@@ -136,6 +192,7 @@ type RingStats struct {
 	Replicas    int
 	Members     int
 	FillsQueued int64
+	Nudges      int64
 }
 
 // RingStats reports ring settings and owner fills.
@@ -144,7 +201,7 @@ func (cm *DefaultCacheManager) RingStats() RingStats {
 	if !ok {
 		return RingStats{}
 	}
-	return RingStats{Replicas: ps.ringReplicas(), Members: len(ps.ringMembers()), FillsQueued: cm.ringFillsQueued.Load()}
+	return RingStats{Replicas: ps.ringReplicas(), Members: len(ps.ringMembers()), FillsQueued: cm.ringFillsQueued.Load(), Nudges: ps.ringNudges.Load()}
 }
 
 // NoteOwnedMiss is called when a peer asked this node for a chunk it does
@@ -194,4 +251,19 @@ func (ps *PeerStorage) ringMembers() []*coordinator.PeerInfo {
 		peers = append(peers, self)
 	}
 	return peers
+}
+
+// ownersFirst moves owners to the front of peers, keeping the rest's order.
+func ownersFirst(peers, owners []*coordinator.PeerInfo) []*coordinator.PeerInfo {
+	isOwner := make(map[string]bool, len(owners))
+	for _, o := range owners {
+		isOwner[o.ID] = true
+	}
+	out := append([]*coordinator.PeerInfo{}, owners...)
+	for _, p := range peers {
+		if !isOwner[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
