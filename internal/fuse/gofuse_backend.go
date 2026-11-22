@@ -766,7 +766,7 @@ func (n *goFuseNode) Write(ctx context.Context, f gfs.FileHandle, data []byte, o
 	if !n.isNew {
 		return 0, syscall.EPERM
 	}
-	if err := n.ensureWriteFileLocked(); err != nil {
+	if err := n.ensureWriteFileLocked(true); err != nil {
 		n_logEIO(n.gfs, "goFuseNode.Write", n.path, err)
 		return 0, syscall.EIO
 	}
@@ -805,7 +805,9 @@ func (n *goFuseNode) Setattr(ctx context.Context, f gfs.FileHandle, in *gfuse.Se
 		if !n.isNew {
 			return syscall.EPERM
 		}
-		if err := n.ensureWriteFileLocked(); err != nil {
+		// Truncating to zero discards everything, so there is nothing to
+		// carry over; any other size keeps a prefix of the committed bytes.
+		if err := n.ensureWriteFileLocked(size > 0); err != nil {
 			n_logEIO(n.gfs, "goFuseNode.Setattr", n.path, err)
 			return syscall.EIO
 		}
@@ -929,25 +931,98 @@ func (n *goFuseNode) Release(ctx context.Context, f gfs.FileHandle) syscall.Errn
 	return 0
 }
 
-func (n *goFuseNode) ensureWriteFileLocked() error {
+// ensureWriteFileLocked opens the staging file writes land in.
+//
+// A staging file does not live as long as the open file: Flush commits it
+// with PutFromFile, which moves it into the cache, and the kernel sends
+// FUSE_FLUSH on every close() of a descriptor sharing the open file (a dup,
+// a forked child exiting) and on fsync -- while the file stays open for
+// writing through the others. So a write can arrive after the bytes before
+// it were committed. Starting that write on an empty staging file commits a
+// file of the right size whose earlier bytes are a hole of zeros (a CRIU
+// dump on Nebius: files.img flushed at 40,538 bytes, extended by 1,053, read
+// back as 41,591 zeros).
+//
+// With seed set, the new staging file therefore starts as a copy of the
+// n.entry.Size bytes already committed. seed is false only for a truncate to
+// zero, where nothing carries over.
+func (n *goFuseNode) ensureWriteFileLocked(seed bool) error {
 	if n.writeFile != nil {
 		return nil
 	}
+	var (
+		tmp  *os.File
+		path string
+		err  error
+	)
 	if creator, ok := n.gfs.cacheManager.(stagedWriteFileCreator); ok {
-		tmp, path, err := creator.CreateWriteFile(context.Background(), n.path)
-		if err != nil {
-			return err
+		tmp, path, err = creator.CreateWriteFile(context.Background(), n.path)
+	} else {
+		tmp, err = os.CreateTemp("", "fuse-client-write-*")
+		if err == nil {
+			path = tmp.Name()
 		}
-		n.writeFile = tmp
-		n.writePath = path
-		return nil
 	}
-	tmp, err := os.CreateTemp("", "fuse-client-write-*")
 	if err != nil {
 		return err
 	}
+	if seed && n.entry != nil && n.entry.Size > 0 {
+		if err := n.seedWriteFile(tmp, n.entry.Size); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(path)
+			return err
+		}
+	}
 	n.writeFile = tmp
-	n.writePath = tmp.Name()
+	n.writePath = path
+	return nil
+}
+
+// seedWriteFile copies the first size committed bytes of this file into a
+// fresh staging file: from the local copy when one is whole, otherwise
+// through ReadRange. If neither can produce every byte it fails -- the write
+// then returns EIO, which the writer sees, instead of committing zeros,
+// which nothing would see until the bytes are read.
+func (n *goFuseNode) seedWriteFile(dst *os.File, size int64) error {
+	ctx := context.Background()
+	if r, ok := n.gfs.cacheManager.(localFilePathResolver); ok {
+		if p, ok := r.LocalFilePath(ctx, n.path); ok {
+			if src, err := os.Open(p); err == nil {
+				info, serr := src.Stat()
+				if serr == nil && info.Size() >= size {
+					_, cerr := io.Copy(io.NewOffsetWriter(dst, 0), io.NewSectionReader(src, 0, size))
+					src.Close()
+					if cerr == nil {
+						return nil
+					}
+				} else {
+					src.Close()
+				}
+			}
+		}
+	}
+	rr, ok := n.gfs.cacheManager.(rangeReader)
+	if !ok {
+		return fmt.Errorf("write after commit of %s: %d committed bytes have no local copy and no range reader", n.path, size)
+	}
+	const step = 4 << 20
+	for off := int64(0); off < size; {
+		want := size - off
+		if want > step {
+			want = step
+		}
+		data, err := rr.ReadRange(ctx, n.path, off, int(want))
+		if err != nil {
+			return fmt.Errorf("write after commit of %s: reading committed bytes [%d,%d): %w", n.path, off, off+want, err)
+		}
+		if len(data) == 0 {
+			return fmt.Errorf("write after commit of %s: committed bytes end at %d, want %d", n.path, off, size)
+		}
+		if err := writeAllAt(dst, data, off); err != nil {
+			return err
+		}
+		off += int64(len(data))
+	}
 	return nil
 }
 
