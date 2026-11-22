@@ -237,21 +237,21 @@ func (cm *DefaultCacheManager) WarmPrefixOpts(ctx context.Context, prefix string
 		chunksPlanned int64
 		chunksDone    int64
 		inFlightBytes int64
+		snapSeq       uint64
 	)
-	// snapshotLocked builds a progress snapshot; callers must hold mu.
-	snapshotLocked := func() WarmupProgress {
-		return WarmupProgress{
+	// snapshotLocked builds a progress snapshot, numbered in the order the
+	// state it describes was reached; callers must hold mu.
+	snapshotLocked := func() orderedProgress {
+		snapSeq++
+		return orderedProgress{seq: snapSeq, p: WarmupProgress{
 			Files: res.Files, Done: res.Warmed + res.AlreadyLocal + res.Skipped + res.Failed,
 			Warmed: res.Warmed, AlreadyLocal: res.AlreadyLocal,
 			Skipped: res.Skipped, Failed: res.Failed, Bytes: res.Bytes,
 			Chunks: chunksPlanned, ChunksDone: chunksDone, InFlightBytes: inFlightBytes,
-		}
+		}}
 	}
-	emit := func(snap WarmupProgress) {
-		if opts.OnProgress != nil {
-			opts.OnProgress(snap)
-		}
-	}
+	var emitter progressEmitter
+	emit := func(snap orderedProgress) { emitter.emit(opts.OnProgress, snap) }
 
 	sem := make(chan struct{}, fileConcurrency)
 	for _, t := range targets {
@@ -368,4 +368,49 @@ func (cm *DefaultCacheManager) warmOneFile(ctx context.Context, t *warmupTarget,
 		}, TierNVMe)
 	})
 	return warmOutcomeWarmed
+}
+
+// orderedProgress is a progress snapshot with the sequence number of the
+// state it describes.
+type orderedProgress struct {
+	seq uint64
+	p   WarmupProgress
+}
+
+// progressEmitter delivers snapshots to a progress callback in the order
+// they were taken. Snapshots are taken under the warm's mutex but delivered
+// after it is released (the callback must not run under it), so two workers
+// could deliver theirs in the opposite order and a consumer saw counters go
+// backwards (TestWarmPrefixOpts_ChunkLevelProgress failed about 1 in 40
+// under -race, on main as well). Every snapshot taken is emitted exactly
+// once with a consecutive sequence number; one that arrives early waits for
+// the ones before it, so all are delivered, in order.
+type progressEmitter struct {
+	mu      sync.Mutex
+	next    uint64 // next sequence number to deliver (first is 1)
+	pending map[uint64]WarmupProgress
+}
+
+func (e *progressEmitter) emit(fn func(WarmupProgress), s orderedProgress) {
+	if fn == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.next == 0 {
+		e.next = 1
+	}
+	if e.pending == nil {
+		e.pending = make(map[uint64]WarmupProgress)
+	}
+	e.pending[s.seq] = s.p
+	for {
+		p, ok := e.pending[e.next]
+		if !ok {
+			return
+		}
+		delete(e.pending, e.next)
+		e.next++
+		fn(p)
+	}
 }

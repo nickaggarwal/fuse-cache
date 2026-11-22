@@ -345,3 +345,22 @@ func TestWarmPrefixOpts_AlreadyLocalChunksNotCounted(t *testing.T) {
 			last.ChunksDone, last.Chunks)
 	}
 }
+
+// Snapshots handed to the emitter out of order are delivered in order, none
+// lost.
+func TestProgressEmitterOrders(t *testing.T) {
+	var e progressEmitter
+	var got []int64
+	fn := func(p WarmupProgress) { got = append(got, p.ChunksDone) }
+	for _, seq := range []uint64{2, 1, 4, 3, 5} {
+		e.emit(fn, orderedProgress{seq: seq, p: WarmupProgress{ChunksDone: int64(seq)}})
+	}
+	if len(got) != 5 {
+		t.Fatalf("delivered %v, want all 5", got)
+	}
+	for i, v := range got {
+		if v != int64(i+1) {
+			t.Fatalf("delivered %v, want 1..5 in order", got)
+		}
+	}
+}
