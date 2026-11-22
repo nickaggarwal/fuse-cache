@@ -373,11 +373,21 @@ func (cl *cluster) start(n *node, m int) startRec {
 			cl.admit(n, l)
 			continue
 		}
-		if h := cl.liveHolder(l.id, n.id); h != nil {
-			h.readers++
-			rate := peerMBps / (1 + contentionStep*float64(h.readers-1))
-			secs += l.sizeMB/rate + peerReadSec*l.sizeMB/8
-			h.readers--
+		if hs := cl.liveHolders(l.id, n.id); len(hs) > 0 {
+			// The client spreads a file's chunks across its holders (start
+			// index rotated per chunk), so the layer is read from all of
+			// them in parallel and takes as long as the busiest holder's
+			// share. (The first version read the whole layer from one
+			// holder, which overstated what ring placement adds.)
+			share := l.sizeMB / float64(len(hs))
+			worst := 0.0
+			for _, h := range hs {
+				h.readers++
+				rate := peerMBps / (1 + contentionStep*float64(h.readers-1))
+				worst = math.Max(worst, share/rate+peerReadSec*share/8)
+				h.readers--
+			}
+			secs += worst
 			rec.bytesPeer += l.sizeMB
 			srcs["peer"] = true
 		} else {
@@ -493,6 +503,23 @@ func fnv64(s string) uint64 {
 		h *= 1099511628211
 	}
 	return h
+}
+
+func (cl *cluster) liveHolders(id string, except int) []*node {
+	var out []*node
+	for nid, row := range cl.holders[id] {
+		if nid == except {
+			continue
+		}
+		hn := cl.nodes[nid]
+		if !hn.alive || !cl.rowLive(row) {
+			continue
+		}
+		if _, ok := hn.lru[id]; ok {
+			out = append(out, hn)
+		}
+	}
+	return out
 }
 
 func (cl *cluster) liveHolder(id string, except int) *node {
