@@ -149,7 +149,8 @@ func (cm *DefaultCacheManager) stampHolderRow(loc *coordinator.FileLocation) {
 }
 
 // holdsWhole reports whether this node has the whole file locally: a whole
-// local copy, or every chunk of it.
+// local copy, or every chunk of it. It takes cm.mu: never call it with cm.mu
+// held (a nested RLock deadlocks once a writer is queued).
 func (cm *DefaultCacheManager) holdsWhole(path string) bool {
 	cm.mu.RLock()
 	e, ok := cm.entries.get(path)
