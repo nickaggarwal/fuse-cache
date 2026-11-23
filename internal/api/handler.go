@@ -239,6 +239,7 @@ func (h *Handler) SetupRoutes() *mux.Router {
 	router.HandleFunc("/api/cache/intents/reconcile", h.handleWarmIntentReconcile).Methods("POST")
 	router.HandleFunc("/api/holders/renew", h.handleHolderRenew).Methods("POST")
 	router.HandleFunc("/api/cache/evict", h.handleCacheEvict).Methods("POST")
+	router.HandleFunc("/api/ring", h.handleRingSet).Methods("POST")
 	router.HandleFunc("/api/cache/intents/{volumeID}", h.handleWarmIntentDelete).Methods("DELETE")
 	h.registerModelKVRoutes(router)
 	router.HandleFunc("/api/fs/snapshot", h.handleFSSnapshot).Methods("POST")

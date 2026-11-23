@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -57,4 +58,28 @@ func (h *Handler) handleCacheEvict(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"path": p, "freed": freed})
+}
+
+// ringSetter is the cache side of POST /api/ring.
+type ringSetter interface {
+	SetRingReplicas(r int)
+}
+
+// handleRingSet sets ring placement at runtime: POST /api/ring?replicas=R
+// (0 disables). Lets an operator or an A/B switch placement fleet-wide
+// without restarting clients (which would also reset their counters).
+func (h *Handler) handleRingSet(w http.ResponseWriter, r *http.Request) {
+	rs, ok := h.cacheManager.(ringSetter)
+	if !ok {
+		http.Error(w, "ring placement not supported", http.StatusNotImplemented)
+		return
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("replicas"))
+	if err != nil || n < 0 || n > 8 {
+		http.Error(w, "replicas must be 0..8", http.StatusBadRequest)
+		return
+	}
+	rs.SetRingReplicas(n)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"replicas": n})
 }

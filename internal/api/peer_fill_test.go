@@ -334,3 +334,26 @@ func TestLiveFillEnqueueRemaining(t *testing.T) {
 		t.Fatalf("background fetched %d, complete=%v; want 7 and complete", n, lf.complete())
 	}
 }
+
+// POST /api/ring switches ring placement at runtime and validates input.
+func TestRingSetEndpoint(t *testing.T) {
+	c := &ringFake{peerFillCache: newPeerFillCache("/x", []byte("x"))}
+	h := NewHandler(c, nil, "p", "")
+	srv := httptest.NewServer(h.SetupRoutes())
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/api/ring?replicas=2", "application/json", nil)
+	if err != nil || resp.StatusCode != http.StatusOK || c.r != 2 {
+		t.Fatalf("set 2: status %v err %v r=%d", resp.StatusCode, err, c.r)
+	}
+	resp, _ = http.Post(srv.URL+"/api/ring?replicas=-1", "application/json", nil)
+	if resp.StatusCode != http.StatusBadRequest || c.r != 2 {
+		t.Fatalf("bad input accepted: %d r=%d", resp.StatusCode, c.r)
+	}
+}
+
+type ringFake struct {
+	*peerFillCache
+	r int
+}
+
+func (f *ringFake) SetRingReplicas(r int) { f.r = r }
