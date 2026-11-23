@@ -45,6 +45,12 @@ const (
 
 // PeerStorage implements TierStorage for peer-to-peer storage via gRPC.
 type PeerStorage struct {
+	// ringR is the number of ring owners per chunk tried first on reads
+	// (ring.go); 0 disables ring placement.
+	ringR               atomic.Int32
+	ringNudges          atomic.Int64
+	nudgeMu             sync.Mutex
+	nudged              map[string]struct{}
 	coordinator         coordinator.Coordinator
 	timeout             time.Duration
 	minReplicationCount int
@@ -58,6 +64,7 @@ type PeerStorage struct {
 	readConnPerPeer     int
 	metaMu              sync.RWMutex
 	peersCache          []*coordinator.PeerInfo
+	self                *coordinator.PeerInfo // this node's registry entry, for ring membership
 	peersCacheAt        time.Time
 	peersCacheTTL       time.Duration
 	fileHints           map[string]fileHintCacheEntry
@@ -339,6 +346,9 @@ func (ps *PeerStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	preferred, fallback := ps.partitionPeersForPath(ctx, path, peers)
 	preferred = storeFirst(orderedPeersForPath(preferred, path))
 	fallback = orderedPeersForPath(fallback, path+"#fallback")
+	var unheld []*coordinator.PeerInfo
+	preferred, fallback, unheld = ringOrder(preferred, fallback, path, ps.ringReplicas())
+	ps.nudgeOwners(path, unheld)
 
 	ordered := make([]*coordinator.PeerInfo, 0, len(preferred)+len(fallback))
 	ordered = append(ordered, preferred...)
@@ -809,6 +819,16 @@ func (ps *PeerStorage) replicate(ctx context.Context, path string, data []byte, 
 	// then prefer targets with more headroom.
 	cryptoShuffle(candidates)
 	sortPeersByReplicationScore(candidates)
+	// With ring placement, copies go to the path's owners first: that is
+	// where readers look (ring.go).
+	if r := ps.ringReplicas(); r > 0 {
+		// Replication targets: owners first, whether or not they hold it.
+		owners := ringOwners(candidates, path)
+		if len(owners) > r {
+			owners = owners[:r]
+		}
+		candidates = ownersFirst(candidates, owners)
+	}
 
 	written := 0
 	var lastErr error
@@ -841,6 +861,12 @@ func (ps *PeerStorage) replicate(ctx context.Context, path string, data []byte, 
 	}
 	return written, lastErr
 }
+
+// SetRingReplicas sets how many rendezvous-hash owners per chunk reads try
+// first (0 disables).
+func (ps *PeerStorage) SetRingReplicas(r int) { ps.ringR.Store(int32(r)) }
+
+func (ps *PeerStorage) ringReplicas() int { return int(ps.ringR.Load()) }
 
 // Delete removes a file from peer storage.
 func (ps *PeerStorage) Delete(ctx context.Context, path string) error {
@@ -989,16 +1015,21 @@ func (ps *PeerStorage) getPeers(ctx context.Context) ([]*coordinator.PeerInfo, e
 	}
 
 	filtered := make([]*coordinator.PeerInfo, 0, len(peers))
+	var self *coordinator.PeerInfo
 	for _, peer := range peers {
 		if peer == nil || peer.ID == "" {
 			continue
 		}
 		if peer.ID == ps.localPeerID {
+			self = peer
 			continue
 		}
 		filtered = append(filtered, peer)
 	}
 	ps.metaMu.Lock()
+	if self != nil {
+		ps.self = self // ring membership includes this node (ring.go)
+	}
 	ps.peersCache = filtered
 	ps.peersCacheAt = time.Now()
 	ps.metaMu.Unlock()
@@ -1340,8 +1371,17 @@ func (ps *PeerStorage) ReadRange(ctx context.Context, path string, off, n int64)
 	if err != nil {
 		return nil, err
 	}
-	preferred, _ := ps.partitionPeersForPath(ctx, path, peers)
+	preferred, rest := ps.partitionPeersForPath(ctx, path, peers)
 	preferred = storeFirst(orderedPeersForPath(preferred, path))
+	if r := ps.ringReplicas(); r > 0 {
+		// Owners hold most chunks once the cluster has read a blob; try
+		// them first, then the listed holders, then everyone (a miss is
+		// cheap and typed).
+		var unheld []*coordinator.PeerInfo
+		preferred, rest, unheld = ringOrder(preferred, rest, path, r)
+		preferred = append(preferred, rest...)
+		ps.nudgeOwners(path, unheld)
+	}
 	var lastErr error = &peerMissError{addr: "none", path: path}
 	for _, peer := range preferred {
 		if peer == nil || peer.Status != "active" || peer.Address == "" {

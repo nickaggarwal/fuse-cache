@@ -53,6 +53,13 @@ func (ps *PeerStorage) requestPull(ctx context.Context, path string, exclude map
 	}
 	cryptoShuffle(candidates)
 	sortPeersByReplicationScore(candidates)
+	if r := ps.ringReplicas(); r > 0 {
+		owners := ringOwners(candidates, path)
+		if len(owners) > r {
+			owners = owners[:r]
+		}
+		candidates = ownersFirst(candidates, owners)
+	}
 	body, _ := json.Marshal(map[string]any{"prefix": path, "mode": "full", "source": "peer-first", "bandwidth": "background", "async": true})
 	accepted := 0
 	var lastErr error

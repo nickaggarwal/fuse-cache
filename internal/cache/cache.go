@@ -489,6 +489,9 @@ type DefaultCacheManager struct {
 	// holders tracks generations and leases of published holder rows
 	// (holder_lease.go).
 	holders holderLeases
+	// ringFillsQueued counts owned chunks queued for fill after a peer
+	// asked for them here (ring.go).
+	ringFillsQueued atomic.Int64
 	// slotsHeld are the cluster-wide replication slots this node holds
 	// (replication_slots.go).
 	slotsHeld heldSlots

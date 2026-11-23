@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -187,3 +188,34 @@ func (cm *DefaultCacheManager) holdsLocally(path string) bool {
 	}
 	return false
 }
+
+// EvictPath evicts filePath (and its chunk files) from this node exactly as
+// watermark eviction would: same durability, open-file and assembly guards,
+// generation-guarded retraction of this node's row, no tombstone, so the
+// node can fetch and publish the file again. Returns the bytes freed.
+// Operators use it to cold one node without touching the rest of the
+// cluster (a cluster-wide DELETE also removes the file everywhere).
+func (cm *DefaultCacheManager) EvictPath(ctx context.Context, filePath string) (int64, error) {
+	if cm.isOpen(filePath) || cm.assembling(filePath) {
+		return 0, errEvictBusy
+	}
+	cm.mu.RLock()
+	e, ok := cm.entries.get(filePath)
+	cm.mu.RUnlock()
+	if ok && e != nil && !cm.evictionSafe(ctx, filePath, e) {
+		return 0, errEvictOnlyCopy
+	}
+	freed, err := cm.deleteLocalNVMeFootprint(ctx, filePath, true, true)
+	if err != nil {
+		return freed, err
+	}
+	cm.metrics.RecordEviction()
+	cm.evictBytes.add(freed, time.Now())
+	cm.queueEvictRetraction(filePath)
+	return freed, nil
+}
+
+var (
+	errEvictBusy     = errors.New("file is open or being assembled")
+	errEvictOnlyCopy = errors.New("this node holds the only copy (not yet durable)")
+)
