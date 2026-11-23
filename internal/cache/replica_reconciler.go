@@ -86,15 +86,26 @@ func (cm *DefaultCacheManager) hotLocalObjects(now time.Time) []reconcileCandida
 		if entry.Size <= 0 || entry.Size > replicatePullMaxBytes {
 			return true
 		}
-		// Large objects are pulled by the target, not pushed; only a whole
-		// local copy is a source worth asking others to pull from.
-		if entry.Size > reconcileMaxObjectBytes && !cm.holdsWhole(path) {
-			return true
-		}
 		out = append(out, reconcileCandidate{path: path, size: entry.Size, lastAccessed: entry.LastAccessed})
 		return true
 	})
 	cm.mu.RUnlock()
+	// Large objects are pulled by the target, not pushed; only a whole local
+	// copy is a source worth asking others to pull from. holdsWhole takes
+	// cm.mu itself, so it must run after the scan releases it: a second
+	// RLock by a goroutine already holding one blocks forever once a writer
+	// is queued (sync.RWMutex), and that froze a client on the 48-node Azure
+	// run for 53 minutes (reconciler holding RLock inside entries.each,
+	// scrub's quarantineLocal queued for Lock, every peer read, metrics and
+	// warm request queued behind it).
+	kept := out[:0]
+	for _, c := range out {
+		if c.size > reconcileMaxObjectBytes && !cm.holdsWhole(c.path) {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	out = kept
 	// Most-recently-accessed first so the hottest objects get the pass budget
 	// (map iteration order is random).
 	sort.Slice(out, func(i, j int) bool {
